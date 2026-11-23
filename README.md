@@ -46,7 +46,7 @@ cd mashu_studio
 | 手册、命令参考、上报与权限流程 | `docs/indexes/docs.md` 开始的知识地图 |
 | 工作流模板 | `playbooks/*.json`（项目专用的放在工程里的 `.mashu/playbooks/`） |
 | 并发、模型、哪些操作要你审批、扫描哪些目录 | `state/studio.json`（字段和默认值见 `mashu/studio.py` 的 `DEFAULTS`，示例 `studio.json.example`） |
-| 头像 | 替换 `web/mashu.svg`（换成 jpg/png 的话同时改 `web/app.js` 的 `AVATAR` 和 `web/index.html` 的 icon） |
+| 头像 | 替换 `web/mashu.jpg`（换成别的格式的话同时改 `web/app.js` 的 `AVATAR` 和 `web/index.html` 的 icon） |
 | 知识地图用的 docs skill | `skills/caesar-docs/`；换成别的 skill 就改 `studio.json` 的 `docs_skill`，设为 `""` 不加载 |
 
 记忆会随使用增长：麻薯会自己往 `docs/memory/` 里记你的偏好、复盘和教训。这些是你的私人数据，如果你 fork 后公开仓库，记得别把它们推上去。

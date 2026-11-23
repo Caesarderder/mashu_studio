@@ -1,6 +1,6 @@
 'use strict';
 const TOKEN = window.MASHU_TOKEN;
-const AVATAR = '/static/mashu.svg';
+const AVATAR = '/static/mashu.jpg';
 const MAIN = 'assistant';
 const $ = (s) => document.querySelector(s);
 
