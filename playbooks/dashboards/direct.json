@@ -1,0 +1,13 @@
+{
+  "workflow": "direct",
+  "title": "直接做",
+  "summary": "一个执行者从头做到尾，只分进行中 / 已完成。卡片上能直接打开方案和交接。",
+  "columns": {
+    "1": "执行者在做；改界面的完成前要发截图给你确认",
+    "done": "看交接：改了哪些文件、怎么验证的"
+  },
+  "card": [
+    {"key": "plan", "label": "方案", "type": "link", "from": "feature", "path": ["docs/plan.md", "docs/requirement.md"]},
+    {"key": "handoff", "label": "交接", "type": "link", "from": "feature", "path": "handoff.md"}
+  ]
+}

@@ -1,0 +1,9 @@
+# 运行数据（数据库、令牌、日志、会话记录）
+state/
+backups/
+# 麻薯管理自己时的功能资料
+.mashu/
+__pycache__/
+*.pyc
+*.bak*
+.DS_Store

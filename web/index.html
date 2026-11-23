@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>麻薯电脑秘书</title>
+  <link rel="icon" href="/static/mashu.svg">
+  <link rel="stylesheet" href="/static/style.css?v=__V__">
+  <script>try { const t = localStorage.getItem('mashu.theme') || 'auto'; document.documentElement.dataset.theme = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light'; } catch (e) {}</script>
+</head>
+<body>
+  <aside class="side">
+    <div id="assistantItem"></div>
+    <div class="side-tools">
+      <input id="search" type="search" placeholder="搜索项目 / 功能 / 会话名" autocomplete="off">
+      <button class="icon-btn" id="greenlightBtn" title="登记一个项目"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></button>
+    </div>
+    <div class="status-board" id="statusBoard"></div>
+    <nav id="slate"></nav>
+    <div class="side-foot" id="sideFoot"></div>
+  </aside>
+
+  <main class="main">
+    <nav class="tabs" id="tabs">
+      <button data-view="chat"><span>聊天</span></button>
+      <button data-view="mail"><span>邮箱</span></button>
+      <button data-view="board"><span>看板</span></button>
+      <button data-view="wall"><span>会话监控</span></button>
+      <button data-view="decisions"><span>决策记录</span></button>
+      <button data-view="library"><span>资料库</span></button>
+      <button data-view="budget"><span>用量</span></button>
+      <button data-view="selfiter"><span>自迭代</span></button>
+      <span class="tabs-right" id="tabsRight"></span>
+    </nav>
+    <section class="view" id="view-chat">
+      <header class="chat-head" id="chatHead"></header>
+      <div class="wf-dash" id="wfDash" hidden></div>
+      <div class="pending-bar" id="pendingBar" hidden></div>
+      <div class="messages" id="messages"></div>
+      <button class="to-bottom" id="toBottom" hidden title="跳到最新"><svg class="ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg></button>
+      <div class="drop-zone" id="dropZone" hidden><div class="dz-box"><div class="dz-ic"><svg class="ic" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg></div><div>松手发给 <b id="dropWho"></b></div><div class="dz-s">图片、截图、文档、整个文件夹都行，单个文件 50MB 以内</div></div></div>
+      <div class="attach-tray" id="attachTray" hidden></div>
+      <footer class="composer">
+        <div class="slash-menu" id="slashMenu" hidden></div>
+        <button class="attach-btn" id="attachBtn" title="添加文件（也可以直接 ⌘V 粘贴截图，或拖进来）"><svg class="ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
+        <button class="attach-btn" id="imageBtn" title="添加图片 / 截图（也可以直接 ⌘V 粘贴）"><svg class="ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.09-3.09a2 2 0 0 0-2.82 0L6 21"/></svg></button>
+        <input type="file" id="fileInput" multiple hidden>
+        <textarea id="input" rows="1" placeholder="和麻薯说点什么… Enter 发送，Shift+Enter 换行"></textarea>
+        <span class="composer-hint"><span class="kbd">/</span> 命令 <span class="kbd">⌘V</span> 贴图 <span class="kbd">↑</span> 上一句 <span class="kbd">⌘K</span> 跳转</span>
+        <button class="stop-btn" id="stopBtn" hidden title="打断它这一轮（Esc）"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>打断</button>
+        <button id="sendBtn">发送</button>
+      </footer>
+    </section>
+    <section class="view" id="view-mail"></section>
+    <section class="view scroll" id="view-board"></section>
+    <section class="view scroll" id="view-wall"></section>
+    <section class="view scroll" id="view-decisions"></section>
+    <section class="view scroll" id="view-budget"></section>
+    <section class="view scroll" id="view-selfiter"></section>
+    <section class="view" id="view-library"></section>
+  </main>
+
+  <div class="panel-grip" id="panelGrip"><div class="pg" title="拖动调宽度，拖到很窄松手就收起；点一下收起 / 展开（⌘\）"></div><button class="pg-btn" title="收起 / 展开右侧栏（⌘\）"></button></div>
+  <aside class="panel" id="panel"></aside>
+  <div class="palette" id="palette" hidden><div class="pal-box">
+    <input class="pal-in" placeholder="跳到对话、功能、页面，或执行操作…（↑↓ 选择，Enter 确认，Esc 关闭）" autocomplete="off">
+    <div class="pal-list"></div>
+    <div class="pal-foot"><span><span class="kbd">⌘K</span> 打开</span><span><span class="kbd">⌘J</span> 下一件待办</span><span><span class="kbd">⌥1–8</span> 切页面</span><span><span class="kbd">⌘\</span> 右侧栏</span><span><span class="kbd">/</span> 输入</span></div>
+  </div></div>
+  <div class="modal" id="modal" hidden><div class="modal-box" id="modalBox"></div></div>
+
+  <script>window.MASHU_TOKEN = "__TOKEN__";</script>
+  <script src="/static/app.js?v=__V__"></script>
+</body>
+</html>

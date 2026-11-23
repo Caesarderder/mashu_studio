@@ -1,0 +1,6 @@
+interface:
+  display_name: "Caesar 知识地图"
+  short_description: "维护项目六职能索引、事实工作流和记录，衔接可迁移技能与本地知识"
+  default_prompt: "使用 $caesar-docs 维护本项目知识地图及六职能 index。"
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# 麻薯电脑秘书 CLI 薄壳：mashu <命令>（会话里由 PATH 找到；hooks 也调用它）
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$DIR/../mashu/studio.py" "$@"

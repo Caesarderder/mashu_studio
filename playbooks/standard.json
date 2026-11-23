@@ -1,0 +1,30 @@
+{
+  "id": "standard",
+  "name": "标准流程",
+  "summary": "常规功能：方案 → 实现 → 代码审查（新会话）→ 本地测试 → 测试环境验证 → 发布上线。方案由麻薯批准，进测试环境要用户审批。",
+  "version": 2,
+  "stages": [
+    {"id": 1, "name": "方案", "plain": "需求、验收标准与设计", "role": "方案", "entry": null, "writes": false, "check": false, "require_ac": false,
+     "do": "读代码和 .mashu/README.md。写 docs/requirement.md（目标、范围、不做什么）和 docs/design.md（改动点、伪代码、测试计划）。用 mashu ac add 逐条写验收标准（可测、二值）。用 mashu claim 声明会改的文件范围。需求不清就 mashu ask。",
+     "exit": "文档、验收标准、改动范围齐了 → mashu feature set 1 已完成 → mashu feature handoff → mashu finish。"},
+    {"id": 2, "name": "实现", "plain": "写代码与测试", "role": "开发", "entry": "producer", "writes": true, "check": true, "require_ac": false,
+     "do": "按 design.md 实现，写单测和按验收标准编号的用例。只改声明范围内的文件，范围要扩就重新 mashu claim。每完成一块就提交：只 git add 自己改的文件，提交信息以 [项目id#编号] 开头。",
+     "exit": "自己的改动已提交 → mashu feature set 2 已完成 → handoff（只写事实：改了哪些文件、哪些提交、审查重点）→ mashu finish（会自动跑 .mashu/check.sh，失败会被打回）。"},
+    {"id": 3, "name": "代码审查", "plain": "独立审查并修复", "role": "审查", "entry": null, "writes": true, "check": true, "require_ac": false,
+     "do": "你没见过这些代码。用 git show 看本功能的提交（见状态文件），只对照 acceptance.json 找正确性问题、遗漏的验收标准和风险，不提风格意见（skip style）。阻断问题直接修复并提交。结论写 docs/review.md。",
+     "exit": "没有阻断问题 → set 3 已完成 → handoff → mashu finish。"},
+    {"id": 4, "name": "本地测试", "plain": "按验收标准逐条验证", "role": "测试", "entry": null, "writes": true, "check": true, "require_ac": true,
+     "do": "本地完整跑测试。按 acceptance.json 逐条验证，用 mashu ac pass AC-n --evidence \"命令和结果\" 标记，没通过的修复或上报。",
+     "exit": "全部验收标准通过 → set 4 已完成 → handoff → mashu finish（验收标准没全过会被打回）。"},
+    {"id": 5, "name": "测试环境验证", "plain": "部署测试环境并验证", "role": "测试环境", "entry": "producer", "writes": true, "check": false, "require_ac": true,
+     "do": "部署测试环境，跑测试环境用例，用完释放占用。没有测试环境的项目，征得负责人同意后 set 5 跳过。",
+     "exit": "通过 → set 5 已完成 → handoff → mashu finish。"},
+    {"id": 6, "name": "发布上线", "plain": "发布并验证", "role": "发布", "entry": null, "writes": true, "check": false, "require_ac": true,
+     "do": "写 docs/release.md 发布计划 → mashu ask --gate release-plan 申请审批 → 按计划发布，每次生产操作都要审批（会被拦截并提示）。不需要发布的项目可跳过。",
+     "exit": "上线验证 → set 6 已完成。"}
+  ],
+  "changelog": [
+    {"version": 1, "ts": "2026-11-13", "by": "初版", "note": "从旧麻薯 Hub 的六阶段工作流沿用而来。"},
+    {"version": 2, "ts": "2026-11-13", "by": "调研后改版", "note": "改用直白术语；加验收标准(ac)、改动范围声明(claim)、完成时自动检查(check)、按功能提交；审查只看正确性。"}
+  ]
+}

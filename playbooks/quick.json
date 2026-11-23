@@ -1,0 +1,21 @@
+{
+  "id": "quick",
+  "name": "快速流程",
+  "summary": "小改动、修 bug、文档：方案 → 实现与自测 → 发布。方案由负责人批准即可。",
+  "version": 2,
+  "stages": [
+    {"id": 1, "name": "方案", "plain": "需求与验收标准", "role": "方案", "entry": null, "writes": false, "check": false, "require_ac": false,
+     "do": "写 docs/requirement.md：要改什么、改动范围。用 mashu ac add 写验收标准，用 mashu claim 声明会改的文件。小改动一页纸即可。",
+     "exit": "set 1 已完成 → handoff → mashu finish。"},
+    {"id": 2, "name": "实现与自测", "plain": "实现、测试、按验收标准自验", "role": "开发", "entry": "producer", "writes": true, "check": true, "require_ac": true,
+     "do": "实现 + 测试；按验收标准逐条 mashu ac pass。只提交自己的文件，提交信息以 [项目id#编号] 开头。",
+     "exit": "set 2 已完成 → handoff → mashu finish（自动检查 + 验收标准全过才放行）。"},
+    {"id": 3, "name": "发布", "plain": "发布（需要的话）", "role": "发布", "entry": null, "writes": true, "check": false, "require_ac": true,
+     "do": "需要发布就 mashu ask --gate release-plan 申请审批后发布（生产操作要审批）；不需要就跳过。",
+     "exit": "set 3 已完成。"}
+  ],
+  "changelog": [
+    {"version": 1, "ts": "2026-11-13", "by": "初版", "note": "给小改动用的短流程。"},
+    {"version": 2, "ts": "2026-11-13", "by": "调研后改版", "note": "改用直白术语；加验收标准、改动范围、自动检查。"}
+  ]
+}
