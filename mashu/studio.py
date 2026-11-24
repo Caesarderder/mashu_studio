@@ -3463,6 +3463,16 @@ def handle_wrap(conn, c):
             end_camera(conn, c['id'], 'wrap', reason)
             notice(conn, channel_of(c), f'「{c["name"]}」收工：{reason}')
             return
+    if c['role'] == 'crew':
+        # 换会话空转保护：198 曾在功能状态没标完成时，每 20 秒换一个新会话（每个都说「做完了」又 finish）
+        n = one(conn, 'SELECT COUNT(*) AS n FROM cameras WHERE film_id=? AND seq_key IS ? AND ended_reason LIKE "handoff%" AND updated>?',
+                c['film_id'], c['seq_key'], time.time() - 600)['n']
+        if n >= 3:
+            why = f'10 分钟内已换 {n} 次会话，疑似空转：停下等子脑核对（功能做完了就 mashu feature set <阶段> 已完成）'
+            end_camera(conn, c['id'], 'wrap', why)
+            notice(conn, channel_of(c), f'「{c["name"]}」收工：{why}')
+            log_event(conn, 'relaunch-loop', c, level='warn', value=n)
+            return
     relaunch(conn, c, forced='强制' in reason)
 
 
