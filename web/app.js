@@ -821,8 +821,8 @@ function renderCard(m) {
   if (mt.reversible === false) chips.push('<span class="chip bad">不可逆</span>');
   if (mt.impact) chips.push(`<span class="chip">影响：${esc(mt.impact)}</span>`);
   for (const a of mt.anomalies || []) chips.push(`<span class="chip bad">${icon('alert', 12)}${esc(a)}</span>`);
-  if (mt.head) chips.push(`<span class="chip mono" title="审批绑定这个提交，代码变了要重新审批">@ ${esc(mt.head.slice(0, 8))}</span>`);
-  if (mt.diff) chips.push(`<span class="chip mono">${mt.diff.commits} 提交 · ${mt.diff.files} 文件 · +${mt.diff.insertions} −${mt.diff.deletions}</span>`);
+  if (mt.head && !mt.external) chips.push(`<span class="chip mono" title="审批绑定这个提交，代码变了要重新审批">@ ${esc(mt.head.slice(0, 8))}</span>`);
+  if (mt.diff && !mt.external) chips.push(`<span class="chip mono">${mt.diff.commits} 提交 · ${mt.diff.files} 文件 · +${mt.diff.insertions} −${mt.diff.deletions}</span>`);
   const acBox = mt.ac ? `<details class="ac-box" data-dkey="ac${r.id}" ${detailsOpen(`ac${r.id}`)}><summary>验收标准 ${mt.ac.passed}/${mt.ac.total} 通过</summary>${mt.ac.items.map((i) =>
     `<div class="ac-row ${i.passes ? 'ok' : 'no'}">${icon(i.passes ? 'check' : 'x', 12)}<b>${esc(i.id)}</b> ${esc(i.text)}</div>`).join('')}</details>` : '';
   const recLine = mt.recommend ? `<div class="rec-line">${icon('star', 13)}推荐：<b>${esc(mt.recommend)}</b>${mt.why ? ` —— ${esc(mt.why)}` : ''}${mt.recommend_by ? `<span class="k">（${esc(mt.recommend_by)}）</span>` : ''}</div>` : '';
