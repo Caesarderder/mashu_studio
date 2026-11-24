@@ -6448,6 +6448,14 @@ def cmd_cut(args):
     if who_c and not why:
         raise SystemExit('停执行者要写原因：mashu stop <功能> --reason "一句话：为什么停、接下来等谁"（会显示在功能频道）')
     why = why or '用户在命令行停止'
+    if who_c and not getattr(args, 'force', False):
+        # 自迭代：子脑曾在执行者刚拿到上线批准时把它停掉，打断正式发布；有生效中的 prod / 不可逆批准就先拦住
+        ap = one(conn, "SELECT * FROM approvals WHERE film_id=? AND seq_key IS ? AND gate IN ('prod','irreversible') AND expires_at>? "
+                       'ORDER BY id DESC LIMIT 1', f['id'], s['key'], time.time())
+        if ap:
+            left = int((ap['expires_at'] - time.time()) / 60)
+            raise SystemExit(f'「{cam["name"]}」有生效中的{GATES.get(ap["gate"], ap["gate"])}批准（还剩 {left} 分钟），可能正在做正式步骤。'
+                             '先等它做完，或 mashu stop <功能> --force --reason "为什么必须现在停"')
     if not seq_done(seq_state(f, s['key'])) and not wrote_handoff(cam):
         auto_handoff(conn, cam, f'执行者被停止前没写 handoff.md；停止原因：{why}')   # 功能没做完就停：留一份最小交接，下一个人不用从 diff 猜
     end_camera(conn, cam['id'], 'cut', why)
@@ -6938,6 +6946,7 @@ def main(argv=None):
             s.add_argument('--prompt')
         if name == 'stop':
             s.add_argument('--reason', help='为什么停、接下来等谁（agent 调用时必填，显示在功能频道）')
+            s.add_argument('--force', action='store_true', help='有生效中的上线 / 不可逆批准时仍然停（必须在 --reason 写清为什么）')
     s = sub.add_parser('note', help='给执行者补充指令'); s.add_argument('ref'); s.add_argument('text')
     s = sub.add_parser('memo', help='主脑给子脑的指示'); s.add_argument('film'); s.add_argument('text')
     s = sub.add_parser('say', help='麻薯在主对话里说话'); s.add_argument('text')
