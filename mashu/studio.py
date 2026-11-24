@@ -6176,7 +6176,7 @@ def main(argv=None):
     s = sub.add_parser('decide', help='记决策'); s.add_argument('text'); s.add_argument('--why'); s.add_argument('--film')
     s.add_argument('--seq'); s.add_argument('--ratify', action='store_true', help='要用户追认（默认记为已执行）')
     s = sub.add_parser('finish', aliases=['wrap'], help='本阶段完成 / 交接'); s.add_argument('--reason', required=True)
-    s = sub.add_parser('handoff', help='写交接文档 handoff.md（上下文到 75% 时用）')
+    s = sub.add_parser('handoff', help='写交接文档 handoff.md（上下文到 75%% 时用）')
     for k in ('now', 'next', 'open', 'files', 'evidence', 'risk', 'file'):
         s.add_argument(f'--{k}')
     sub.add_parser('reports', help='我手上的上报')
