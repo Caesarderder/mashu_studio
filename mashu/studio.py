@@ -32,6 +32,8 @@ import time
 import uuid
 
 sys.modules.setdefault('studio', sys.modules[__name__])   # 以脚本运行时，让 selfiter 里的 import studio 拿到同一个模块
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import platforms as plat  # noqa: E402   Codex / OpenCode 的纯函数部分
 
 CODE = Path(__file__).resolve().parent.parent
 PROMPTS = Path(__file__).resolve().parent / 'prompts'
@@ -65,6 +67,9 @@ DEFAULTS = dict(
     permission_mode='bypassPermissions',
     claude='claude',
     agy='agy',                    # Antigravity CLI（Gemini）的可执行文件；Gemini 会话用它开
+    codex='codex',                # Codex CLI 的可执行文件；Codex 会话用独立的 CODEX_HOME（state/codex-home），不改 ~/.codex
+    opencode='opencode',          # OpenCode CLI 的可执行文件；OpenCode 会话通过 OPENCODE_CONFIG_DIR 加载麻薯插件，不改 ~/.config/opencode
+    platform_versions={},         # 额外认可的 CLI 版本前缀：{"codex": ["0.170"]}；不在已验证范围内的平台不能选（安全拦截没验证过）
     tmux_session='mashu-studio',
     tmux_socket='',
     port=8770,
@@ -81,6 +86,8 @@ DEFAULTS = dict(
     code_modes={},                # 各角色默认是否开 Claude Code 实验性 Code Mode：{"crew": "on"}；没写 = 关。只对新会话生效
     providers={},                 # 各角色默认用哪家：{"crew": "gemini"}；没写 = claude。只对新会话生效（恢复会话沿用原来的）
     gemini_models={},             # 各角色 Gemini 会话的默认模型（agy models 里的名字）；空 = agy 默认
+    codex_models={},              # 各角色 Codex 会话的默认模型（mashu platforms 列出的名字）；空 = Codex 配置里的默认
+    opencode_models={},           # 各角色 OpenCode 会话的默认模型（provider/model）；空 = OpenCode 配置里的默认
     stuck_minutes=15,             # 忙碌中的会话这么久屏幕和记录都没变化：标「可能卡住」并提醒用户
     api_retry_max=3,              # 屏幕出现 API 报错时自动发“继续”的最多次数
     trust_streak=20,              # 某类审批连续原样批准多少次后，提议交给麻薯                    # {"claude-opus-5-5": {"input": 每百万 token 单价, "output":…, "cache_read":…, "cache_write":…}}
@@ -160,7 +167,8 @@ CREATE TABLE IF NOT EXISTS stage_watch(film_id TEXT, seq_key TEXT, statuses TEXT
 def cfg(key):
     if key in CONFIG_OVERRIDES:
         return CONFIG_OVERRIDES[key]
-    env = {'claude': 'MASHU_CLAUDE', 'agy': 'MASHU_AGY', 'tmux_session': 'MASHU_TMUX', 'tmux_socket': 'MASHU_TMUX_SOCKET'}.get(key)
+    env = {'claude': 'MASHU_CLAUDE', 'agy': 'MASHU_AGY', 'codex': 'MASHU_CODEX', 'opencode': 'MASHU_OPENCODE',
+           'tmux_session': 'MASHU_TMUX', 'tmux_socket': 'MASHU_TMUX_SOCKET'}.get(key)
     if env and os.environ.get(env):
         return os.environ[env]
     path = HOME / 'studio.json'
@@ -1252,7 +1260,7 @@ def set_dir_ok(f, wd):
 
 
 def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workflow=False, touches=None, plan=None, account=None,
-          workdir=None):
+          workdir=None, exec_cfg=None):
     """新建一个功能：默认直接做（不分阶段）；workflow=True 用项目的专门工作流，playbook=<模板id> 用指定模板。
     by=麻薯（主脑 / 子脑）开的功能先不派执行者：带着方案（plan，需求 + 技术方案）申请用户批准开工，批准后才启动。"""
     f = require_film(conn, film_id)
@@ -1262,6 +1270,7 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
     ensure_film_docs(f)
     if workdir and not set_dir_ok(f, workdir):
         raise ValueError(f'工作目录 {workdir} 必须是工程文件夹里已存在的子目录（相对 {f["path"]}）')
+    exec_cfg = check_exec(exec_cfg) if exec_cfg else None
     pb = load_template(playbook.rpartition('/')[2], f) if playbook else (film_playbook(f) if workflow else load_template(DEFAULT_PLAYBOOK))
     slug = slugify(slug)
     nums = [r['num'] or 0 for r in rows(conn, 'SELECT num FROM sequences WHERE film_id=?', f['id'])]
@@ -1278,6 +1287,8 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
         data['account'] = account
     if workdir:
         data['workdir'] = workdir
+    if exec_cfg:       # 开功能时指定的执行配置（--cli / --model / --effort）；开工审批卡上可以再改
+        data['exec'] = exec_cfg
     save_state(f, key, data)
     upd = adapter_call(conn, f, 'on_new', feature_view(conn, f, key))     # 项目适配器：建工作目录、绑定外部单号……
     if isinstance(upd, dict) and upd:
@@ -1300,9 +1311,11 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
     post(conn, 'system', channel, 'brief', brief)
     if by:
         notice(conn, f['id'], f'{LEVEL_LABEL.get(by["role"], by["role"])}「{by["name"]}」开了#{num}：{title or slug}，等用户批准开工')
-        text = f'申请开工 {seq_label(f, key)}：{title or slug}\n\n需求：{brief}' + (f'\n\n方案（docs/plan.md）：\n{plan}' if plan else '')
+        ex = kickoff_exec(conn, f, key)
+        text = (f'申请开工 {seq_label(f, key)}：{title or slug}\n\n执行者：{exec_label(ex["cli"], ex["model"], ex["effort"])}\n\n需求：{brief}'
+                + (f'\n\n方案（docs/plan.md）：\n{plan}' if plan else ''))
         create_report(conn, 'gate', by, f['id'], key, text, summary=f'批准开工 #{num}：{title or slug}',
-                      options=['批准开工', '先别'], gate='kickoff')
+                      options=['批准开工', '先别'], gate='kickoff', meta=dict(exec=ex))
         return f, key, None
     cam, _ = request_crew(conn, f, key, continue_prompt(f, key, f'新功能的需求（来自{by["name"] if by else "用户"}）：\n{brief}'))
     return f, key, cam
@@ -1477,13 +1490,52 @@ def kickoff_pending(f, key):
     return (seq_state(f, key) or {}).get('kickoff') == 'pending'
 
 
-def grant_kickoff(conn, f, key, who):
-    """用户批准开工（批复开工审批，或在网页上亲手启动）：解除闸门，关掉还开着的开工审批。"""
+def check_exec(v):
+    """执行配置 dict(cli, model, effort) 校验：平台要能用，模型 / 思考程度要认得；空字符串 = 用默认。返回整理后的 dict。"""
+    if not isinstance(v, dict):
+        raise ValueError('执行配置格式不对')
+    cli = (v.get('cli') or 'claude').strip()
+    if cli not in PROVIDERS:
+        raise ValueError(f'不认识的 CLI：{cli}（可选 {" / ".join(PROVIDERS)}）')
+    st = platform_status(cli)
+    if not st['ok']:
+        raise ValueError(f'{PROV_LABEL[cli]} 现在不能用：{st["reason"]}')
+    model, effort = (v.get('model') or '').strip(), (v.get('effort') or '').strip()
+    if model and not valid_model(cli, model):
+        raise ValueError(f'{PROV_LABEL[cli]} 不认识模型 {model}')
+    if effort and effort not in EFFORTS:
+        raise ValueError(f'思考程度只能是 {" / ".join(EFFORTS)}：{effort}')
+    return dict(cli=cli, model=model, effort=effort)
+
+
+def kickoff_exec(conn, f, key):
+    """这个功能的执行者会用什么启动：dict(cli, model, effort)，按 对话单独设 > 功能定的（state.exec）> 执行者默认 解析。"""
+    c = dict(id=0, role='crew', film_id=f['id'], seq_key=key, resume_sid=None, claude_sid=None)
+    prov = provider_pref(conn, c)
+    p = session_pref(conn, c, prov)
+    return dict(cli=prov, model=p['model'], effort=p['effort'])
+
+
+def grant_kickoff(conn, f, key, who, exec_cfg=None):
+    """用户批准开工（批复开工审批，或在网页上亲手启动）：解除闸门，关掉还开着的开工审批。
+    exec_cfg：卡片上最后选定的 CLI / 模型 / 思考程度，存进 state.json 的 exec，执行者按它启动；没给就用开工卡上写的。"""
     data = seq_state(f, key)
     if not data or data.get('kickoff') != 'pending':
         return
+    if exec_cfg is None:
+        r = one(conn, 'SELECT meta FROM reports WHERE film_id=? AND seq_key=? AND gate="kickoff" ORDER BY id DESC LIMIT 1', f['id'], key)
+        exec_cfg = json.loads((r or {}).get('meta') or '{}').get('exec')
+        try:
+            exec_cfg = check_exec(exec_cfg) if exec_cfg else None
+        except ValueError as exc:      # 卡上写的平台现在不能用了：不挡开工，按默认来
+            notice(conn, f'{f["id"]}/{key}', f'开工卡上的执行配置用不了（{exc}），执行者按默认设置启动')
+            exec_cfg = None
+    if exec_cfg:
+        data['exec'] = check_exec(exec_cfg)
     data['kickoff'] = 'approved'
     save_state(f, key, data)
+    if exec_cfg:
+        audit(conn, 'executive', 'kickoff-exec', f['id'], key, exec_label(data['exec']['cli'], data['exec']['model'], data['exec']['effort']))
     for r in rows(conn, 'SELECT id FROM reports WHERE film_id=? AND seq_key=? AND gate="kickoff" AND status="open"', f['id'], key):
         close_report(conn, r['id'], '批准开工', 'executive')
         add_route(conn, r['id'], action='answer', who=who, level='executive', note='亲手启动，视同批准开工')
@@ -1790,12 +1842,58 @@ GEMINI_HOME = Path.home() / '.gemini' / 'antigravity-cli'     # agy 的数据目
 AGY_HOOKS = Path.home() / '.gemini' / 'config' / 'hooks.json'   # agy 只从这里（或工作区 .agents/hooks.json）读 hooks
 
 
+CODEX_USER_HOME = Path(os.environ.get('MASHU_CODEX_USER_HOME') or Path.home() / '.codex')   # 用户自己的 Codex 配置（只读）
+
+
+def codex_home():
+    """麻薯会话专用的 CODEX_HOME：用户 config.toml 的副本 + 麻薯 hooks，登录文件软链接共用（见 platforms.build_codex_home）。"""
+    return HOME / 'codex-home'
+
+
+def opencode_config_dir():
+    """麻薯会话的 OPENCODE_CONFIG_DIR：plugins/mashu.js 软链接到 integrations/opencode/mashu.js，只有麻薯开的 OpenCode 会加载。"""
+    d = HOME / 'opencode-config'
+    link = d / 'plugins' / 'mashu.js'
+    src = CODE / 'integrations' / 'opencode' / 'mashu.js'
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if not link.is_symlink() or os.readlink(link) != str(src):
+        tmp = link.with_name('.mashu.js.tmp')
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        tmp.symlink_to(src)
+        os.replace(tmp, link)
+    return d
+
+
 def has_transcript(cwd, sid):
     if not sid:
         return False
     if (CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(cwd)) / f'{sid}.jsonl').exists():
         return True
+    if plat.codex_session_file(codex_home(), sid):     # Codex 会话（麻薯 CODEX_HOME 里的 rollout）
+        return True
+    if sid.startswith('ses_') and (HOME / 'opencode-sessions' / sid).exists():     # OpenCode 会话（hook 收到会话 ID 时记下）
+        return True
     return (GEMINI_HOME / 'brain' / sid).is_dir()      # Gemini（agy）会话
+
+
+def transcript_file(conn, c):
+    """这个机位当前会话的对话记录文件：Claude 的 projects/*.jsonl、Codex 的 rollout、OpenCode 插件写的实时文件；没有就 None。"""
+    sid = c['claude_sid'] if c else None
+    if not sid:
+        return None
+    prov = cam_provider(conn, c)
+    try:
+        if prov == 'codex':
+            p = meta_get(conn, f'transcript:{sid}')
+            return Path(p) if p else plat.codex_session_file(codex_home(), sid)
+        if prov == 'opencode':
+            return HOME / 'live' / f'{c["id"]}.json'
+        if prov == 'gemini':
+            return agy_transcript(sid)
+        return CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, c))) / f'{sid}.jsonl'
+    except RuntimeError:
+        return None
 
 
 def f_of(conn, cam):
@@ -2017,6 +2115,106 @@ def agy_cmd(conn, c, cwd, sid, as_file, no_prompt):
     return cmd, sid
 
 
+def extra_dirs(conn, c):
+    """会话要能读写的额外目录：执行者的功能资料目录、麻薯的知识地图。"""
+    dirs = [seq_dir(f_of(conn, c), c['seq_key'])] if c['role'] == 'crew' else []
+    return dirs + [KMAP]
+
+
+def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
+    """Codex 会话的命令行，对应 Claude 的那套（详见 docs/references/platforms.md）：
+    - CODEX_HOME=state/codex-home：用户 config.toml 的副本 + 麻薯 hooks，登录文件软链接共用。不改 ~/.codex（Codex 会往
+      CODEX_HOME 的 config.toml 写目录信任，用独立 home 就只写到副本里）；
+    - hooks 是内联在副本 config.toml 里的，--dangerously-bypass-hook-trust 让它们不用先在 /hooks 里点信任；
+    - 系统提示：-c developer_instructions=…（启动、恢复都传）；
+    - 会话 ID 不能预先指定：SessionStart / UserPromptSubmit hook 回写；恢复用 codex resume <ID>。
+    返回 (命令, sid, 额外环境变量, 启动前的 shell 行)。"""
+    skills = {}
+    host = skill_host()
+    if host:
+        skills['caesar-docs'] = Path(os.path.realpath(host / '.claude' / 'skills' / 'caesar-docs'))
+    home = plat.build_codex_home(codex_home(), CODEX_USER_HOME, skills, extra=plat.codex_hooks_toml(shlex.quote(str(BIN / 'mashu'))))
+    auth = home / 'auth.json'
+    if auth.exists() and not auth.is_symlink():
+        notice(conn, channel_of(c), f'{auth} 变成了普通文件（Codex 刷新登录时换掉了软链接）：麻薯的 Codex 会话和你自己的登录可能不同步，'
+                                    f'确认能用后可以删掉它，麻薯下次启动会重新链接到 {CODEX_USER_HOME / "auth.json"}')
+    pref = session_pref(conn, c, 'codex')
+    cmd = [cfg('codex')] + (['resume', sid] if sid else [])
+    cmd += ['--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust', '-C', str(cwd)]
+    for d in extra_dirs(conn, c):
+        cmd += ['--add-dir', str(d)]
+    if pref['model']:
+        cmd += ['-m', pref['model']]
+    eff = platform_effort('codex', pref['model'], pref['effort'])
+    if eff:
+        cmd += ['-c', f'model_reasoning_effort={plat.toml_str(eff)}']
+    plat.codex_trust(home, [cwd, os.path.realpath(cwd)])     # 先记成信任（写在麻薯的副本里），免得弹「Trust this folder?」
+    cmd += ['-c', as_file('devinst', 'developer_instructions=' + plat.toml_str(system_prompt(conn, c)))]
+    if sid:
+        meta_set(conn, f'provider:{sid}', 'codex')
+    if not no_prompt:
+        cmd += ['--', as_file('prompt', c['prompt'] or '开工')]
+    return cmd, sid, {'CODEX_HOME': str(home)}, []
+
+
+def opencode_cmd(conn, c, cwd, sid, as_file, no_prompt):
+    """OpenCode 会话的命令行（TUI）：
+    - OPENCODE_CONFIG_DIR=state/opencode-config：只多加载麻薯插件（integrations/opencode/mashu.js），用户的 ~/.config/opencode 照常读、不改；
+    - 模型、思考档位：OPENCODE_CONFIG_CONTENT 里的 agent.build.model / variant（TUI 没有 --variant）；
+    - 系统提示：插件在 experimental.chat.system.transform 里追加 MASHU_SYSTEM_FILE；
+    - 去掉 TMUX 环境变量：用户装的 opentmux 插件在 tmux 里会自己开窗格，会打乱麻薯的窗口布局；
+    - 会话 ID：插件在第一轮回写；恢复用 -s <ID>。"""
+    as_file('system', system_prompt(conn, c))
+    pref = session_pref(conn, c, 'opencode')
+    conf = {}
+    if pref['model']:
+        agent = dict(model=pref['model'])
+        var = platform_effort('opencode', pref['model'], pref['effort'])
+        if var:
+            agent['variant'] = var
+        conf['agent'] = {'build': agent}
+    cmd = [cfg('opencode'), str(cwd), '--auto']
+    if sid:
+        cmd += ['-s', sid]
+        meta_set(conn, f'provider:{sid}', 'opencode')
+        if not no_prompt:       # 恢复会话时 --prompt 不会自动提交：等界面就绪后由调度器粘贴（resume_prompts）
+            meta_set(conn, f'pending-prompt:{c["id"]}', c['prompt'] or '继续')
+    elif not no_prompt:
+        cmd += ['--prompt', as_file('prompt', c['prompt'] or '开工')]
+    env = dict(OPENCODE_CONFIG_DIR=str(opencode_config_dir()), MASHU_BIN=str(BIN / 'mashu'),
+               MASHU_SYSTEM_FILE=str(HOME / 'launch' / f'{c["id"]}-system.txt'),
+               XDG_STATE_HOME=str(opencode_state_home(pref['model'], conf.get('agent', {}).get('build', {}).get('variant'))),
+               MASHU_USER_XDG_STATE_HOME=os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local' / 'state'))
+    if conf:
+        env['OPENCODE_CONFIG_CONTENT'] = json.dumps(conf, ensure_ascii=False)
+    return cmd, sid, env, ['unset TMUX TMUX_PANE']
+
+
+def opencode_state_home(model, variant):
+    """麻薯 OpenCode 会话的 XDG_STATE_HOME：OpenCode 的 TUI 把「每个模型上次用的思考档位」、最近模型、输入历史存在
+    $XDG_STATE_HOME/opencode/model.json 等文件里，启动时这个档位优先于配置的 variant。麻薯会话用自己的一份：
+    不往用户的 ~/.local/state/opencode 里写，启动前把要用的档位写好（没选档位就记 default）。
+    执行者跑的 bash 命令由插件（shell.env）把 XDG_STATE_HOME 还原成用户的。"""
+    d = HOME / 'opencode-state'
+    fp = d / 'opencode' / 'model.json'
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    if model:
+        try:
+            data = json.loads(fp.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        data.setdefault('variant', {})[model] = variant or 'default'
+        prov, _, mid = model.partition('/')
+        data['recent'] = [dict(providerID=prov, modelID=mid)] + [x for x in data.get('recent') or []
+                                                                 if isinstance(x, dict) and f'{x.get("providerID")}/{x.get("modelID")}' != model][:9]
+        data.setdefault('favorite', [])
+        tmp = fp.with_name('.model.json.mashu-tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        os.replace(tmp, fp)
+    return d
+
+
 def launch(conn, cid, pane=None, no_prompt=False):
     """开会话。pane 给定时在这个窗格里换上新的 claude 会话（同身份交接用），不新开窗格。
     no_prompt：只恢复会话不发话（换模型 / 思考程度时用），会话起来就是空闲。"""
@@ -2046,10 +2244,28 @@ def launch(conn, cid, pane=None, no_prompt=False):
         first = adapter_prompt(conn, fa, c['seq_key']).get('first')
         if first:           # 适配器的开场话接在「继续 …」后面（hook 认「继续」开头注入状态摘要）
             c = dict(c, prompt=f'{c["prompt"] or "开工"}\n\n{first}')
-    prov = provider_of_sid(conn, sid) if sid else provider_pref(conn, c)    # 恢复会话必须沿用开会话时的 Claude / Gemini
+    prov = provider_of_sid(conn, sid) if sid else provider_pref(conn, c)    # 恢复会话必须沿用开会话时的那家
+    st = platform_status(prov)
+    if not st['ok']:
+        if sid:      # 恢复会话没法换平台：不启动，说明原因
+            conn.execute('UPDATE cameras SET state="ended", ended_reason=?, updated=? WHERE id=?', (st['reason'], time.time(), cid))
+            conn.commit()
+            log_event(conn, 'launch-fail', c, level='error', err=st['reason'])
+            notice(conn, channel_of(c), f'「{c["name"]}」的会话是 {PROV_LABEL.get(prov, prov)} 开的，现在不能用：{st["reason"]}')
+            return None
+        notice(conn, channel_of(c), f'{PROV_LABEL.get(prov, prov)} 现在不能用（{st["reason"]}），这次改用 Claude 启动「{c["name"]}」')
+        log_event(conn, 'platform-fallback', c, level='warn', provider=prov, err=st['reason'])
+        prov = 'claude'
     meta_set(conn, f'camprov:{cid}', prov)
+    extra_env, pre = {}, []
     if prov == 'gemini':
         cmd, sid = agy_cmd(conn, c, cwd, sid, as_file, no_prompt)
+        code = False
+    elif prov == 'codex':
+        cmd, sid, extra_env, pre = codex_cmd(conn, c, cwd, sid, as_file, no_prompt)
+        code = False
+    elif prov == 'opencode':
+        cmd, sid, extra_env, pre = opencode_cmd(conn, c, cwd, sid, as_file, no_prompt)
         code = False
     else:
         cmd = [cfg('claude'), '--permission-mode', cfg('permission_mode'), '-n', title,
@@ -2078,7 +2294,7 @@ def launch(conn, cid, pane=None, no_prompt=False):
     pref = session_pref(conn, c, prov)
     script = HOME / 'launch' / f'{cid}.sh'
     exit_fp = shlex.quote(str(HOME / 'launch' / f'{cid}.exit'))
-    script.write_text(f'#!/bin/sh\nrm -f {exit_fp}\n' + ' '.join(f'"$(cat {shlex.quote(str(big[a]))})"' if a in big else shlex.quote(str(a))
+    script.write_text(f'#!/bin/sh\nrm -f {exit_fp}\n' + ''.join(x + '\n' for x in pre) + ' '.join(f'"$(cat {shlex.quote(str(big[a]))})"' if a in big else shlex.quote(str(a))
                                                     for a in cmd) + f'\necho $? > {exit_fp}\n')
     cmd = ['/bin/sh', str(script)]
     f = film(conn, c['film_id']) if c['film_id'] else None
@@ -2087,6 +2303,7 @@ def launch(conn, cid, pane=None, no_prompt=False):
                MASHU_TMUX_SOCKET=cfg('tmux_socket') or '',
                MASHU_SEQ_DIR=str(seq_dir(f, c['seq_key'])) if f and c['seq_key'] else '',
                PATH=f'{BIN}:{os.environ.get("PATH", "/usr/bin:/bin")}', **{CODE_ENV: '1' if code else '0'})
+    env.update(extra_env)
     if fa and has_adapter_hook(fa, 'launch_env'):
         prev = c['resume_sid'] and meta_get(conn, f'adapter-env:{c["resume_sid"]}')
         extra = adapter_call(conn, fa, 'launch_env', feature_view(conn, fa, c['seq_key']),
@@ -2117,13 +2334,15 @@ def launch(conn, cid, pane=None, no_prompt=False):
     conn.execute('UPDATE cameras SET state=?, pane=?, claude_sid=?, started_at=?, last_active=?, last_stop=?, updated=?, '
                  'pref_applied=? WHERE id=?', ('idle' if no_prompt else 'running', pane, sid, t, t, t + 0.001 if no_prompt else 0, t,
                                                json.dumps(pref, sort_keys=True), cid))
+    if prov in ('codex', 'opencode') and pref.get('effort'):     # 这两家不回报思考档位：记下实际传的那档，网页显示「现在：…」
+        conn.execute('UPDATE cameras SET effort=? WHERE id=?', (platform_effort(prov, pref['model'], pref['effort']) or None, cid))
     conn.commit()
     c = camera(conn, cid)
     if c['role'] == 'crew' and not respawn:
         f = film(conn, c['film_id'])
         stage = stage_def(seq_state(f, c['seq_key']), c['stage_no'] or 1)
         post(conn, 'system', channel_of(c), 'handover',
-             f'—— #{seq_num(c["seq_key"]) or c["seq_key"]} · {stage["name"]} · 「{c["name"]}」以{c["crew_role"]}身份接手{"（Gemini）" if prov == "gemini" else ""} ——'
+             f'—— #{seq_num(c["seq_key"]) or c["seq_key"]} · {stage["name"]} · 「{c["name"]}」以{c["crew_role"]}身份接手{f"（{PROV_LABEL[prov]}）" if prov != "claude" else ""} ——'
              if not c['resume_sid'] else f'—— 「{c["name"]}」恢复会话——', camera=c)
     elif c['role'] == 'producer' and not respawn:
         post(conn, 'system', c['film_id'], 'handover', f'—— 子脑启动 ——', camera=c)
@@ -2464,9 +2683,13 @@ def is_approval(r, text):
     return bool(opts) and text.strip() == opts[0]
 
 
-def answer_report(conn, rid, cam, text):
-    """批复上报：cam 为 None 表示用户（只能来自网页）。"""
+def answer_report(conn, rid, cam, text, exec_cfg=None):
+    """批复上报：cam 为 None 表示用户（只能来自网页）。exec_cfg：开工审批卡上改过的执行配置（CLI / 模型 / 思考程度）。"""
     r = report(conn, rid)
+    if exec_cfg:
+        if r['gate'] != 'kickoff':
+            raise ValueError('只有开工审批能带执行配置')
+        exec_cfg = check_exec(exec_cfg)
     check_holder(conn, r, cam)
     if json.loads(r.get('meta') or '{}').get('external'):
         return answer_external(conn, r, cam, text)
@@ -2501,7 +2724,7 @@ def answer_report(conn, rid, cam, text):
         audit(conn, level, 'sign' if approved else 'reject', r['film_id'], r['seq_key'], f'#{rid} {r["gate"]}：{text}')
     if r['gate'] == 'kickoff' and f:
         if approved:
-            grant_kickoff(conn, f, r['seq_key'], who)
+            grant_kickoff(conn, f, r['seq_key'], who, exec_cfg or None)
             data = seq_state(f, r['seq_key'])
             request_crew(conn, f, r['seq_key'], continue_prompt(
                 f, r['seq_key'], f'[系统] {who}已批准开工。需求：\n{data.get("summary") or r["text"]}\n\n方案见资料目录 docs/plan.md（如有），按它做。'))
@@ -3052,6 +3275,26 @@ def auto_confirm_dialogs(conn):
                 tmux('send-keys', '-t', c['pane'], 'Enter', check=False)
 
 
+OPENCODE_READY = ('ctrl+p commands', 'ctrl+p')
+
+
+def resume_prompts(conn):
+    """OpenCode 恢复会话（-s）时开场话不会自动提交：界面就绪后粘贴进去（launch 记在 pending-prompt:<机位>）。"""
+    for r in rows(conn, 'SELECT k, v FROM meta WHERE k LIKE "pending-prompt:%"'):
+        cid = r['k'].split(':', 1)[1]
+        c = camera(conn, int(cid)) if cid.isdigit() else None
+        if not c or c['state'] not in LIVE or c['pane'] not in alive_panes():
+            if not c or c['state'] == 'ended' or time.time() - (c['started_at'] or 0) > 300:
+                conn.execute('DELETE FROM meta WHERE k=?', (r['k'],))
+                conn.commit()
+            continue
+        if time.time() - (c['started_at'] or 0) < 2 or not any(m in screen(c['pane']) for m in OPENCODE_READY):
+            continue
+        conn.execute('DELETE FROM meta WHERE k=?', (r['k'],))
+        conn.commit()
+        paste(c['pane'], r['v'])
+
+
 # ---------- 会话健康：API 报错、卡住、掉线（2026-11-22 用户：「AI 卡住的时候及时提醒我，标注一下状态」） ----------
 
 API_ERROR_RE = re.compile(r'API Error|Connection lost mid-response|overloaded_error|Overloaded|Request timed out|'
@@ -3064,9 +3307,8 @@ _health_tick = [0.0]
 
 def transcript_mtime(conn, c):
     try:
-        cwd = camera_cwd(conn, c)
-        return (CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(cwd)) / f'{c["claude_sid"]}.jsonl').stat().st_mtime
-    except (OSError, RuntimeError, TypeError):
+        return transcript_file(conn, c).stat().st_mtime
+    except (OSError, RuntimeError, TypeError, AttributeError):
         return 0
 
 
@@ -3461,6 +3703,7 @@ def _tick(conn):
         auto_resume_lost(conn, lost_busy)
     ensure_assistant(conn)
     auto_confirm_dialogs(conn)
+    resume_prompts(conn)
     health_guard(conn)
     watch_stages(conn)
     context_guard(conn)
@@ -3538,17 +3781,32 @@ _LIVE_CACHE = {}
 
 def turn_progress_of(conn, cam, tail=256_000):
     """读 transcript 末尾算当前这一轮的进度；文件没变就用缓存。Claude Code 按内容块落盘，所以是分段流式。"""
-    if not cam['claude_sid']:
+    if not cam['claude_sid'] and cam_provider(conn, cam) != 'opencode':
+        return '', ''
+    prov = cam_provider(conn, cam)
+    if prov == 'gemini':
         return '', ''
     try:
-        p = CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, cam))) / f'{cam["claude_sid"]}.jsonl'
+        p = transcript_file(conn, cam)
         st = p.stat()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, AttributeError):
         return '', ''
     key = (st.st_size, st.st_mtime)
     hit = _LIVE_CACHE.get(p)
     if hit and hit[0] == key:
         return hit[1]
+    if prov == 'opencode':          # 插件写的实时文件：{text, tool, sid}
+        try:
+            d = json.loads(p.read_text())
+            out = ((d.get('text') or '').strip(), d.get('tool') or '')
+        except (OSError, ValueError):
+            out = ('', '')
+        _LIVE_CACHE[p] = (key, out)
+        return out
+    if prov == 'codex':
+        out = plat.codex_progress(plat.read_jsonl_tail(p, tail))
+        _LIVE_CACHE[p] = (key, out)
+        return out
     with p.open('rb') as fh:
         if st.st_size > tail:
             fh.seek(st.st_size - tail)
@@ -3598,7 +3856,7 @@ _BG_CACHE = {}
 
 def bg_tasks_of(conn, cam, tail=1_000_000):
     """会话 transcript 末尾里还没结束的后台任务数；文件没变就用缓存。"""
-    if not cam or not cam['claude_sid']:
+    if not cam or not cam['claude_sid'] or cam_provider(conn, cam) != 'claude':     # 后台任务只认得 Claude Code 的记录
         return 0
     try:
         p = CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, cam))) / f'{cam["claude_sid"]}.jsonl'
@@ -3696,6 +3954,11 @@ def session_detail(conn, cam, tail=1_500_000):
                turn_out=0, busy=bool(cam['last_active'] > cam['last_stop']))
     if not cam['claude_sid']:
         return out
+    prov = cam_provider(conn, cam)
+    if prov != 'claude':        # 别家：只给这一轮的文字 / 正在用的工具（详细的工具表、子代理只认得 Claude Code 的记录）
+        text, tool = turn_progress_of(conn, cam)
+        return dict(out, provider=prov, tools=[dict(name=tool.split(' · ')[0], detail=tool.split(' · ', 1)[1] if ' · ' in tool else '',
+                                                     state='doing', start=None, end=None, id='live')] if tool else [])
     try:
         base = CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, cam)))
         p = base / f'{cam["claude_sid"]}.jsonl'
@@ -3830,6 +4093,9 @@ def interrupt(conn, c, by='用户'):
         return f'「{c["name"]}」现在没在忙'
     text, tool = turn_progress_of(conn, c)
     tmux('send-keys', '-t', c['pane'], 'Escape', check=False)
+    if cam_provider(conn, c) == 'opencode':       # OpenCode 要连按两次 Esc 才打断
+        time.sleep(0.2)
+        tmux('send-keys', '-t', c['pane'], 'Escape', check=False)
     conn.execute('UPDATE cameras SET state="idle", last_stop=? WHERE id=?', (time.time(), c['id']))
     conn.commit()
     if text:
@@ -3852,7 +4118,119 @@ def get_pref(conn, channel):
         return {}
 
 
-PROVIDERS = ('claude', 'gemini')
+# ---------- 平台表：每家 CLI 的名字、模型偏好键、默认模型键、可执行文件、已验证版本 ----------
+PROVIDERS = ('claude', 'gemini', 'codex', 'opencode')
+PROV_LABEL = dict(claude='Claude', gemini='Gemini', codex='Codex', opencode='OpenCode')
+MODEL_KEY = dict(claude='model', gemini='gmodel', codex='xmodel', opencode='omodel')          # 对话偏好（pref:<频道>）里的模型键
+DEFAULT_MODELS = dict(claude='models', gemini='gemini_models', codex='codex_models', opencode='opencode_models')   # studio.json 的默认模型键
+PROV_EXE = dict(claude='claude', gemini='agy', codex='codex', opencode='opencode')         # cfg 里可执行文件的键
+# 安全拦截（PreToolUse 的全部检查）在这些版本上做过真实会话实测；别的版本 hook 格式可能变了，不让选（studio.json 的 platform_versions 可追加）
+VERIFIED_VERSIONS = dict(codex=('0.166',), opencode=('1.18',))
+_PLAT_CACHE = {}
+
+
+def cli_version(prov):
+    """CLI 版本号（缓存 10 分钟）；没装或跑不起来是 None。"""
+    exe = cfg(PROV_EXE[prov])
+    hit = _PLAT_CACHE.get(('ver', exe))
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    v = None
+    try:
+        r = subprocess.run([exe, '--version'], capture_output=True, text=True, timeout=20)
+        m = re.search(r'(\d+\.\d+\.\d+[\w.\-]*)', (r.stdout or '') + (r.stderr or ''))
+        v = m.group(1) if r.returncode == 0 and m else None
+    except (OSError, subprocess.TimeoutExpired):
+        v = None
+    _PLAT_CACHE[('ver', exe)] = (time.time(), v)
+    return v
+
+
+def platform_status(prov):
+    """这家能不能用来开会话：dict(ok, reason, version)。Claude、Gemini 沿用以前的行为（不检查）；
+    Codex、OpenCode 要装了、版本在已验证范围内（安全拦截实测过），插件 / hooks 模板在。"""
+    if prov not in PROVIDERS:
+        return dict(ok=False, reason=f'不认识的平台 {prov}', version=None)
+    if prov in ('claude', 'gemini'):
+        return dict(ok=True, reason='', version=None)
+    ver = cli_version(prov)
+    if not ver:
+        return dict(ok=False, reason=f'没装 {PROV_LABEL[prov]} CLI（找不到 {cfg(PROV_EXE[prov])}）', version=None)
+    allowed = tuple(VERIFIED_VERSIONS.get(prov, ())) + tuple((cfg('platform_versions') or {}).get(prov) or ())
+    if not any(ver == a or ver.startswith(a + '.') for a in allowed):
+        return dict(ok=False, reason=f'{PROV_LABEL[prov]} {ver} 没做过安全拦截实测（已验证：{" / ".join(allowed)}.x），'
+                                     '不能当麻薯的会话用；实测后在 studio.json 的 platform_versions 里加上', version=ver)
+    if prov == 'opencode' and not (CODE / 'integrations' / 'opencode' / 'mashu.js').exists():
+        return dict(ok=False, reason='缺少麻薯的 OpenCode 插件 integrations/opencode/mashu.js', version=ver)
+    return dict(ok=True, reason='', version=ver)
+
+
+def codex_model_info():
+    """Codex 可选模型 {名字: dict(efforts, context)}：Codex 自己缓存的 models_cache.json（麻薯 CODEX_HOME 的优先，其次用户的）。"""
+    for p in (codex_home() / 'models_cache.json', CODEX_USER_HOME / 'models_cache.json'):
+        got = plat.codex_models(p)
+        if got:
+            return got
+    return {}
+
+
+def opencode_model_info():
+    """OpenCode 可选模型 {provider/model: dict(variants, context, free)}：mashu opencode-models --refresh 缓存的 opencode models --verbose。"""
+    try:
+        got = json.loads((HOME / 'opencode-models.json').read_text()).get('models') or {}
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def refresh_opencode_models():
+    """跑 opencode models --verbose（只列模型、不碰凭证），缓存到 state/opencode-models.json。"""
+    try:
+        r = subprocess.run([cfg('opencode'), 'models', '--verbose'], capture_output=True, text=True, timeout=120, cwd=str(HOME))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f'opencode models 运行失败：{exc}')
+    got = plat.opencode_models_parse(r.stdout or '')
+    if not got:
+        raise ValueError('opencode models --verbose 的输出里没认出模型：' + ((r.stdout or '') + (r.stderr or '')).strip()[-300:])
+    HOME.mkdir(parents=True, exist_ok=True)
+    (HOME / 'opencode-models.json').write_text(json.dumps(dict(models=got, at=time.time()), ensure_ascii=False, indent=2))
+    return f'OpenCode 模型列表已更新（{len(got)} 个）'
+
+
+def platform_models(prov):
+    if prov == 'gemini':
+        return tuple(gemini_models())
+    if prov == 'codex':
+        return tuple(codex_model_info())
+    if prov == 'opencode':
+        return tuple(opencode_model_info())
+    return MODELS
+
+
+def platform_effort(prov, model, effort):
+    """麻薯的思考程度 → 这家这个模型实际传的档位（不支持的档位取最接近的）。"""
+    if not effort:
+        return ''
+    if prov == 'codex':
+        return plat.nearest_effort(effort, (codex_model_info().get(model) or {}).get('efforts') or ['low', 'medium', 'high', 'xhigh', 'max'])
+    if prov == 'opencode':
+        return plat.nearest_effort(effort, (opencode_model_info().get(model) or {}).get('variants') or [])
+    return effort
+
+
+def model_context(prov, model):
+    """模型的上下文窗口（token）；不知道是 None。"""
+    if prov == 'codex':
+        return (codex_model_info().get(model) or {}).get('context')
+    if prov == 'opencode':
+        return (opencode_model_info().get(model) or {}).get('context')
+    return None
+
+
+def exec_label(prov, model, effort):
+    return f'{PROV_LABEL.get(prov, prov)} · {model or "默认模型"} · 思考 {effort or "默认"}'
+
+
 # agy 没登录时拿不到真实列表，先用文档里的名字兜底；登录后 `mashu gemini-models --refresh`（或网页「默认设置」里的刷新）换成 agy models 的输出
 GEMINI_FALLBACK = ('Gemini 4 Neon', 'Gemini 4 Argon', 'Gemini 4 Carbon', 'Gemini 4 Hydrogen', 'Gemini 3.8 Flash', 'Gemini 3.1 Pro')
 GEMINI_MODEL_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9 ._()/:-]{0,79}')
@@ -3894,18 +4272,33 @@ def refresh_gemini_models():
 def valid_model(provider, v):
     if provider == 'gemini':
         return v in gemini_models() or bool(GEMINI_MODEL_RE.fullmatch(v))
+    if provider == 'codex':
+        return v in codex_model_info() or bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,79}', v))
+    if provider == 'opencode':
+        return v in opencode_model_info() or bool(re.fullmatch(r'[A-Za-z0-9][\w.\-]*/[\w.:\-/]{1,120}', v))
     return v in MODELS or bool(re.fullmatch(r'claude-[a-z0-9.-]+', v))
 
 
+def feature_exec(conn, c):
+    """执行者所属功能批准开工时定下的执行配置（state.json 的 exec：cli / model / effort）；不是执行者或没定就是空 dict。"""
+    if not c or c['role'] != 'crew' or not c['film_id'] or not c['seq_key']:
+        return {}
+    f = film(conn, c['film_id'])
+    v = (seq_state(f, c['seq_key']) or {}).get('exec') if f else None
+    return v if isinstance(v, dict) else {}
+
+
 def provider_pref(conn, c):
-    """新会话用 Claude 还是 Gemini：对话单独设的优先，其次角色默认，默认 Claude。"""
-    v = get_pref(conn, channel_of(c)).get('provider') or (cfg('providers') or {}).get(c['role']) or 'claude'
+    """新会话用哪家：对话单独设的优先，其次功能批准开工时定的（执行者），再次角色默认，默认 Claude。"""
+    v = (get_pref(conn, channel_of(c)).get('provider') or feature_exec(conn, c).get('cli')
+         or (cfg('providers') or {}).get(c['role']) or 'claude')
     return v if v in PROVIDERS else 'claude'
 
 
 def provider_of_sid(conn, sid):
-    """某个会话 ID 是哪家的：Gemini 会话在 SessionStart hook / 恢复时记 provider:<sid>，没记的都是 Claude。"""
-    return 'gemini' if sid and meta_get(conn, f'provider:{sid}') == 'gemini' else 'claude'
+    """某个会话 ID 是哪家的：非 Claude 的会话在 hook / 恢复时记 provider:<sid>，没记的都是 Claude。"""
+    v = meta_get(conn, f'provider:{sid}') if sid else None
+    return v if v in PROVIDERS else 'claude'
 
 
 def cam_provider(conn, c):
@@ -3914,14 +4307,17 @@ def cam_provider(conn, c):
 
 
 def session_pref(conn, c, provider=None):
-    """这个对话用的模型 / 思考程度：网页上单独设的优先，其次是角色默认，都没有就用 CLI 默认（空）。
-    Claude 和 Gemini 的模型分开记（model / gmodel），切换平台不会改到另一家的设置；Claude 会话的结果和以前完全一样。"""
+    """这个对话用的模型 / 思考程度：网页上单独设的优先，其次功能批准开工时定的（执行者、同一平台时），再次角色默认，都没有就用 CLI 默认（空）。
+    各家的模型分开记（model / gmodel / xmodel / omodel），切换平台不会改到另一家的设置；Claude 会话的结果和以前完全一样。"""
     prov = provider or cam_provider(conn, c)
     p = get_pref(conn, channel_of(c))
-    effort = p.get('effort') or (cfg('efforts') or {}).get(c['role']) or ''
-    if prov == 'gemini':
-        return dict(provider='gemini', model=p.get('gmodel') or (cfg('gemini_models') or {}).get(c['role']) or '', effort=effort)
-    return dict(model=p.get('model') or (cfg('models') or {}).get(c['role']) or '', effort=effort)
+    ex = feature_exec(conn, c)
+    ex = ex if (ex.get('cli') or 'claude') == prov else {}
+    effort = p.get('effort') or ex.get('effort') or (cfg('efforts') or {}).get(c['role']) or ''
+    model = p.get(MODEL_KEY[prov]) or ex.get('model') or (cfg(DEFAULT_MODELS[prov]) or {}).get(c['role']) or ''
+    if prov == 'claude':
+        return dict(model=model, effort=effort)
+    return dict(provider=prov, model=model, effort=effort)
 
 
 CODE_ENV = 'CLAUDE_CODE_EXPERIMENTAL_CODE_MODE'
@@ -3949,27 +4345,30 @@ def set_pref(conn, channel, **kw):
         else:
             p.pop('code', None)
         meta_set(conn, f'pref:{channel}', json.dumps(p, ensure_ascii=False))
-        if all(kw.get(k) is None for k in ('model', 'effort', 'gmodel', 'provider')):
+        if all(kw.get(k) is None for k in ('model', 'effort', 'provider') + tuple(MODEL_KEY.values())):
             return f'已记下：Code Mode {"开" if v == "on" else "关" if v == "off" else "跟随默认"}，下次新会话（新会话 / 交接）生效'
     if kw.get('provider') is not None:  # Claude / Gemini 也只对新会话生效（恢复会话必须沿用原来那家），不触发重开
         v = (kw.pop('provider') or '').strip()
         if v not in ('',) + PROVIDERS:
-            raise ValueError(f'只能选 claude / gemini：{v}')
+            raise ValueError(f'只能选 {" / ".join(PROVIDERS)}：{v}')
+        if v and not platform_status(v)['ok']:
+            raise ValueError(f'{PROV_LABEL[v]} 现在不能用：{platform_status(v)["reason"]}')
         if v:
             p['provider'] = v
         else:
             p.pop('provider', None)
         meta_set(conn, f'pref:{channel}', json.dumps(p, ensure_ascii=False))
-        if all(kw.get(k) is None for k in ('model', 'effort', 'gmodel')):
-            name = {'claude': 'Claude', 'gemini': 'Gemini'}.get(v, '默认（' + ('Gemini' if (cfg('providers') or {}).get(
-                'assistant' if channel == 'assistant' else 'crew' if '/' in channel else 'producer') == 'gemini' else 'Claude') + '）')
+        if all(kw.get(k) is None for k in ('model', 'effort') + tuple(MODEL_KEY.values())):
+            name = PROV_LABEL.get(v) or ('默认（' + PROV_LABEL.get((cfg('providers') or {}).get(
+                'assistant' if channel == 'assistant' else 'crew' if '/' in channel else 'producer'), 'Claude') + '）')
             return f'已记下：改用 {name}，下次新会话（新会话 / 交接）生效；要马上换就点「新会话」'
 
-    for k, allowed in (('model', MODELS), ('gmodel', None), ('effort', EFFORTS)):
+    key_prov = {v: k for k, v in MODEL_KEY.items()}
+    for k in tuple(MODEL_KEY.values()) + ('effort',):
         if k not in kw or kw[k] is None:
             continue
         v = (kw[k] or '').strip()
-        if v and (not valid_model('gemini' if k == 'gmodel' else 'claude', v) if k != 'effort' else v not in allowed):
+        if v and (not valid_model(key_prov[k], v) if k != 'effort' else v not in EFFORTS):
             raise ValueError(f'不支持的{"思考程度" if k == "effort" else "模型"}：{v}')
         if v:
             p[k] = v
@@ -3991,7 +4390,7 @@ def set_pref(conn, channel, **kw):
 ROLES = ('assistant', 'producer', 'crew')
 
 
-def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, providers=None, gmodels=None):
+def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, providers=None, gmodels=None, xmodels=None, omodels=None):
     """网页「默认设置」：统一改各角色默认模型 / 思考程度（写 studio.json），clear=True 同时清掉各对话单独设的。
     空闲的会话马上在原窗格 --resume 重开生效，忙的这一轮做完由调度器切。"""
     path = HOME / 'studio.json'
@@ -4000,7 +4399,8 @@ def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, provi
     except (OSError, ValueError):
         data = {}
     for key, given, allowed in (('models', models, MODELS), ('efforts', efforts, EFFORTS), ('code_modes', codes, ('on', 'off')),
-                                ('providers', providers, PROVIDERS), ('gemini_models', gmodels, None)):
+                                ('providers', providers, PROVIDERS), ('gemini_models', gmodels, None),
+                                ('codex_models', xmodels, None), ('opencode_models', omodels, None)):
         if given is None:
             continue
         cur = dict(data.get(key) or {})
@@ -4008,9 +4408,12 @@ def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, provi
             if role not in ROLES:
                 raise ValueError(f'未知角色：{role}')
             v = (v or '').strip()
-            ok = valid_model('claude' if key == 'models' else 'gemini', v) if key in ('models', 'gemini_models') else v in allowed
+            mprov = {d: p for p, d in DEFAULT_MODELS.items()}.get(key)
+            ok = valid_model(mprov, v) if mprov else v in allowed
             if v and not ok:
-                raise ValueError(f'不支持的{ {"models": "模型", "gemini_models": "Gemini 模型", "efforts": "思考程度", "providers": "平台"}.get(key, "Code Mode 设置") }：{v}')
+                raise ValueError(f'不支持的{ {"models": "模型", "gemini_models": "Gemini 模型", "codex_models": "Codex 模型", "opencode_models": "OpenCode 模型", "efforts": "思考程度", "providers": "平台"}.get(key, "Code Mode 设置") }：{v}')
+            if key == 'providers' and v and not platform_status(v)['ok']:
+                raise ValueError(f'{PROV_LABEL[v]} 现在不能用：{platform_status(v)["reason"]}')
             if v and not (key == 'code_modes' and v == 'off') and not (key == 'providers' and v == 'claude'):
                 cur[role] = v
             else:
@@ -4025,14 +4428,15 @@ def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, provi
         conn.commit()
     audit(conn, 'executive', 'defaults', None, None, json.dumps(dict(models=data.get('models'), efforts=data.get('efforts'), codes=data.get('code_modes'),
                                                                      providers=data.get('providers'), gemini_models=data.get('gemini_models'),
+                                                                     codex_models=data.get('codex_models'), opencode_models=data.get('opencode_models'),
                                                                      cleared=cleared), ensure_ascii=False))
     apply_prefs(conn)
     busy = len(rows(conn, f'SELECT id FROM cameras WHERE state IN {LIVE} AND last_active>last_stop'))
     msg = '已保存' + (f'，清掉了 {cleared} 个对话的单独设置' if cleared else '')
-    if models is not None or efforts is not None or gmodels is not None:
+    if any(x is not None for x in (models, efforts, gmodels, xmodels, omodels)):
         msg += '；模型 / 思考：空闲的会话已在原窗格重开' + (f'，{busy} 个正在忙的这一轮做完再切' if busy else '')
     if providers is not None:
-        msg += '；Claude / Gemini 只对新会话（新会话 / 交接）生效'
+        msg += '；平台只对新会话（新会话 / 交接）生效'
     if codes is not None:
         msg += '；Code Mode 只对新会话（新会话 / 交接）生效'
     return msg
@@ -4051,7 +4455,8 @@ def apply_pref(conn, c):
     conn.commit()
     launch(conn, c['id'], pane=c['pane'], no_prompt=True)
     p = json.loads(want)
-    text = ('Gemini · ' if p.get('provider') == 'gemini' else '') + f'{p["model"] or "默认模型"} · 思考 {p["effort"] or "默认"}'
+    text = (f'{PROV_LABEL[p["provider"]]} · ' if p.get('provider') in PROV_LABEL and p['provider'] != 'claude' else '') + \
+        f'{p["model"] or "默认模型"} · 思考 {p["effort"] or "默认"}'
     post(conn, 'system', channel_of(c), 'handover', f'—— 「{c["name"]}」切到 {text}（原会话重开，对话不丢）——', camera=c)
     return f'已切换：{text}'
 
@@ -4156,19 +4561,53 @@ def record_usage(conn, c, entries):
     elif ctx is not None and ctx > 1:
         log_event(conn, 'ctx-anomaly', c, level='warn', value=round(ctx, 3), window=c.get('ctx_window'), model=model)
         ctx = min(ctx, 1.0)
+    store_usage(conn, c, tot, ctx, model)
+
+
+def store_usage(conn, c, tot, ctx, model, cost=None):
+    """记累计用量（cameras）和比上次多出来的部分（usage 表，按天统计、预算用），再看要不要提醒交接。
+    cost：平台自己给的累计花费（OpenCode）；没有就按 studio.json 的 prices 算。"""
     if not any(tot.values()):
         return
+    total_cost = cost if cost is not None else price(model, tot)
     delta = {k: max(0, tot[k] - (c[k] or 0)) for k in tot}
+    if cost is not None:
+        dcost = max(0.0, cost - (c['cost'] or 0)) if c['cost'] is not None else cost
+    else:
+        dcost = price(model, delta)
     conn.execute('UPDATE cameras SET tokens_in=?, tokens_out=?, cache_read=?, cache_write=?, cost=?, context_pct=?, model=? '
-                 'WHERE id=?', (tot['tokens_in'], tot['tokens_out'], tot['cache_read'], tot['cache_write'], price(model, tot),
+                 'WHERE id=?', (tot['tokens_in'], tot['tokens_out'], tot['cache_read'], tot['cache_write'], total_cost,
                                 ctx, model, c['id']))
     if any(delta.values()):
         conn.execute('INSERT INTO usage(day, camera_id, role, film_id, seq_key, model, tokens_in, tokens_out, cache_read, '
                      'cache_write, cost) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                      (today(), c['id'], c['role'], c['film_id'], c['seq_key'], model, delta['tokens_in'], delta['tokens_out'],
-                      delta['cache_read'], delta['cache_write'], price(model, delta)))
+                      delta['cache_read'], delta['cache_write'], dcost))
     conn.commit()
     warn_context(conn, camera(conn, c['id']), ctx)
+
+
+def record_codex_usage(conn, c, path):
+    """Codex：rollout 里最后一个 token_count 是累计用量和上下文；Codex 走订阅，没配 prices 就不算钱。"""
+    tot, ctx, model, window = plat.codex_usage(plat.read_jsonl_tail(path, 4_000_000))
+    if window and window != c.get('ctx_window'):
+        conn.execute('UPDATE cameras SET ctx_window=?, ctx_at=? WHERE id=?', (window, time.time(), c['id']))
+        conn.commit()
+    if ctx is not None:
+        conn.execute('UPDATE cameras SET ctx_at=? WHERE id=?', (time.time(), c['id']))
+        conn.commit()
+    store_usage(conn, camera(conn, c['id']), tot, ctx if ctx is not None else c['context_pct'], model or c['model'])
+
+
+def record_opencode_usage(conn, c, total, cost):
+    """OpenCode：插件给主会话的累计 tokens 和花费（OpenCode 按 models.dev 价格算的）；上下文占比由 statusline --opencode 记。"""
+    if not isinstance(total, dict):
+        return
+    cache = total.get('cache') or {}
+    n = lambda x: x if isinstance(x, (int, float)) and not isinstance(x, bool) else 0  # noqa: E731
+    tot = dict(tokens_in=int(n(total.get('input'))), tokens_out=int(n(total.get('output')) + n(total.get('reasoning'))),
+               cache_read=int(n(cache.get('read'))), cache_write=int(n(cache.get('write'))))
+    store_usage(conn, c, tot, c['context_pct'], c['model'], cost=float(cost) if isinstance(cost, (int, float)) else None)
 
 
 # ---------- 安全拦截（PreToolUse） ----------
@@ -4836,7 +5275,34 @@ def read_payload():
         return {}
 
 
-_HOOK = {'agy': False, 'denied': False}       # 这次 hook 是不是 agy（Gemini）调的：输入输出格式不同
+_HOOK = {'agy': False, 'fmt': 'claude', 'denied': False}   # 这次 hook 是哪家调的（claude / agy / codex / opencode）：输入输出格式不同
+
+
+def hook_fmt(args):
+    """hook 命令行上的平台标记：--agy（Gemini）/ --codex / --opencode，没有就是 Claude。"""
+    for k in ('agy', 'codex', 'opencode'):
+        if getattr(args, k, False):
+            return k
+    return 'claude'
+
+
+def note_session(conn, c, prov, sid, transcript=None):
+    """Codex / OpenCode 的 hook 收到会话 ID：记是哪家的、回写到机位（这两家不能预先指定会话 ID），Codex 顺便记 rollout 路径。"""
+    if not (sid and c):
+        return sid
+    if meta_get(conn, f'provider:{sid}') != prov:
+        meta_set(conn, f'provider:{sid}', prov)
+    if transcript and meta_get(conn, f'transcript:{sid}') != str(transcript):
+        meta_set(conn, f'transcript:{sid}', str(transcript))
+    if prov == 'opencode':
+        mark = HOME / 'opencode-sessions' / sid
+        if not mark.exists():
+            mark.parent.mkdir(parents=True, exist_ok=True)
+            mark.write_text(str(c['id']))
+    if sid != c['claude_sid']:
+        conn.execute('UPDATE cameras SET claude_sid=? WHERE id=?', (sid, c['id']))
+        conn.commit()
+    return sid
 
 
 def agy_out(obj):
@@ -4945,14 +5411,23 @@ def cmd_hook_prompt(args):
             if f:
                 agy_out(agy_system('[麻薯电脑秘书 · 状态文件]\n' + status_text(f, c['seq_key'])))
         return
+    fmt = hook_fmt(args)
+    if fmt in ('codex', 'opencode'):         # 格式和 Claude 一样（session_id / prompt）；会话 ID 要回写、记是哪家的
+        note_session(conn, c, fmt, payload.get('session_id'), payload.get('transcript_path'))
     conn.execute('UPDATE cameras SET state="running", last_active=?, claude_sid=COALESCE(?, claude_sid) WHERE id=?',
                  (time.time(), payload.get('session_id'), c['id']))
     conn.commit()
+    out = []
+    if fmt == 'opencode' and payload.get('first'):   # OpenCode 没有 SessionStart：插件在本进程第一轮 / 压缩后带 first，补回角色状态
+        out.append(session_context(conn, c))
     prompt = payload.get('prompt') or ''
-    if c['role'] == 'crew' and prompt.lstrip().startswith('继续'):
+    if c['role'] == 'crew' and prompt.lstrip().startswith('继续') and not out:
         f = film(conn, c['film_id'])
         if f:
-            print('[麻薯电脑秘书 · 状态文件]\n' + status_text(f, c['seq_key']))
+            out.append('[麻薯电脑秘书 · 状态文件]\n' + status_text(f, c['seq_key']))
+    text = '\n\n'.join(x for x in out if x and x.strip())
+    if text:
+        print(text)
 
 
 _USAGE_AT = {}
@@ -4961,12 +5436,18 @@ _USAGE_AT = {}
 def refresh_running_usage(conn, every=600):
     """一轮很长（几小时不结束）的会话：Stop hook 迟迟不来，token 一直记 0。每 10 分钟从 transcript 补记一次。"""
     for c in rows(conn, 'SELECT * FROM cameras WHERE state="running" AND claude_sid IS NOT NULL AND claude_sid!=""'):
-        if meta_get(conn, f'camprov:{c["id"]}') == 'gemini':      # Gemini 会话的 token / 花费由状态栏给
+        prov = meta_get(conn, f'camprov:{c["id"]}') or 'claude'
+        if prov in ('gemini', 'opencode'):      # Gemini 的由状态栏给；OpenCode 的由插件在每轮结束时给
             continue
         if time.time() - _USAGE_AT.get(c['id'], 0) < every or time.time() - (c['last_stop'] or c['started_at'] or 0) < every:
             continue
         _USAGE_AT[c['id']] = time.time()
         try:
+            if prov == 'codex':
+                p = transcript_file(conn, c)
+                if p:
+                    record_codex_usage(conn, c, p)
+                continue
             p = CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, c))) / f'{c["claude_sid"]}.jsonl'
             record_usage(conn, c, read_transcript(str(p)))
         except Exception:
@@ -4981,15 +5462,37 @@ def cmd_hook_stop(args):
             pass
         agy_out({'decision': 'stop'})
         return
-    _hook_stop(read_payload(), False)
+    _hook_stop(read_payload(), False, hook_fmt(args))
 
 
-def _hook_stop(payload, agy):
+def _hook_stop(payload, agy, fmt='claude'):
     conn = db()
     c = env_camera(conn)
     if not c:
         return
-    if agy:
+    if fmt in ('codex', 'opencode'):
+        if c['state'] == 'idle' and c['last_stop'] >= c['last_active']:
+            return          # 已经被打断（interrupt 自己记了空闲、发了已写出的部分）：这一轮的 Stop 不再重复发
+        sid = note_session(conn, c, fmt, payload.get('session_id'), payload.get('transcript_path'))
+        conn.execute('UPDATE cameras SET state="idle", last_stop=? WHERE id=?', (time.time(), c['id']))
+        conn.commit()
+        c = camera(conn, c['id'])
+        try:        # 预算统计失败不影响回复
+            if fmt == 'codex':
+                path = payload.get('transcript_path') or plat.codex_session_file(codex_home(), sid)
+                if path:
+                    record_codex_usage(conn, c, path)
+            else:
+                record_opencode_usage(conn, c, payload.get('total'), payload.get('cost'))
+        except Exception:
+            pass
+        text = (payload.get('last_assistant_message') or payload.get('text') or '').strip()
+        if not text and fmt == 'codex' and payload.get('transcript_path'):
+            text = plat.codex_last_reply(plat.read_jsonl_tail(payload['transcript_path'], 400_000))
+        if not text:
+            log_event(conn, f'{fmt}-reply-missing', c, level='warn')
+            return
+    elif agy:
         conv = agy_note(conn, c, payload)
         conn.execute('UPDATE cameras SET state="idle", last_stop=? WHERE id=?', (time.time(), c['id']))
         conn.commit()
@@ -5056,8 +5559,8 @@ def forbidden_git(cmd):
 
 
 def deny(reason):
-    if _HOOK['agy']:
-        _HOOK['denied'] = True
+    _HOOK['denied'] = True
+    if _HOOK['agy'] or _HOOK['fmt'] == 'opencode':      # agy 和麻薯的 OpenCode 插件都认 {"decision": "deny", "reason": …}
         return agy_out({'decision': 'deny', 'reason': reason})
     print(json.dumps(dict(hookSpecificOutput=dict(hookEventName='PreToolUse', permissionDecision='deny',
                                                   permissionDecisionReason=reason)), ensure_ascii=False))
@@ -5103,6 +5606,7 @@ def edit_guard(conn, c, f, fp):
 
 def cmd_hook_pretool(args):
     payload = read_payload()
+    _HOOK.update(agy=False, fmt='claude', denied=False)
     if getattr(args, 'agy', False):          # agy 的 PreToolUse 必须回 decision：没拦就放行
         _HOOK['agy'] = True
         try:
@@ -5112,7 +5616,47 @@ def cmd_hook_pretool(args):
         if not _HOOK['denied']:
             agy_out({'decision': 'allow'})
         return
-    _pretool(payload.get('tool_name', ''), payload.get('tool_input') or {})
+    fmt = hook_fmt(args)
+    _HOOK['fmt'] = fmt
+    if fmt == 'codex':
+        calls = codex_tool_calls(payload)
+    elif fmt == 'opencode':
+        calls = opencode_tool_calls(payload)
+    else:
+        calls = [(payload.get('tool_name', ''), payload.get('tool_input') or {})]
+    for tool, ti in calls:          # 一次补丁改多个文件：逐个过检查，有一个被拦就整次拦下
+        _pretool(tool, ti)
+        if _HOOK['denied']:
+            return
+
+
+def hook_cwd(payload):
+    return payload.get('cwd') or os.environ.get('PWD') or os.getcwd()
+
+
+def codex_tool_calls(payload):
+    """Codex 的 PreToolUse（格式同 Claude）→ 麻薯内部的 [(工具名, 参数)]：shell / exec_command 是 Bash（command），
+    apply_patch 的补丁里每个文件一项 Write，write_stdin 往已开的终端里打的字也按 Bash 命令查。"""
+    name, ti = payload.get('tool_name') or '', payload.get('tool_input') or {}
+    ti = ti if isinstance(ti, dict) else {'command': str(ti)}
+    if name in ('Bash', 'shell', 'exec_command', 'local_shell', 'unified_exec'):
+        c = ti.get('command') if ti.get('command') is not None else ti.get('cmd')
+        return [('Bash', {'command': ' '.join(c) if isinstance(c, list) else str(c or '')})]
+    if name == 'write_stdin':
+        return [('Bash', {'command': str(ti.get('chars') or '')})]
+    if name in ('apply_patch', 'Edit', 'Write'):
+        files = plat.patch_files(ti.get('command') or ti.get('input') or ti.get('patch') or '', hook_cwd(payload))
+        return [('Write', {'file_path': fp}) for fp in files] or [('Write', {'file_path': ''})]
+    return [(name, ti)]
+
+
+def opencode_tool_calls(payload):
+    """麻薯 OpenCode 插件转来的 tool.execute.before（tool + args）→ 麻薯内部的 [(工具名, 参数)]。"""
+    conn = db()
+    c = env_camera(conn)
+    f = film(conn, c['film_id']) if c and c['film_id'] else None
+    mcp = ((f or {}).get('safety') or {}).get('mcp_tools') or []
+    return plat.opencode_tool(payload.get('tool'), payload.get('args'), hook_cwd(payload), mcp)
 
 
 def _pretool(tool, ti):
@@ -5212,6 +5756,8 @@ def cmd_hook_session(args):
     if not c:
         return
     if not getattr(args, 'agy', False):
+        if hook_fmt(args) == 'codex':        # Codex 的 SessionStart 带 session_id / transcript_path：新会话在这里拿到会话 ID
+            note_session(conn, c, 'codex', payload.get('session_id'), payload.get('transcript_path'))
         print(session_context(conn, c))
         return
     # agy 没有 --append-system-prompt：新会话第一次 SessionStart 时把系统提示（launch 写的文件）作为系统消息注入
@@ -5270,11 +5816,48 @@ def statusline_agy(raw):
     print(f'{os.environ.get("MASHU_NAME", "")} · Gemini{" · " + model if model else ""} · 上下文 {round(pct) if isinstance(pct, (int, float)) else "?"}%')
 
 
+def statusline_opencode(raw):
+    """麻薯 OpenCode 插件在每条助手消息完成时调：这条消息的 tokens 算上下文占比（窗口来自 opencode models 缓存），记模型、思考档位、会话 ID。"""
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return
+    sid = os.environ.get('MASHU_SESSION')
+    if not (sid and sid.isdigit()):
+        return
+    conn = db()
+    c = camera(conn, int(sid))
+    if not c:
+        return
+    note_session(conn, c, 'opencode', d.get('session_id'))
+    last = d.get('last') or {}
+    cache = last.get('cache') or {}
+    n = lambda x: x if isinstance(x, (int, float)) and not isinstance(x, bool) else 0  # noqa: E731
+    used = n(last.get('input')) + n(last.get('output')) + n(cache.get('read')) + n(cache.get('write'))
+    model = d.get('model') or None
+    win = model_context('opencode', model) if model else None
+    ctx = min(1.0, used / float(win)) if win and used else None
+    try:
+        (HOME / 'statusline').mkdir(exist_ok=True)
+        (HOME / 'statusline' / f'{sid}.json').write_text(json.dumps(dict(
+            d, model=dict(id=model, display_name=model), context_window=dict(used_percentage=round(ctx * 100, 1) if ctx is not None else None,
+                                                                              context_window_size=win), at=time.time()), ensure_ascii=False))
+    except OSError:
+        pass
+    conn.execute('UPDATE cameras SET context_pct=COALESCE(?, context_pct), ctx_at=?, model=COALESCE(?, model), effort=COALESCE(?, effort), '
+                 'ctx_window=COALESCE(?, ctx_window) WHERE id=?',
+                 (ctx, time.time() if ctx is not None else c['ctx_at'], model, d.get('variant') if d.get('variant') not in (None, '', 'default') else None,
+                  win, c['id']))
+    conn.commit()
+
+
 def cmd_statusline(args):
     """受管会话的状态栏：记下 Claude Code 给的准确上下文占用，再转给用户自己的状态栏脚本。"""
     raw = sys.stdin.read()
     if getattr(args, 'agy', False):
         return statusline_agy(raw)
+    if getattr(args, 'opencode', False):
+        return statusline_opencode(raw)
     pct = None
     try:
         d = json.loads(raw)
@@ -5439,6 +6022,7 @@ def status_data(conn):
                 seen=seq_flag(conn, f, s['key'], 'seen', data),
                 archived_at=float(meta_get(conn, f'archived_at:{f["id"]}/{s["key"]}') or 0),
                 ac=load_ac(f, s['key']), claims=claims_of(f, s['key'], extra=False),
+                exec=(data or {}).get('exec') if isinstance((data or {}).get('exec'), dict) else None,
                 claims_extra=((data or {}).get('claims') or {}).get('extra') or [],
                 commits=[x[:8] for x in all_feature_commits(f, s['key'])[:12]],
                 checks=[dict(stage=x['id'], **x['check_result']) for x in (data or {}).get('stages', []) if isinstance(x.get('check_result'), dict)]))
@@ -5471,9 +6055,22 @@ def status_data(conn):
         live=live_replies(conn), limits=read_limits(),
         prefs={r['k'][5:]: json.loads(r['v'] or '{}') for r in rows(conn, 'SELECT k, v FROM meta WHERE k LIKE "pref:%"')},
         pref_defaults=dict(models=cfg('models') or {}, efforts=cfg('efforts') or {}, codes=cfg('code_modes') or {},
-                           providers=cfg('providers') or {}, gmodels=cfg('gemini_models') or {}),
+                           providers=cfg('providers') or {}, gmodels=cfg('gemini_models') or {},
+                           xmodels=cfg('codex_models') or {}, omodels=cfg('opencode_models') or {}),
         model_choices=MODELS, effort_choices=EFFORTS, gemini_model_choices=gemini_models(), provider_choices=PROVIDERS,
-        gemini_models_cached=(HOME / 'gemini-models.json').exists())
+        gemini_models_cached=(HOME / 'gemini-models.json').exists(), platforms=platforms_view())
+
+
+def platforms_view():
+    """网页用的平台表：能不能选（不能就写原因）、模型列表、对话偏好里的模型键。"""
+    out = []
+    for p in PROVIDERS:
+        st = platform_status(p)
+        out.append(dict(id=p, label=PROV_LABEL[p], ok=st['ok'], reason=st['reason'], version=st['version'],
+                        model_key=MODEL_KEY[p], default_key={'models': 'models', 'gemini_models': 'gmodels', 'codex_models': 'xmodels',
+                                                              'opencode_models': 'omodels'}[DEFAULT_MODELS[p]],
+                        models=list(platform_models(p)), code_mode=p == 'claude'))
+    return out
 
 
 def retro_text(conn, film_id=None, days=14):
@@ -5693,8 +6290,12 @@ def cmd_pitch(args):
         if not args.plan:
             raise SystemExit('麻薯开功能要带方案：先和用户把需求、技术方案谈清楚，写成文件后 `--plan <文件>`；开好后等用户批准开工')
         plan = Path(args.plan).expanduser().read_text()
-    f, key, cam = pitch(conn, args.film, args.slug, args.brief, args.title, by=c, playbook=args.playbook, workflow=args.workflow,
-                        touches=args.touches, plan=plan, account=args.account, workdir=args.workdir)
+    ex = {k: v for k, v in dict(cli=args.cli, model=args.model, effort=args.effort).items() if v}
+    try:
+        f, key, cam = pitch(conn, args.film, args.slug, args.brief, args.title, by=c, playbook=args.playbook, workflow=args.workflow,
+                            touches=args.touches, plan=plan, account=args.account, workdir=args.workdir, exec_cfg=ex or None)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     if c:
         record_decision(conn, c, f['id'], key, f'开新功能 {seq_label(f, key)}：{args.title or args.slug}（等用户批准开工）')
     if not cam:
@@ -5812,6 +6413,10 @@ def cmd_ask(args):
             raise SystemExit(f'{seq_label(kf, key)} 不在等开工状态，不用再申请开工')
         if not options:
             options = ['批准开工', '先别']
+        ex = kickoff_exec(conn, kf, key)
+        meta['exec'] = ex
+        if '执行者：' not in (args.question or ''):
+            args.question = (args.question or '') + f'\n\n执行者：{exec_label(ex["cli"], ex["model"], ex["effort"])}'
         plan = seq_dir(kf, key) / 'docs' / 'plan.md'
         if plan.exists() and 'plan.md' not in (args.question or ''):
             args.question = (args.question or '') + f'\n\n方案（docs/plan.md）：\n{plan.read_text()}'
@@ -6091,6 +6696,54 @@ def cmd_gemini_models(args):
     print('Gemini 可选模型' + src + '：\n' + '\n'.join(gemini_models()))
 
 
+def platform_selfcheck(prov):
+    """安全拦截自检（不调模型）：把各家 PreToolUse 的真实输入格式转成麻薯内部格式，看禁止的 git、改 state.json、正式操作、
+    不可逆操作是不是都认得出来。返回 [(项目, 通过?)]。"""
+    if prov == 'codex':
+        conv = lambda tool, ti: codex_tool_calls(dict(tool_name=tool, tool_input=ti, cwd='/w'))  # noqa: E731
+        cases = [('Bash', {'command': 'git stash'}), ('apply_patch', {'command': '*** Begin Patch\n*** Update File: .mashu/features/x/state.json\n*** End Patch'}),
+                 ('Bash', {'command': 'git push origin main'}), ('Bash', {'command': 'git push -f origin feat'}), ('write_stdin', {'chars': 'git stash\n'})]
+    elif prov == 'opencode':
+        conv = lambda tool, ti: plat.opencode_tool(tool, ti, '/w')  # noqa: E731
+        cases = [('bash', {'command': 'git stash'}), ('write', {'filePath': '/w/.mashu/features/x/state.json'}),
+                 ('bash', {'command': 'git push origin main'}), ('bash', {'command': 'git push -f origin feat'}),
+                 ('apply_patch', {'patchText': '*** Begin Patch\n*** Update File: .mashu/features/x/acceptance.json\n*** End Patch'})]
+    else:
+        return []
+    names = ['禁止的 git（git stash）', '改 state.json', '推送受保护分支（正式操作）', '强制推送（不可逆）', cases[4][0] + ' 里的禁止操作']
+    out = []
+    for label, (tool, ti) in zip(names, cases):
+        hit = False
+        for t, x in conv(tool, ti):
+            if t == 'Bash':
+                hit = hit or bool(forbidden_git(x.get('command', ''))) or bool(risky('Bash', x))
+            elif t in ('Edit', 'Write', 'MultiEdit'):
+                hit = hit or Path(x.get('file_path') or '').name in ('state.json', 'acceptance.json')
+        out.append((label, hit))
+    return out
+
+
+def cmd_platforms(args):
+    for prov in PROVIDERS:
+        st = platform_status(prov)
+        models = platform_models(prov)
+        line = f'{PROV_LABEL[prov]:<9}{"可用" if st["ok"] else "不可用"}' + (f' · {st["version"]}' if st['version'] else '') + \
+            (f' · {st["reason"]}' if st['reason'] else '') + (f' · 模型 {len(models)} 个' if models else '')
+        print(line)
+        if args.check and prov in ('codex', 'opencode'):
+            for label, ok in platform_selfcheck(prov):
+                print(f'    {"✓" if ok else "✗"} {label}')
+    if args.check:
+        print('（自检只验证输入格式的转换和判定；真实会话实测见 docs/references/platforms.md）')
+
+
+def cmd_opencode_models(args):
+    if args.refresh or not opencode_model_info():
+        print(refresh_opencode_models())
+    for k, v in opencode_model_info().items():
+        print(f'{k}  思考档位：{" / ".join(v.get("variants") or []) or "无"}  窗口：{v.get("context") or "?"}{"  免费" if v.get("free") else ""}')
+
+
 def cmd_init(args):
     """首次安装：检查依赖、建 state/ 和 studio.json、确认记忆和 docs skill 就位。已有的文件不覆盖。"""
     import shutil
@@ -6098,7 +6751,9 @@ def cmd_init(args):
     print('麻薯 Studio 初始化')
     for exe, need, tip in (('python3', True, ''), ('tmux', True, 'brew install tmux'),
                            (cfg('claude'), True, 'npm install -g @anthropic-ai/claude-code，再运行 claude 登录一次'),
-                           ('git', False, ''), (cfg('agy'), False, '可选：Gemini（Antigravity CLI）')):
+                           ('git', False, ''), (cfg('agy'), False, '可选：Gemini（Antigravity CLI）'),
+                           (cfg('codex'), False, '可选：Codex CLI（npm install -g @openai/codex，再 codex login）'),
+                           (cfg('opencode'), False, '可选：OpenCode CLI（npm install -g opencode-ai）')):
         found = shutil.which(exe)
         print(f'  {"✓" if found else ("✗" if need else "-")} {exe}{"：" + found if found else ("（" + tip + "）" if tip else "")}')
         ok = ok and (bool(found) or not need)
@@ -6143,6 +6798,9 @@ def main(argv=None):
     s.add_argument('--plan', help='方案文件（需求 + 技术方案 + 验收标准，已和用户谈清楚）；麻薯开功能必填，开好后等用户批准开工')
     s.add_argument('--account', help='归哪个账号（项目有 .mashu/accounts.json 时；不写按 accounts.json 的 features / 改动范围推）')
     s.add_argument('--workdir', help='执行者的工作目录：工程文件夹里已存在的子目录（相对路径）；不写就是工程根目录。项目适配器开功能时也可能自己设')
+    s.add_argument('--cli', choices=PROVIDERS, help='执行者用哪家 CLI（不写 = 执行者默认）；开工审批卡上用户可以再改')
+    s.add_argument('--model', help='执行者的模型（该 CLI 的模型名，mashu platforms 可查；不写 = 默认）')
+    s.add_argument('--effort', choices=EFFORTS, help='执行者的思考程度（不写 = 默认）')
     s = sub.add_parser('playbook', aliases=['workflow'], help='工作流（可复用流程）')
     s.add_argument('action', choices=['list', 'show', 'check', 'commit', 'apply', 'restore'])
     s.add_argument('target', nargs='?', help='template:<id> 或 film:<id>'); s.add_argument('--note'); s.add_argument('--template')
@@ -6200,7 +6858,14 @@ def main(argv=None):
     s = sub.add_parser('gemini-models', help='Gemini（agy）可选模型；--refresh 跑 agy models 更新（要先登录 agy）')
     s.add_argument('--refresh', action='store_true')
     for h in ('statusline', 'hook-prompt', 'hook-stop', 'hook-notify', 'hook-pretool', 'hook-session'):
-        sub.add_parser(h).add_argument('--agy', action='store_true', help='Gemini（agy）调用：输入输出用 agy 的格式')
+        s = sub.add_parser(h)
+        s.add_argument('--agy', action='store_true', help='Gemini（agy）调用：输入输出用 agy 的格式')
+        s.add_argument('--codex', action='store_true', help='Codex 调用（格式同 Claude，工具名不同）')
+        s.add_argument('--opencode', action='store_true', help='麻薯的 OpenCode 插件调用')
+    s = sub.add_parser('platforms', help='各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型，--check 跑一遍安全拦截自检')
+    s.add_argument('--check', action='store_true')
+    s = sub.add_parser('opencode-models', help='OpenCode 可选模型；--refresh 跑 opencode models --verbose 更新缓存')
+    s.add_argument('--refresh', action='store_true')
     if not next(iter(sys.argv[1:] if argv is None else argv), '').startswith(('hook-', 'statusline')):
         selfiter_call('add_parser', sub)          # 每日自迭代（hooks 和状态栏调用频繁，不加载）
     args = p.parse_args(argv)
@@ -6215,7 +6880,8 @@ def main(argv=None):
         'playbook': cmd_playbook, 'retro': cmd_retro, 'logs': cmd_logs, 'ac': cmd_ac, 'claim': cmd_claim, 'waive': cmd_waive, 'digest': cmd_digest,
         'statusline': cmd_statusline, 'hook-prompt': cmd_hook_prompt, 'hook-stop': cmd_hook_stop, 'hook-notify': cmd_hook_notify,
         'hook-pretool': cmd_hook_pretool, 'hook-session': cmd_hook_session,
-        'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'init': cmd_init,
+        'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,
+        'opencode-models': cmd_opencode_models, 'init': cmd_init,
         'self-iterate': lambda a: __import__('selfiter').cmd(a)}[cmd]
     try:
         handler(args)

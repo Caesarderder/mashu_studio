@@ -603,13 +603,33 @@ async function loadCandidates() {
 
 // ---------- 频道头 ----------
 // 会话控制：模型 / 思考程度（按对话记住，空闲时在原窗格 --resume 重开生效）+ 交接 / 新会话
+// 功能批准开工时定的执行配置（state.json 的 exec）：执行者对话的「默认」先看它，再看角色默认
+function featExec(ch) {
+  if (!ch || ch === MAIN || !ch.includes('/')) return null;
+  const s = seqOf(ch)[1];
+  return (s && s.exec) || null;
+}
 function prefOf(ch, role) {
   const p = (state.prefs || {})[ch] || {};
   const d = state.pref_defaults || {};
-  return { model: p.model || '', effort: p.effort || '', code: p.code || '', dm: (d.models || {})[role] || '', de: (d.efforts || {})[role] || '', dc: (d.codes || {})[role] || 'off',
-    provider: p.provider || '', dp: (d.providers || {})[role] || 'claude', gmodel: p.gmodel || '', dgm: (d.gmodels || {})[role] || '' };
+  const ex = featExec(ch);
+  const dp = (ex && ex.cli) || (d.providers || {})[role] || 'claude';
+  return { model: p.model || '', effort: p.effort || '', code: p.code || '', dm: (d.models || {})[role] || '', de: (ex && ex.effort) || (d.efforts || {})[role] || '', dc: (d.codes || {})[role] || 'off',
+    provider: p.provider || '', dp, gmodel: p.gmodel || '', dgm: (d.gmodels || {})[role] || '',
+    mk: (prov) => p[platOf(prov).model_key] || '',
+    dmk: (prov) => (ex && (ex.cli || 'claude') === prov && ex.model) || (d[platOf(prov).default_key] || {})[role] || '' };
 }
-const PROV_CN = { claude: 'Claude', gemini: 'Gemini' };
+const PROV_CN = { claude: 'Claude', gemini: 'Gemini', codex: 'Codex', opencode: 'OpenCode' };
+// 平台表（后端 platforms_view）：能不能选、不能选的原因、模型列表、对话偏好里的模型键
+function plats() {
+  return state.platforms || [
+    { id: 'claude', label: 'Claude', ok: true, model_key: 'model', default_key: 'models', models: state.model_choices || [] },
+    { id: 'gemini', label: 'Gemini', ok: true, model_key: 'gmodel', default_key: 'gmodels', models: state.gemini_model_choices || [] }];
+}
+function platOf(id) { return plats().find((x) => x.id === id) || plats()[0]; }
+function provOpts(cur, withDefault) {
+  return plats().map((x) => `<option value="${x.id}" ${x.id === cur ? 'selected' : ''} ${x.ok || x.id === cur ? '' : 'disabled'} title="${esc(x.ok ? (x.version ? `${x.label} ${x.version}` : x.label) : x.reason)}">${esc(x.label)}${x.ok ? '' : '（不可用）'}</option>`).join('');
+}
 function chRole(ch) { return ch === MAIN ? 'assistant' : (seqOf(ch)[1] ? 'crew' : 'producer'); }
 // 这个对话下次新会话用哪家（对话单独设 > 角色默认 > Claude）
 function chProvider(ch) { const p = prefOf(ch, chRole(ch)); return p.provider || p.dp; }
@@ -617,25 +637,24 @@ function shortModel(x) { return String(x || '').replace(/^claude-/, '').replace(
 function sessCtl(ch, role, cam, buttons) {
   const p = prefOf(ch, role);
   const opts = (list, cur, def, now, none) => `<option value="">${def ? esc(def) : (now ? esc(now) : none)}</option>`
+    + (cur && !list.includes(cur) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : '')
     + list.map((x) => `<option value="${esc(x)}" ${x === cur ? 'selected' : ''}>${esc(x)}</option>`).join('');
   const ctx = cam && cam.alive && cam.context_pct != null ? cam.context_pct : null;
-  const gem = (p.provider || p.dp) === 'gemini', camProv = cam && cam.alive ? cam.provider || 'claude' : '';
-  const nowModel = cam && (cam.provider || 'claude') === (gem ? 'gemini' : 'claude') ? cam.model : '';
+  const prov = p.provider || p.dp, pl = platOf(prov), camProv = cam && cam.alive ? cam.provider || 'claude' : '';
+  const nowModel = cam && (cam.provider || 'claude') === prov ? cam.model : '';
   return `<div class="sess-ctl">
     <div class="sess-pill">
-      <label class="sel prov" title="用 Claude 还是 Gemini（Antigravity CLI）。只对新会话（点「新会话」或交接后）生效，恢复会话沿用原来那家${camProv ? `；现在的会话：${PROV_CN[camProv] || camProv}` : ''}">
+      <label class="sel prov" title="用哪家 CLI（Claude / Gemini / Codex / OpenCode）。只对新会话（点「新会话」或交接后）生效，恢复会话沿用原来那家；灰掉的是现在不能用的（悬停看原因）${camProv ? `；现在的会话：${PROV_CN[camProv] || camProv}` : ''}">
         <select data-pref="provider" data-ch="${esc(ch)}"><option value="">${PROV_CN[p.dp] || 'Claude'}（默认）</option>
-          ${(state.provider_choices || ['claude', 'gemini']).map((x) => `<option value="${x}" ${x === p.provider ? 'selected' : ''}>${PROV_CN[x] || esc(x)}</option>`).join('')}</select></label>
-      ${camProv && camProv !== (p.provider || p.dp) ? `<span class="sp-pend" title="现在的会话还是 ${PROV_CN[camProv]}，点「新会话」或交接后换成 ${PROV_CN[p.provider || p.dp]}">待新会话</span>` : ''}
+          ${provOpts(p.provider)}</select></label>
+      ${camProv && camProv !== prov ? `<span class="sp-pend" title="现在的会话还是 ${PROV_CN[camProv]}，点「新会话」或交接后换成 ${PROV_CN[prov]}">待新会话</span>` : ''}
       <span class="sp-sep">·</span>
-      ${gem ? `<label class="sel" title="Gemini 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。列表来自 agy models（没登录时是内置兜底列表）。切换时 Gemini 会话在原窗格重开，对话不丢">
-        <select data-pref="gmodel" data-ch="${esc(ch)}">${opts(state.gemini_model_choices || [], p.gmodel, p.dgm, nowModel, '默认模型')}</select></label>`
-      : `<label class="sel" title="模型${cam && cam.model ? `（现在：${esc(cam.model)}）` : ''}。选“${esc(p.dm || shortModel(nowModel) || '默认')}”第一项 = 用默认。切换时会话在原窗格重开，对话不丢">
-        <select data-pref="model" data-ch="${esc(ch)}">${opts(state.model_choices || [], p.model, p.dm, shortModel(nowModel), '默认模型')}</select></label>`}
+      <label class="sel" title="${esc(pl.label)} 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。第一项 = 用默认。切换时会话在原窗格重开，对话不丢${prov === 'opencode' && !(pl.models || []).length ? '。还没有 OpenCode 模型列表：到「会话监控」的默认设置里点刷新' : ''}">
+        <select data-pref="${esc(pl.model_key)}" data-ch="${esc(ch)}">${opts(pl.models || [], p.mk(prov), p.dmk(prov), prov === 'claude' ? shortModel(nowModel) : nowModel, '默认模型')}</select></label>
       <span class="sp-sep">·</span>
-      <label class="sel eff" title="思考程度${cam && cam.effort ? `（现在：${esc(cam.effort)}）` : ''}。切换时会话在原窗格重开，对话不丢">
+      <label class="sel eff" title="思考程度${cam && cam.effort ? `（现在：${esc(cam.effort)}）` : ''}。Codex / OpenCode 会换成这个模型支持的最接近一档。切换时会话在原窗格重开，对话不丢">
         <select data-pref="effort" data-ch="${esc(ch)}">${opts(state.effort_choices || [], p.effort, p.de, cam && cam.effort, '默认思考')}</select></label>
-      ${gem ? '' : `<span class="sp-sep">·</span>
+      ${prov !== 'claude' ? '' : `<span class="sp-sep">·</span>
       <label class="sel" title="Claude Code 实验性 Code Mode（用 JavaScript 一次跑多个工具）。开了以后 Chrome 浏览器、computer use 用不了；只对新会话（新会话 / 交接）生效，恢复会话沿用原模式">
         <select data-pref="code" data-ch="${esc(ch)}"><option value="">Code ${p.dc === 'on' ? '开' : '关'}（默认）</option>
           <option value="on" ${p.code === 'on' ? 'selected' : ''}>Code 开</option><option value="off" ${p.code === 'off' ? 'selected' : ''}>Code 关</option></select></label>`}
@@ -742,6 +761,34 @@ function closedLine(r) {
   }
   return `<div class="done-line ok">${icon('check', 13)}${esc(by)}批复 · ${clock(r.closed_at)}：${esc(r.answer)}</div>`;
 }
+// 开工审批卡：执行者用哪个 CLI / 模型 / 思考程度，默认填好（开功能时指定的，或执行者默认），可以改了再批准
+function kickModelOpts(prov, cur) {
+  const list = platOf(prov).models || [];
+  return '<option value="">默认模型</option>' + (cur && !list.includes(cur) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : '')
+    + list.map((x) => `<option value="${esc(x)}" ${x === cur ? 'selected' : ''}>${esc(x)}</option>`).join('');
+}
+const kickSel = {};       // 卡片上改过但还没批的执行配置：重画消息时保留
+function kickExecHtml(r) {
+  const ex = kickSel[r.id] || (r.meta || {}).exec || { cli: 'claude', model: '', effort: '' };
+  return `<div class="kick-exec" data-kick="${r.id}" title="批准后执行者按这里的配置启动；之后在对话的 ⚙ 里改，只影响新会话">
+    <span class="ke-l">${icon('terminal', 13)}执行者</span>
+    <select data-kick-cli="${r.id}">${provOpts(ex.cli || 'claude')}</select>
+    <select data-kick-model="${r.id}">${kickModelOpts(ex.cli || 'claude', ex.model || '')}</select>
+    <select data-kick-effort="${r.id}"><option value="">默认思考</option>${(state.effort_choices || []).map((x) => `<option value="${esc(x)}" ${x === ex.effort ? 'selected' : ''}>思考 ${esc(x)}</option>`).join('')}</select>
+  </div>`;
+}
+function kickExecOf(rid, el) {
+  const box = (el && el.querySelector(`[data-kick="${rid}"]`)) || document.querySelector(`[data-kick="${rid}"]`);
+  if (!box) return null;
+  return { cli: box.querySelector('[data-kick-cli]').value, model: box.querySelector('[data-kick-model]').value, effort: box.querySelector('[data-kick-effort]').value };
+}
+document.addEventListener('change', (ev) => {
+  const s = ev.target.closest('select[data-kick-cli],select[data-kick-model],select[data-kick-effort]');
+  if (!s) return;
+  const box = s.closest('[data-kick]');
+  if (s.dataset.kickCli) { const m = box.querySelector('[data-kick-model]'); if (m) m.innerHTML = kickModelOpts(s.value, ''); }
+  kickSel[box.dataset.kick] = kickExecOf(box.dataset.kick, box.parentElement);
+});
 function muteBtn(r) { return `<button class="btn ghost mute" data-mute="${r.id}" title="静默：不处理这件事、不叫醒任何人，维持现状">${icon('moon', 13)}静默</button>`; }
 async function muteReport(rid) {
   try { await api('/api/mute', { report_id: Number(rid) }); expanded.delete(Number(rid)); await refresh(); if (view === 'mail') await loadMail(); toast(`#${rid} 已静默`); }
@@ -764,7 +811,7 @@ function cardActions(r) {
         <div class="acts reject" id="rej-${r.id}" hidden><input data-reject-input="${r.id}" placeholder="理由（可选，会转给提出的人）">
         <button class="btn danger" data-reject-go="${r.id}" data-label="${esc(opts[1])}">确认${esc(opts[1])}</button></div>`;
     }
-    return `<div class="acts">
+    return `${r.gate === 'kickoff' ? kickExecHtml(r) : ''}<div class="acts">
       <button class="btn primary" data-answer="${r.id}" data-text="${esc(opts[0])}">${yes}</button>
       <button class="btn danger" data-reject="${r.id}" data-label="${esc(opts[1])}">${esc(opts[1])}…</button>
       ${muteBtn(r)}<span class="hint-inline">${r.gate ? `审批后 ${esc(String(state.approval_ttl_hours || 2))} 小时内有效` : ''}</span></div>
@@ -1562,19 +1609,26 @@ let zoomCam = null;
 // 默认设置：统一切换各角色默认模型 / 思考程度（studio.json），可同时清掉各对话单独设的
 const ROLE_CN = { assistant: '主脑', producer: '子脑', crew: '执行者' };
 function defaultsHtml() {
-  const d = state.pref_defaults || {}, M = d.models || {}, E = d.efforts || {}, C = d.codes || {}, P = d.providers || {}, G = d.gmodels || {};
-  const LIST = { models: state.model_choices, efforts: state.effort_choices, gmodels: state.gemini_model_choices };
-  const psel = (role, cur) => `<select data-def="providers" data-role="${role}">${role === '*' ? '<option value="">（不改）</option>' : ''}<option value="claude" ${role !== '*' && cur !== 'gemini' ? 'selected' : ''}>Claude</option><option value="gemini" ${cur === 'gemini' ? 'selected' : ''}>Gemini</option></select>`;
+  const d = state.pref_defaults || {}, E = d.efforts || {}, C = d.codes || {}, P = d.providers || {};
+  const MK = plats().map((x) => x.default_key);       // models / gmodels / xmodels / omodels
+  const LIST = { efforts: state.effort_choices };
+  plats().forEach((x) => { LIST[x.default_key] = x.models || []; });
+  const psel = (role, cur) => `<select data-def="providers" data-role="${role}">${role === '*' ? '<option value="">（不改）</option>' : ''}${provOpts(role === '*' ? '' : (cur || 'claude'))}</select>`;
   const csel = (role, cur) => `<select data-def="codes" data-role="${role}">${role === '*' ? '<option value="">（不改）</option>' : ''}<option value="off" ${role !== '*' && cur !== 'on' ? 'selected' : ''}>Code Mode 关</option><option value="on" ${cur === 'on' ? 'selected' : ''}>Code Mode 开</option></select>`;
   const sel = (kind, role, cur) => `<select data-def="${kind}" data-role="${role}"><option value="">${role === '*' ? '（不改）' : kind === 'gmodels' ? 'agy 默认' : 'CLI 默认'}</option>`
+    + (cur && !(LIST[kind] || []).includes(cur) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : '')
     + (LIST[kind] || []).map((x) => `<option value="${esc(x)}" ${x === cur ? 'selected' : ''}>${esc(x)}</option>`).join('') + '</select>';
+  const oc = platOf('opencode'), cx = platOf('codex');
   const nOver = Object.keys(state.prefs || {}).filter((k) => Object.keys(state.prefs[k] || {}).length).length;
   return `<div class="defaults card-lite"><div class="df-h">${icon('gear', 15)}<b>默认平台、模型与思考程度</b><span class="hint-inline">各角色新开或重开的会话用这里的设置；对话里单独选过的优先</span></div>
-    <div class="df-grid"><span></span><span class="df-th">平台</span><span class="df-th">Claude 模型</span><span class="df-th">Gemini 模型</span><span class="df-th">思考程度</span><span class="df-th" title="只对 Claude 会话有效">Code Mode</span>
-      <span class="df-r all">全部统一</span>${psel('*', '')}${sel('models', '*', '')}${sel('gmodels', '*', '')}${sel('efforts', '*', '')}${csel('*', '')}
-      ${Object.keys(ROLE_CN).map((r) => `<span class="df-r">${ROLE_CN[r]}</span>${psel(r, P[r])}${sel('models', r, M[r])}${sel('gmodels', r, G[r])}${sel('efforts', r, E[r])}${csel(r, C[r])}`).join('')}</div>
-    <div class="hint">平台（Claude / Gemini）只对新开的会话生效，恢复会话沿用原来那家。Gemini 用本机的 Antigravity CLI（agy），要先在终端运行一次 <code>agy</code> 用谷歌账号登录；登录后点
+    <div class="df-scroll"><div class="df-grid"><span></span><span class="df-th">平台</span>${plats().map((x) => `<span class="df-th" title="${esc(x.ok ? '' : x.reason)}">${esc(x.label)} 模型${x.ok ? '' : '（不可用）'}</span>`).join('')}<span class="df-th">思考程度</span><span class="df-th" title="只对 Claude 会话有效">Code Mode</span>
+      <span class="df-r all">全部统一</span>${psel('*', '')}${MK.map((k) => sel(k, '*', '')).join('')}${sel('efforts', '*', '')}${csel('*', '')}
+      ${Object.keys(ROLE_CN).map((r) => `<span class="df-r">${ROLE_CN[r]}</span>${psel(r, P[r])}${MK.map((k) => sel(k, r, (d[k] || {})[r])).join('')}${sel('efforts', r, E[r])}${csel(r, C[r])}`).join('')}</div></div>
+    <div class="hint">平台只对新开的会话生效，恢复会话沿用原来那家；灰掉的平台现在不能用（悬停看原因：没装，或版本没做过安全拦截实测）。Gemini 用本机的 Antigravity CLI（agy），要先在终端运行一次 <code>agy</code> 用谷歌账号登录；登录后点
       <button class="btn small" data-gmrefresh>${icon('swap', 13)}刷新 Gemini 模型列表</button>（现在是${state.gemini_models_cached ? ' agy models 的列表' : '内置兜底列表'}）。</div>
+    <div class="hint">Codex${cx.version ? ` ${esc(cx.version)}` : ''} 用你本机 Codex 的登录和配置（麻薯会话用独立的 CODEX_HOME，不改 <code>~/.codex</code>），模型列表来自 Codex 自己的缓存。
+      OpenCode${oc.version ? ` ${esc(oc.version)}` : ''} 用你本机 OpenCode 配好的提供方（按量计费的模型会花钱），麻薯插件只在麻薯开的会话里加载；模型列表（${(oc.models || []).length} 个）
+      <button class="btn small" data-ocrefresh>${icon('swap', 13)}刷新 OpenCode 模型列表</button>。OpenCode 的思考程度要选了模型才生效。</div>
     <div class="hint">Code Mode 是 Claude Code 的实验功能：只对新开的会话生效（恢复会话沿用原模式）；开了以后 Chrome 浏览器、computer use 用不了，要用浏览器的活别开。</div>
     <div class="df-acts"><label><input type="checkbox" id="dfClear"> 同时清除各对话单独设置${nOver ? `（现有 ${nOver} 个）` : ''}</label>
       <button class="btn primary" data-defsave>${icon('check', 14)}保存并切换</button><span class="hint-inline">空闲会话会在原窗格重开（对话不丢），忙的这一轮做完再切</span></div></div>`;
@@ -1587,17 +1641,18 @@ document.addEventListener('change', (ev) => {
 document.addEventListener('click', async (ev) => {
   const b = ev.target.closest('[data-defsave]');
   if (!b) return;
-  const out = { models: {}, efforts: {}, codes: {}, providers: {}, gmodels: {} };
+  const out = { efforts: {}, codes: {}, providers: {} };
+  plats().forEach((x) => { out[x.default_key] = {}; });
   document.querySelectorAll('select[data-def]').forEach((x) => { if (x.dataset.role !== '*') out[x.dataset.def][x.dataset.role] = x.value; });
   b.disabled = true;
   try { const d = await api('/api/camera', { action: 'defaults', ...out, clear: $('#dfClear')?.checked }); toast(d.result); await refresh(); renderWall(); }
   catch (e) { toast(e.message); } finally { b.disabled = false; }
 });
 document.addEventListener('click', async (ev) => {
-  const b = ev.target.closest('[data-gmrefresh]');
+  const b = ev.target.closest('[data-gmrefresh],[data-ocrefresh]');
   if (!b) return;
   b.disabled = true;
-  try { const d = await api('/api/camera', { action: 'gemini-models' }); toast(d.result); await refresh(); renderWall(); }
+  try { const d = await api('/api/camera', { action: b.dataset.ocrefresh !== undefined ? 'opencode-models' : 'gemini-models' }); toast(d.result); await refresh(); renderWall(); }
   catch (e) { toast(e.message); } finally { b.disabled = false; }
 });
 function renderWall() {
@@ -1842,7 +1897,9 @@ async function answer(rid, text, el = null) {
   card?.classList.add('busy');
   card?.querySelectorAll('button,input').forEach((x) => { x.disabled = true; });
   try {
-    await api('/api/answer', { report_id: Number(rid), text });
+    const rr = reports[rid];
+    const exec = rr && rr.gate === 'kickoff' && (rr.options || [])[0] === text ? kickExecOf(rid, card) : null;
+    await api('/api/answer', { report_id: Number(rid), text, ...(exec ? { exec } : {}) });
     expanded.delete(Number(rid));
     await refresh();
     if (view === 'mail') await loadMail();
@@ -1943,8 +2000,8 @@ const SLASH = [
   { c: '/screen', d: '看它的终端画面', run: () => { const c = camOfChannel(current); return c && c.alive ? zoom(c.id) : toast('这个对话现在没有运行中的会话'); } },
   { c: '/handoff', d: '让它整理交接文档，然后在原窗格换新会话接着做', run: () => camApi({ action: 'handoff', channel: current }) },
   { c: '/new', d: '直接新开一个会话（不带上一段对话）', run: () => camApi({ action: 'new-session', channel: current }) },
-  { c: '/provider', d: '切换平台：/provider gemini（claude / gemini / default），新会话生效', run: (x) => setPref('provider', x) },
-  { c: '/model', d: '切换模型：/model opus（Claude：fable / opus / sonnet / haiku；Gemini 对话用 agy models 的名字；default）', run: (x) => setPref('model', x) },
+  { c: '/provider', d: '切换平台：/provider codex（claude / gemini / codex / opencode / default），新会话生效', run: (x) => setPref('provider', x) },
+  { c: '/model', d: '切换模型：/model opus（按这个对话的平台：Claude 是 fable / opus / sonnet / haiku，Codex / OpenCode 用它们的模型名；default）', run: (x) => setPref('model', x) },
   { c: '/effort', d: '切换思考程度：/effort high（low / medium / high / xhigh / max / default）', run: (x) => setPref('effort', x) },
   { c: '/compact', d: '压缩它的上下文（Claude Code 的 /compact，要它空闲时）', run: () => camApi({ action: 'slash', cmd: '/compact', channel: current }) },
   { c: '/feature', d: '给这个项目开一个新功能', when: () => current !== MAIN, run: () => pitchModal(current.split('/')[0]) },
@@ -1974,8 +2031,9 @@ function runSlash(i) {
   x.run('');
 }
 async function setPref(kind, v) {
-  if (kind === 'model' && chProvider(current) === 'gemini') kind = 'gmodel';
-  const list = { model: state.model_choices, gmodel: state.gemini_model_choices, effort: state.effort_choices, provider: state.provider_choices }[kind] || [];
+  const pl = platOf(chProvider(current));
+  if (kind === 'model') kind = pl.model_key;
+  const list = { [pl.model_key]: pl.models, effort: state.effort_choices, provider: state.provider_choices }[kind] || [];
   if (!v) return toast(`用法：/${kind} ${list[0] || ''}（可选：${list.join(' / ')} / default）`);
   return camApi({ action: 'pref', channel: current, [kind]: v === 'default' ? '' : v });
 }

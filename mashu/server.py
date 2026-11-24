@@ -394,7 +394,7 @@ class Handler(BaseHTTPRequestHandler):
             text = (data.get('text') or '').strip()
             if not text:
                 raise ValueError('批复内容为空')
-            r = studio.answer_report(conn, int(data['report_id']), None, text)
+            r = studio.answer_report(conn, int(data['report_id']), None, text, exec_cfg=data.get('exec') or None)
             return {'ok': True, 'status': r['status']}
         if path == '/api/camera':
             return {'result': self.camera_action(conn, data)}
@@ -466,12 +466,16 @@ class Handler(BaseHTTPRequestHandler):
             return studio.fresh_session(conn, data.get('channel') or 'assistant')
         if action == 'defaults':
             return studio.set_defaults(conn, models=data.get('models'), efforts=data.get('efforts'), codes=data.get('codes'),
-                                       clear=bool(data.get('clear')), providers=data.get('providers'), gmodels=data.get('gmodels'))
+                                       clear=bool(data.get('clear')), providers=data.get('providers'), gmodels=data.get('gmodels'),
+                                       xmodels=data.get('xmodels'), omodels=data.get('omodels'))
         if action == 'gemini-models':
             return studio.refresh_gemini_models()
+        if action == 'opencode-models':
+            return studio.refresh_opencode_models()
         if action == 'pref':
             return studio.set_pref(conn, data.get('channel') or 'assistant', model=data.get('model'), effort=data.get('effort'),
-                                   code=data.get('code'), provider=data.get('provider'), gmodel=data.get('gmodel'))
+                                   code=data.get('code'), provider=data.get('provider'), gmodel=data.get('gmodel'),
+                                   xmodel=data.get('xmodel'), omodel=data.get('omodel'))
         if action == 'interrupt-all':
             busy = [c for c in studio.rows(conn, f'SELECT * FROM cameras WHERE state IN {studio.LIVE} AND last_active>last_stop')]
             for c in busy:

@@ -16,6 +16,7 @@ related:
   - reference.index-docs
   - workflow.report-flow
   - workflow.feature-state
+  - reference.platforms
 ---
 
 # mashu 命令参考
@@ -48,6 +49,8 @@ related:
 | `mashu browser "任务" [--model …] [--cwd …] [--timeout 分钟]` | Code Mode 会话用不了浏览器：把浏览器的活交给不开 Code Mode 的独立 `claude -p --chrome` 会话，结果打印回来，记录在 `state/browser/`；长任务配 `run_in_background` |
 | `mashu say "…"` | 长任务中途在主对话说一句 |
 | `mashu gemini-models [--refresh]` | Gemini（agy）可选模型；`--refresh` 跑 `agy models` 更新缓存 `state/gemini-models.json`（要先登录 agy；没登录时用内置兜底列表）。网页「会话监控 → 默认设置」里也有刷新按钮 |
+| `mashu platforms [--check]` | 各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型数；`--check` 再跑一遍安全拦截自检（不调模型）。Codex / OpenCode 的接法见 [平台说明](platforms.md) |
+| `mashu opencode-models [--refresh]` | OpenCode 可选模型（`provider/model`、支持的思考档位、窗口、是否免费）；`--refresh` 跑 `opencode models --verbose` 更新缓存 `state/opencode-models.json`。网页默认设置里也有刷新按钮 |
 | `mashu playbook list / show / check / commit / apply / restore` | 工作流管理；目标写 `film:<项目>`（项目默认工作流）、`template:<项目>/<id>`（项目专用模板，在 `<工程>/.mashu/playbooks/`）或 `template:<id>`（麻薯通用模板）。见 [项目资料制作规范](../workflows/project-assets.md) |
 | `mashu retro [项目]` / `mashu digest` / `mashu self-iterate …` | 复盘数据 / 简报数据 / 每日自迭代 |
 
@@ -55,7 +58,7 @@ related:
 
 | 命令 | 用途 |
 | --- | --- |
-| `mashu new-feature <项目> <英文slug> --brief "需求原文" --plan <方案文件> [--title "中文标题"] [--workflow] [--touches <glob…>] [--account <id>] [--workdir <子目录>]` | 新建功能（默认直接做）；`--workdir` 让执行者在工程里的某个已存在子目录里启动（项目适配器也可能在开功能时自己设，见 [项目资料制作规范](../workflows/project-assets.md)「项目适配器」）；麻薯开的功能必须带 `--plan`（需求 + 技术方案，已和用户谈清楚），开好后自动申请用户「批准开工」，批准后执行者才启动；`--touches` 预先声明改动范围，和同项目在跑的功能不重叠才能并行；`--account` 归哪个账号（项目有 `.mashu/accounts.json` 时，id 不存在会报错并列出可选；不写按 accounts.json 推，见 [项目资料制作规范](../workflows/project-assets.md)「accounts.json」）；有账号的项目 `mashu status` 的功能行带账号名 |
+| `mashu new-feature <项目> <英文slug> --brief "需求原文" --plan <方案文件> [--title "中文标题"] [--workflow] [--touches <glob…>] [--account <id>] [--workdir <子目录>] [--cli claude\|gemini\|codex\|opencode] [--model <模型>] [--effort low\|medium\|high\|xhigh\|max]` | 新建功能（默认直接做）；`--cli / --model / --effort` 指定执行者用哪家 CLI、模型、思考程度（不写 = 执行者默认），写进开工审批卡「执行者：CLI · 模型 · 思考」，用户可以在卡上改了再批准；批准时的配置存进 state.json 的 `exec`，执行者按它启动；`--workdir` 让执行者在工程里的某个已存在子目录里启动（项目适配器也可能在开功能时自己设，见 [项目资料制作规范](../workflows/project-assets.md)「项目适配器」）；麻薯开的功能必须带 `--plan`（需求 + 技术方案，已和用户谈清楚），开好后自动申请用户「批准开工」，批准后执行者才启动；`--touches` 预先声明改动范围，和同项目在跑的功能不重叠才能并行；`--account` 归哪个账号（项目有 `.mashu/accounts.json` 时，id 不存在会报错并列出可选；不写按 accounts.json 推，见 [项目资料制作规范](../workflows/project-assets.md)「accounts.json」）；有账号的项目 `mashu status` 的功能行带账号名 |
 | `mashu start / stop / restart <项目>/<编号>` | 启动 / 停止 / 换新执行者（restart 会换一个新名字） |
 | `mashu note <项目>/<编号> "…"` | 给执行者补充指令 |
 | `mashu feature status --ref <项目>/<编号>` | 看某个功能的状态 |
@@ -75,9 +78,10 @@ related:
 - 用户发来的图片 / 文件存在 `state/uploads/<日期>/`，消息里是 markdown 图片语法（图片）或带 📎 的 markdown 链接（其它文件），括号里是绝对路径，用 Read 打开。
 - 给用户看图：存成文件，回复里用 markdown 图片语法、括号里写绝对路径；其它文件用 📎 加 markdown 链接（精确写法见角色提示词）。正文里裸写的图片绝对路径也会显示。能显示的位置：上传目录、项目目录、麻薯代码目录、临时目录、桌面 / 下载 / 图片；隐藏目录、`.env`、密钥文件不显示。
 - 用户可以打断一轮（网页 Esc / ■ 打断 / `/stop`，等于 Claude Code 里按 Esc）：会话不关，已写出的部分留在对话里，看到 `Request interrupted` 就停下原计划，按下一句做。
-- 网页斜杠命令：`/stop` `/stopall` `/attach` `/screen` `/handoff` `/new` `/provider` `/model` `/effort` `/compact` `/feature` `/digest`。
+- 网页斜杠命令：`/stop` `/stopall` `/attach` `/screen` `/handoff` `/new` `/provider` `/model` `/effort` `/compact` `/feature` `/digest`（`/provider` 可选 claude / gemini / codex / opencode；`/model` 按这个对话的平台用对应的模型名）。
 - 交接 vs 新会话（网页对话头按钮或 `/handoff`、`/new`）：交接 = 调度器发提醒（同 75% 提醒，不照做 `handoff_grace_minutes` 后强制），你写 handoff.md + `mashu finish --reason "上下文交接"`，同窗格换新会话读交接续做；新会话 = 直接在原窗格开新会话，不带上一段对话、不读交接。
 - 模型 / 思考程度按对话记在 `meta` 表 `pref:<频道>`，角色默认在 `state/studio.json` 的 `models` / `efforts`；会话空闲时调度器在原窗格 `--resume` 重开同一个会话让新的 `--model` / `--effort` 生效，对话不丢。
+- Codex / OpenCode（2026-11-24，#2）：平台多了 Codex、OpenCode，模型分别记 `xmodel` / `omodel`，角色默认在 `studio.json` 的 `codex_models` / `opencode_models`；思考程度共用 `effort`，按模型支持的档位取最接近的。只有装了、版本做过安全拦截实测的才能选（网页上灰掉并写原因）。执行者的配置优先级：对话单独设 > 功能批准开工时定的 `exec` > 角色默认。怎么启动、hooks 怎么注入、会话记录在哪见 [平台说明](platforms.md)。
 - Claude / Gemini（2026-11-23，#9）：模型选择上面多一层「平台」。按对话记在 `pref:<频道>` 的 `provider`（Gemini 模型记 `gmodel`，和 Claude 的 `model` 分开），角色默认在 `studio.json` 的 `providers` / `gemini_models`；没设 = Claude。平台只对新会话（新会话 / 交接）生效，恢复会话沿用开会话时那家（`meta` 里 `provider:<会话 ID>`、`camprov:<机位>`）。Gemini 会话用 Antigravity CLI：`agy --dangerously-skip-permissions --settings state/launch/<id>-agy.json --add-dir … --model --effort [--conversation <ID>] -i <首句>`；系统提示由 SessionStart hook 注入（agy 没有 `--append-system-prompt`），hooks 写在全局 `~/.gemini/config/hooks.json` 的 `mashu` 项（命令先判断 `$MASHU_SESSION`，用户手开的 agy 不受影响），状态栏走 `mashu statusline --agy`（上下文 %、模型、token、花费）。`mashu browser` 仍用 Claude。
 - 账号 5 小时 / 周额度：受管会话的状态栏回调把 `rate_limits` 写到 `state/ratelimits.json`，网页左下角显示。
 

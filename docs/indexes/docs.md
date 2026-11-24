@@ -17,6 +17,7 @@ related:
   - reference.role-producer
   - reference.role-crew
   - reference.mashu-commands
+  - reference.platforms
   - workflow.report-flow
   - workflow.project-assets
   - workflow.feature-state
@@ -46,6 +47,7 @@ related:
 | 上下文到 75%、换会话 | [上下文交接](../workflows/context-handoff.md) |
 | 状态文件、验收标准、claim | [功能状态文件](../workflows/feature-state.md) |
 | 查某个 `mashu` 命令 | [命令参考](../references/commands.md) |
+| Claude / Gemini / Codex / OpenCode 怎么接、hooks 怎么注入、会话记录在哪、已知限制 | [平台说明](../references/platforms.md) |
 | 改麻薯的记忆 | [记忆索引](../memory/index.md)（记忆文件也是 docs 节点，保留 frontmatter，只改正文） |
 | 改提示词 / 调度器 | `mashu/prompts/`（只放身份 + 入口）、`mashu/studio.py` |
 | 项目的文档、工作流模板、行为模板、项目笔记怎么做、放哪 | [项目资料制作规范](../workflows/project-assets.md) |
