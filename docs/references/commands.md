@@ -4,7 +4,7 @@ km_type: reference
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-23
+last_verified: 2026-11-24
 source_of_truth:
   - mashu/studio.py
   - mashu/server.py
@@ -55,7 +55,7 @@ related:
 
 | 命令 | 用途 |
 | --- | --- |
-| `mashu new-feature <项目> <英文slug> --brief "需求原文" --plan <方案文件> [--title "中文标题"] [--workflow] [--touches <glob…>] [--account <id>]` | 新建功能（默认直接做）；麻薯开的功能必须带 `--plan`（需求 + 技术方案，已和用户谈清楚），开好后自动申请用户「批准开工」，批准后执行者才启动；`--touches` 预先声明改动范围，和同项目在跑的功能不重叠才能并行；`--account` 归哪个账号（项目有 `.mashu/accounts.json` 时，id 不存在会报错并列出可选；不写按 accounts.json 推，见 [项目资料制作规范](../workflows/project-assets.md)「accounts.json」）；有账号的项目 `mashu status` 的功能行带账号名 |
+| `mashu new-feature <项目> <英文slug> --brief "需求原文" --plan <方案文件> [--title "中文标题"] [--workflow] [--touches <glob…>] [--account <id>] [--workdir <子目录>]` | 新建功能（默认直接做）；`--workdir` 让执行者在工程里的某个已存在子目录里启动（项目适配器也可能在开功能时自己设，见 [项目资料制作规范](../workflows/project-assets.md)「项目适配器」）；麻薯开的功能必须带 `--plan`（需求 + 技术方案，已和用户谈清楚），开好后自动申请用户「批准开工」，批准后执行者才启动；`--touches` 预先声明改动范围，和同项目在跑的功能不重叠才能并行；`--account` 归哪个账号（项目有 `.mashu/accounts.json` 时，id 不存在会报错并列出可选；不写按 accounts.json 推，见 [项目资料制作规范](../workflows/project-assets.md)「accounts.json」）；有账号的项目 `mashu status` 的功能行带账号名 |
 | `mashu start / stop / restart <项目>/<编号>` | 启动 / 停止 / 换新执行者（restart 会换一个新名字） |
 | `mashu note <项目>/<编号> "…"` | 给执行者补充指令 |
 | `mashu feature status --ref <项目>/<编号>` | 看某个功能的状态 |

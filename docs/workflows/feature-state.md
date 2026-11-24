@@ -4,7 +4,7 @@ km_type: workflow
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-13
+last_verified: 2026-11-24
 source_of_truth:
   - mashu/studio.py
 validated_by:
@@ -25,7 +25,7 @@ related:
 
 ## 输入
 
-- `state.json`：状态文件，记录各阶段状态和交接镜像，是**事实来源**。只能用 `mashu feature …` 改。
+- `state.json`：状态文件，记录各阶段状态和交接镜像，是**事实来源**。只能用 `mashu feature …` 改。带 `workdir`（相对工程根目录的子目录）时，执行者在那个子目录里启动，这个子目录也自动算进改动范围；带 `adapter` 的是项目适配器自己的字段。
 - `acceptance.json`：验收标准，每条只有通过 / 不通过。只能用 `mashu ac …` 改；条目在方案阶段定，之后只能改状态。
 - `handoff.md`：交接文档（见 [上下文交接](context-handoff.md)），旧版本在 `handoffs/`。
 - `docs/`：`requirement.md`、`design.md`、`review.md`、`release.md`。

@@ -243,7 +243,7 @@ function pct(x) { return x == null ? '未知' : `${Math.round(x * 100)}%`; }
 function num(n) { return n == null ? '—' : Number(n).toLocaleString(); }
 const KIND = { ask: '请示', confirm: '申请进入下一阶段', gate: '申请审批', tell: '通报', report: '汇报', 'stage-done': '阶段完成', 'sequence-done': '功能完成' };
 const NOTIFY = ['tell', 'report', 'stage-done', 'sequence-done'];
-const LEVEL = { producer: '子脑', assistant: '主脑', executive: '用户', crew: '执行者', 'self-iterate': '自迭代' };
+const LEVEL = { producer: '子脑', assistant: '主脑', executive: '用户', crew: '执行者', 'self-iterate': '自迭代', external: '外部' };
 
 // ---------- 频道 ----------
 // 主脑、子脑之间的往来和例行通报只进邮箱，不出现在用户和麻薯的对话里（功能频道是执行者的工作记录，照常显示）
@@ -750,6 +750,10 @@ async function muteReport(rid) {
 function cardActions(r) {
   const opts = r.options || [];
   const m = r.meta || {};
+  if (m.external && m.web_only) {   // 外部卡片要在外部网页完成（例如带 2FA 的发布批准）：只给链接
+    return `<div class="acts">${m.url ? `<a class="btn primary" href="${esc(m.url)}" target="_blank" rel="noopener">${icon('arrow-r', 14)}去${esc(m.source || '外部')}网页处理</a>` : ''}
+      ${muteBtn(r)}<span class="hint-inline">这件只能在${esc(m.source || '外部')}网页完成，麻薯不代答</span></div>`;
+  }
   const twoWay = (r.gate || r.kind === 'confirm') && opts.length >= 2;
   if (twoWay) {
     const yes = `${icon(r.gate ? 'pen' : 'check', 14)}${esc(opts[0])}`;
@@ -812,6 +816,8 @@ function renderCard(m) {
   if (r.seq_key && primary) chips.push(`<button class="chip link" data-go="${esc(seqCh)}">${icon('clipboard', 12)}功能状态</button>`);
   for (const d of r.docs || []) chips.push(`<button class="chip link" data-doc="${esc(seqCh)}" data-path="${esc(d.path)}">${icon('doc', 12)}${esc(d.label)}</button>`);
   const mt = r.meta || {};
+  if (mt.external) chips.push(mt.url ? `<a class="chip link" href="${esc(mt.url)}" target="_blank" rel="noopener">${icon('arrow-ur', 12)}${esc(mt.source || '外部')} ${esc(mt.ref || '')}</a>`
+    : `<span class="chip">${esc(mt.source || '外部')} ${esc(mt.ref || '')}</span>`);
   if (mt.reversible === false) chips.push('<span class="chip bad">不可逆</span>');
   if (mt.impact) chips.push(`<span class="chip">影响：${esc(mt.impact)}</span>`);
   for (const a of mt.anomalies || []) chips.push(`<span class="chip bad">${icon('alert', 12)}${esc(a)}</span>`);

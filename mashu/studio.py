@@ -102,7 +102,8 @@ LEVELS = ['crew', 'producer', 'assistant', 'executive']
 LONG_RUN_MINUTES, LONG_RUN_TOKENS = 180, 30_000_000     # 简报里标出跑得特别久 / 特别费的执行者
 ASK_MERGE_MINUTES = 30      # 同一会话的上一条请示还没回、且在这么多分钟内发的，就不再发新卡，让它合并
 ASK_MAX_CHARS = 400          # 自迭代 #81：多问题塞进一条请示，用户只答一半
-LEVEL_LABEL = {'crew': '执行者', 'producer': '子脑', 'assistant': '主脑', 'executive': '用户', 'system': '调度器', 'digest': '简报'}
+LEVEL_LABEL = {'crew': '执行者', 'producer': '子脑', 'assistant': '主脑', 'executive': '用户', 'system': '调度器', 'digest': '简报',
+               'external': '外部'}
 ASSISTANT_SUB = '麻薯'           # 每个项目的子脑也是麻薯（同一个人格、同一份记忆），只是专注于一个项目
 GATES = {'prod': '生产操作 / 受保护分支', 'irreversible': '不可逆操作', 'preview': '进入测试环境',
          'release-plan': '发布计划', 'budget': '追加预算', 'kickoff': '开工（派执行者）'}
@@ -672,8 +673,15 @@ def seq_dir(f, key):
 
 
 def set_dir(f, key):
-    """布景：执行者的工作目录，就是工程文件夹本身（不建分支、不建 worktree）。"""
-    return Path(f['path'])
+    """执行者的工作目录：默认就是工程文件夹本身（不建分支、不建 worktree）；
+    功能状态带 workdir（相对工程根目录的子目录，例如适配器开单时建的 issues/<单号>-<slug>）时用那个子目录。"""
+    root = Path(f['path'])
+    wd = (seq_state(f, key) or {}).get('workdir') if key else None
+    if wd and isinstance(wd, str):
+        p = (root / wd).resolve()
+        if p == root.resolve() or root.resolve() in p.parents:
+            return p
+    return root
 
 
 def state_path(f, key):
@@ -693,6 +701,327 @@ def save_state(f, key, data):
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
     tmp.replace(path)
+
+
+# ---------- 项目适配器（<工程>/.mashu/adapter.py，可选）----------
+# 项目可以带一个适配器，把外部系统（例如工单系统）接进麻薯的调度。麻薯按约定调用下面这些钩子，没写的钩子按默认行为；
+# 每个钩子第一个参数是 AdapterCtx。适配器出错只记运行日志（adapter-error），不影响调度。
+# 约定见 docs/workflows/project-assets.md「项目适配器」。
+#   on_new(ctx, feature) -> dict | None              开功能后：返回要并进状态文件的字段（workdir、adapter…）
+#   launch_env(ctx, feature, session) -> dict        启动执行者时追加的环境变量（session['env'] 是同一会话上次的值，恢复会话时沿用）
+#   launch_prompt(ctx, feature) -> str | dict        系统提示附加文本；dict(text=…, replace=True 换掉默认的「怎么做」, first=开场话)
+#   pretool(ctx, feature, tool, input, risky) -> None | str | True   None=没意见；str=拒绝原因；True=适配器担保放行（跳过麻薯的 prod 闸门）
+#   sync(ctx, known) -> dict(cards=[…], close=[…], messages=[…])     定时（SYNC_SECONDS，默认 20 秒）：外部卡片、关卡、给执行者的消息
+#   answer(ctx, card, text) -> dict(status='answered'|'closed'|'error', answer=, deliver=, message=)   用户在麻薯网页回答外部卡片
+#   on_idle(ctx, feature, session) -> None | dict(action='continue'|'stop'|'done', note=, prompt=)    执行者本轮结束、空闲时
+#   cron(ctx)                                        随 sync 一起调用，给每周体检这类定时任务用（是否到点由适配器用 ctx.get/set 判断）
+ADAPTER_SYNC_SECONDS = 20
+ADAPTER_THREADED = True          # 测试里设 False：同步跑完再落地
+ADAPTER_HOOKS = ('on_new', 'launch_env', 'launch_prompt', 'pretool', 'sync', 'answer', 'on_idle', 'cron')
+_adapter_mods = {}       # film_id -> (签名, 模块)
+_adapter_jobs = {}       # film_id -> dict(thread, result, at)
+
+
+class AdapterError(Exception):
+    pass
+
+
+def adapter_files(f):
+    p = film_docs(f) / 'adapter.py'
+    if not p.is_file():
+        return []
+    sub = film_docs(f) / 'adapter'
+    return [p] + (sorted(sub.glob('*.py')) if sub.is_dir() else [])
+
+
+def adapter_of(f):
+    """加载项目适配器；adapter.py 或 adapter/*.py 改了就重新加载。没有返回 None；加载出错抛 AdapterError。"""
+    files = adapter_files(f)
+    if not files:
+        _adapter_mods.pop(f['id'], None)
+        return None
+    try:
+        sig = tuple((str(p), p.stat().st_mtime) for p in files)
+    except OSError:
+        return None
+    hit = _adapter_mods.get(f['id'])
+    if hit and hit[0] == sig:
+        return hit[1]
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location(f'mashu_adapter_{re.sub(r"[^A-Za-z0-9_]", "_", f["id"])}', files[0])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as exc:
+        raise AdapterError(f'加载 {files[0]} 失败：{type(exc).__name__}: {exc}') from exc
+    _adapter_mods[f['id']] = (sig, mod)
+    return mod
+
+
+class AdapterCtx:
+    """交给适配器的麻薯接口：项目信息、持久键值（存麻薯数据库，重启不丢）、通知、功能列表。"""
+    def __init__(self, conn, f):
+        self.conn, self.film, self.root, self.docs = conn, f, Path(f['path']), film_docs(f)
+
+    def get(self, k, default=None):
+        v = meta_get(self.conn, f'adapter:{self.film["id"]}:{k}')
+        if v is None:
+            return default
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v
+
+    def set(self, k, v):
+        if v is None:
+            self.conn.execute('DELETE FROM meta WHERE k=?', (f'adapter:{self.film["id"]}:{k}',))
+            self.conn.commit()
+        else:
+            meta_set(self.conn, f'adapter:{self.film["id"]}:{k}', json.dumps(v, ensure_ascii=False))
+
+    def notice(self, text, key=None):
+        notice(self.conn, f'{self.film["id"]}/{key}' if key else self.film['id'], text)
+
+    def log(self, kind, level='info', **detail):
+        log_event(self.conn, f'adapter-{kind}', level=level, film=self.film['id'], **detail)
+
+    def features(self):
+        return [feature_view(self.conn, self.film, s['key']) for s in sequences(self.conn, self.film)]
+
+    def feature(self, key):
+        return feature_view(self.conn, self.film, key)
+
+
+def feature_view(conn, f, key):
+    """给适配器看的功能：key、编号、标题、状态文件、工作目录、它名下还开着的外部卡片。"""
+    data = seq_state(f, key) or {}
+    return dict(key=key, num=seq_num(key), slug=str(key).split('-', 1)[1] if '-' in str(key) else str(key),
+                title=data.get('title') or key, summary=data.get('summary') or '', data=data,
+                adapter=data.get('adapter') or {}, workdir=data.get('workdir') or '', dir=set_dir(f, key),
+                done=seq_done(data), blocker=data.get('blocker') or '',
+                open_cards=[r['meta'].get('ref') for r in external_cards(conn, f['id']) if r['seq_key'] == key])
+
+
+def session_view(conn, c):
+    sid = c.get('claude_sid')
+    env = (meta_get(conn, f'adapter-env:{sid}') if sid else None) or meta_get(conn, f'adapter-env:cam:{c["id"]}')
+    idle = c['last_stop'] >= c['last_active'] and c['state'] in LIVE
+    return dict(id=c['id'], name=c['name'], state=c['state'], claude_sid=sid, started_at=c['started_at'] or 0,
+                last_active=c['last_active'] or 0, last_stop=c['last_stop'] or 0, idle=idle,
+                idle_for=(time.time() - c['last_stop']) if idle and c['last_stop'] else 0,
+                env=json.loads(env) if env else {})
+
+
+def adapter_call(conn, f, hook, *args, default=None, raise_errors=False):
+    """调用适配器钩子。没有适配器 / 没写这个钩子 → default；出错记 adapter-error，返回 default（raise_errors 时抛 AdapterError）。"""
+    if not f:
+        return default
+    try:
+        mod = adapter_of(f)
+        fn = getattr(mod, hook, None) if mod else None
+        if not callable(fn):
+            return default
+        return fn(AdapterCtx(conn, f), *args)
+    except Exception as exc:
+        log_event(conn, 'adapter-error', level='error', film=f['id'], where=hook, err=f'{type(exc).__name__}: {exc}'[:500])
+        if raise_errors:
+            raise AdapterError(str(exc)) from exc
+        return default
+
+
+def has_adapter_hook(f, hook):
+    try:
+        mod = adapter_of(f) if f else None
+    except AdapterError:
+        return False
+    return bool(mod) and callable(getattr(mod, hook, None))
+
+
+def external_cards(conn, film_id):
+    """还开着的外部卡片（适配器 sync 建的上报，meta.external=1）。"""
+    out = []
+    for r in rows(conn, 'SELECT * FROM reports WHERE status="open" AND film_id=? AND meta LIKE \'%"external": 1%\'', film_id):
+        r['meta'] = json.loads(r.get('meta') or '{}')
+        out.append(r)
+    return out
+
+
+def last_external_card(conn, film_id, ref):
+    pat = '%' + json.dumps(ref, ensure_ascii=False) + '%'
+    for r in rows(conn, 'SELECT * FROM reports WHERE film_id=? AND meta LIKE ? ORDER BY id DESC LIMIT 5', film_id, pat):
+        if json.loads(r.get('meta') or '{}').get('ref') == ref:
+            return r
+    return None
+
+
+def answer_external(conn, r, cam, text):
+    """用户在麻薯网页回答外部卡片：由适配器写回外部系统，成功后结案并把结果投给该功能的执行者。"""
+    m = json.loads(r.get('meta') or '{}')
+    if cam is not None:
+        raise ValueError(f'#{r["id"]} 是外部卡片（{m.get("source") or "外部"} {m.get("ref")}），只能用户在网页回答')
+    f = film(conn, r['film_id'])
+    card = dict(ref=m.get('ref'), key=r['seq_key'], rid=r['id'], url=m.get('url') or '', text=r['text'],
+                options=json.loads(r['options'] or '[]'), web_only=m.get('web_only'))
+    try:
+        res = adapter_call(conn, f, 'answer', card, text, raise_errors=True)
+    except AdapterError as exc:
+        raise ValueError(f'写回{m.get("source") or "外部系统"}失败：{exc}') from None
+    if not isinstance(res, dict) or res.get('status') not in ('answered', 'closed'):
+        raise ValueError((res or {}).get('message') if isinstance(res, dict) else '适配器没有处理这个回答')
+    ans = res.get('answer') or text
+    ok = res['status'] == 'answered'
+    close_report(conn, r['id'], ans, 'executive' if ok else 'external', status='answered' if ok else 'closed')
+    add_route(conn, r['id'], action='answer', who='用户' if ok else '外部', level='executive' if ok else 'external', note=ans)
+    audit(conn, 'executive', 'external-answer', r['film_id'], r['seq_key'], f'#{r["id"]} {m.get("ref")}：{ans}'[:300])
+    notice(conn, report_channel(r), res.get('notice') or f'#{r["id"]} 已回答 {m.get("ref")}：{ans}')
+    if res.get('deliver') and r['seq_key']:
+        post(conn, 'system', f'{r["film_id"]}/{r["seq_key"]}', 'notice', res['deliver'], target=f'crew:{r["film_id"]}/{r["seq_key"]}')
+    if not ok:
+        raise ValueError(res.get('message') or f'{m.get("ref")} 已在别处处理，卡片已刷新')
+    return report(conn, r['id'])
+
+
+def adapter_snapshot(conn, f):
+    """后台线程跑适配器前先在调度线程里取好的数据（线程里不碰调度器的连接）。"""
+    cams = rows(conn, f'SELECT * FROM cameras WHERE role="crew" AND film_id=? AND state IN {LIVE} AND wrap_reason IS NULL', f['id'])
+    alive = alive_panes()
+    idle = []
+    for c in cams:
+        if c['pane'] not in alive or c['last_stop'] < c['last_active']:
+            continue
+        try:
+            if bg_tasks_of(conn, c):
+                continue         # 还有后台任务在跑：它会被唤醒接着做，不算空闲
+        except Exception:
+            pass
+        idle.append(c)
+    known = [dict(ref=r['meta'].get('ref'), key=r['seq_key'], rid=r['id']) for r in external_cards(conn, f['id'])]
+    return dict(idle=idle, known=known)
+
+
+def adapter_work(f, snap):
+    """后台线程：sync + 每个空闲执行者的 on_idle + cron。只读外部系统、写适配器自己的键值，结果交回调度线程落地。"""
+    conn = db()
+    try:
+        out = dict(sync=None, idle=[], at=time.time())
+        if has_adapter_hook(f, 'sync'):
+            out['sync'] = adapter_call(conn, f, 'sync', snap['known']) or {}
+        if has_adapter_hook(f, 'on_idle'):
+            for c in snap['idle']:
+                if not c['seq_key']:
+                    continue
+                act = adapter_call(conn, f, 'on_idle', feature_view(conn, f, c['seq_key']), session_view(conn, c))
+                if isinstance(act, dict) and act.get('action') in ('continue', 'stop', 'done'):
+                    out['idle'].append((c, act))
+        adapter_call(conn, f, 'cron')
+        return out
+    finally:
+        conn.close()
+
+
+def adapters_tick(conn, threaded=True):
+    """调度器每拍：先落地上一次后台结果，再按间隔起新一轮。threaded=False（测试）同步跑完并落地。"""
+    for f in films(conn):
+        if not adapter_files(f):
+            continue
+        job = _adapter_jobs.setdefault(f['id'], {})
+        if job.get('result') is not None:
+            res, job['result'] = job['result'], None
+            try:
+                apply_adapter_result(conn, f, res)
+            except Exception as exc:
+                log_event(conn, 'adapter-error', level='error', film=f['id'], where='apply', err=f'{type(exc).__name__}: {exc}'[:500])
+        th = job.get('thread')
+        if th and th.is_alive():
+            continue
+        try:
+            mod = adapter_of(f)
+        except AdapterError as exc:
+            if time.time() - job.get('err_at', 0) > 600:
+                job['err_at'] = time.time()
+                log_event(conn, 'adapter-error', level='error', film=f['id'], where='load', err=str(exc)[:500])
+            continue
+        every = getattr(mod, 'SYNC_SECONDS', ADAPTER_SYNC_SECONDS)
+        if time.time() - job.get('at', 0) < every:
+            continue
+        job['at'] = time.time()
+        snap = adapter_snapshot(conn, f)
+        if not threaded:
+            apply_adapter_result(conn, f, adapter_work(f, snap))
+            continue
+        import threading
+
+        def run(f=f, snap=snap, job=job):
+            try:
+                job['result'] = adapter_work(f, snap)
+            except Exception as exc:
+                job['result'] = dict(sync=None, idle=[], error=str(exc))
+        job['thread'] = threading.Thread(target=run, name=f'adapter-{f["id"]}', daemon=True)
+        job['thread'].start()
+
+
+def apply_adapter_result(conn, f, res):
+    """把后台线程的结果落进麻薯：建 / 关外部卡片、给执行者投消息、处理空闲执行者的去留。"""
+    s = res.get('sync') or {}
+    keys = {x['key'] for x in sequences(conn, f)}
+    opened = {r['meta'].get('ref'): r for r in external_cards(conn, f['id'])}
+    for card in s.get('cards') or []:
+        ref = card.get('ref')
+        if not ref or ref in opened:
+            continue
+        last = last_external_card(conn, f['id'], ref)
+        if last and last['status'] == 'muted':
+            continue        # 用户静默过：外部那边还开着也不再出卡
+        key = card.get('key') if card.get('key') in keys else None
+        meta = dict(external=1, ref=ref, url=card.get('url') or '', web_only=bool(card.get('web_only')),
+                    source=card.get('source') or '外部', label=card.get('label') or '')
+        r = create_report(conn, 'ask', None, f['id'], key, card.get('text') or card.get('title') or ref,
+                          summary=(card.get('summary') or card.get('title') or ref)[:120], options=card.get('options') or None,
+                          holder='executive', need='executive', meta=meta)
+        opened[ref] = r
+        log_event(conn, 'adapter-card', film=f['id'], seq=key, ref=ref, report=r['id'])
+    for item in s.get('close') or []:
+        r = opened.get(item.get('ref'))
+        if not r or report(conn, r['id'])['status'] != 'open':
+            continue
+        close_report(conn, r['id'], item.get('answer') or '已在别处处理', 'external', status='closed')
+        add_route(conn, r['id'], action='answer', who=item.get('who') or '外部', level='external', note=item.get('answer') or '')
+        notice(conn, report_channel(r), f'#{r["id"]} 已在外部处理：{item.get("answer") or ""}'.rstrip('：'))
+        if item.get('deliver') and r['seq_key']:
+            post(conn, 'system', f'{f["id"]}/{r["seq_key"]}', 'notice', item['deliver'], target=f'crew:{f["id"]}/{r["seq_key"]}')
+    for m in s.get('messages') or []:
+        key = m.get('key')
+        if key in keys and m.get('text'):
+            post(conn, 'system', f'{f["id"]}/{key}', 'notice', m['text'], target=f'crew:{f["id"]}/{key}')
+        elif m.get('text'):
+            notice(conn, f['id'], m['text'])
+    for c, act in res.get('idle') or []:
+        apply_idle_action(conn, f, c, act)
+
+
+def apply_idle_action(conn, f, c0, act):
+    c = camera(conn, c0['id'])
+    if not c or c['state'] not in LIVE or c['wrap_reason'] or c['last_active'] != c0['last_active'] or c['last_stop'] < c['last_active']:
+        return          # 期间又忙起来了 / 已在交接：这次不动
+    key, note = c['seq_key'], act.get('note') or ''
+    channel = f'{f["id"]}/{key}'
+    if act['action'] == 'continue':
+        end_camera(conn, c['id'], 'wrap', f'适配器：{note}' if note else '适配器：换会话')
+        if active_crew(conn, f['id'], key):
+            return
+        name = pick_song(conn, f['id'], key)
+        create_camera(conn, 'crew', f['id'], key, continue_prompt(f, key, act.get('prompt') or ''), name=name)
+        notice(conn, channel, f'「{c["name"]}」交班' + (f'：{note}' if note else '') + f'；由新会话「{name}」接手')
+        return
+    end_camera(conn, c['id'], 'wrap', f'适配器：{note}' if note else '适配器：收工')
+    if act['action'] == 'done':
+        data = seq_state(f, key)
+        if data and not seq_done(data):
+            for st in data['stages']:
+                if st['status'] not in DONE:
+                    st.update(status='已完成', updated_at=now_iso(), note=note or st.get('note', ''))
+            save_state(f, key, data)
+    notice(conn, channel, f'「{c["name"]}」收工' + (f'：{note}' if note else ''))
 
 
 def film_templates_dir(f):
@@ -916,7 +1245,14 @@ def staged(pb_or_state):
     return len((pb_or_state or {}).get('stages') or []) > 1
 
 
-def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workflow=False, touches=None, plan=None, account=None):
+def set_dir_ok(f, wd):
+    root = Path(f['path']).resolve()
+    p = (root / wd).resolve()
+    return p.is_dir() and (p == root or root in p.parents)
+
+
+def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workflow=False, touches=None, plan=None, account=None,
+          workdir=None):
     """新建一个功能：默认直接做（不分阶段）；workflow=True 用项目的专门工作流，playbook=<模板id> 用指定模板。
     by=麻薯（主脑 / 子脑）开的功能先不派执行者：带着方案（plan，需求 + 技术方案）申请用户批准开工，批准后才启动。"""
     f = require_film(conn, film_id)
@@ -924,6 +1260,8 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
     if account and acc and account not in {a['id'] for a in acc['accounts']}:
         raise ValueError(f'没有账号「{account}」，可选：' + '、'.join(f'{a["id"]}（{a["name"]}）' for a in acc['accounts']))
     ensure_film_docs(f)
+    if workdir and not set_dir_ok(f, workdir):
+        raise ValueError(f'工作目录 {workdir} 必须是工程文件夹里已存在的子目录（相对 {f["path"]}）')
     pb = load_template(playbook.rpartition('/')[2], f) if playbook else (film_playbook(f) if workflow else load_template(DEFAULT_PLAYBOOK))
     slug = slugify(slug)
     nums = [r['num'] or 0 for r in rows(conn, 'SELECT num FROM sequences WHERE film_id=?', f['id'])]
@@ -938,6 +1276,15 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
         data['claims'] = dict(touches=list(touches), declared_at=now_iso())
     if account:        # 按账号分组的项目（accounts.json）：功能归哪个账号
         data['account'] = account
+    if workdir:
+        data['workdir'] = workdir
+    save_state(f, key, data)
+    upd = adapter_call(conn, f, 'on_new', feature_view(conn, f, key))     # 项目适配器：建工作目录、绑定外部单号……
+    if isinstance(upd, dict) and upd:
+        data.update({k: v for k, v in upd.items() if k not in ('key', 'stages', 'playbook')})
+    if data.get('workdir') and not set_dir_ok(f, data['workdir']):
+        log_event(conn, 'adapter-error', level='error', film=f['id'], seq=key, where='on_new', err=f'工作目录无效：{data["workdir"]}')
+        data.pop('workdir')
     if by:
         data['kickoff'] = 'pending'
         if plan:
@@ -1603,7 +1950,10 @@ def system_prompt(conn, cam):
     if cam['role'] == 'crew' and f:
         data = seq_state(f, cam['seq_key'])
         stage = stage_def(data, cam['stage_no'] or 1)
-        if not staged(data):
+        extra = adapter_prompt(conn, f, cam['seq_key'])
+        if extra.get('replace'):
+            text += '\n\n' + extra['text']
+        elif not staged(data):
             text += '\n\n' + (PROMPTS / 'direct.md').read_text().replace('{{docs}}', str(film_docs(f))) \
                 .replace('{{entry}}', str(project_entry(f)))
         else:
@@ -1617,10 +1967,22 @@ def system_prompt(conn, cam):
             for d in stage_defs(data):
                 need = f'（进入要{LEVEL_LABEL[d["entry"]]}批准，调度器自动申请）' if d.get('entry') else ''
                 text += f'| {d["id"]} {d["name"]}（{d["plain"]}） | {d["role"]} | {d["do"]} | {d["exit"]}{need} |\n'
+        if extra.get('text') and not extra.get('replace'):
+            text += '\n\n' + extra['text']
         rules = film_docs(f) / 'rules.md'
         if rules.exists():
             text += '\n\n## 项目规则（.mashu/rules.md）\n\n' + rules.read_text()
     return text
+
+
+def adapter_prompt(conn, f, key):
+    """适配器给执行者的系统提示附加：返回 dict(text, replace, first)，没有就是空 dict。"""
+    if not key or not has_adapter_hook(f, 'launch_prompt'):
+        return {}
+    v = adapter_call(conn, f, 'launch_prompt', feature_view(conn, f, key))
+    if isinstance(v, str):
+        return dict(text=v) if v.strip() else {}
+    return v if isinstance(v, dict) and (v.get('text') or v.get('first')) else {}
 
 
 def agy_cmd(conn, c, cwd, sid, as_file, no_prompt):
@@ -1679,6 +2041,11 @@ def launch(conn, cid, pane=None, no_prompt=False):
         big[f'@@{tag}@@'] = fp
         return f'@@{tag}@@'
     sid = c['resume_sid']
+    fa = film(conn, c['film_id']) if c['role'] == 'crew' and c['film_id'] else None
+    if fa and not sid and not no_prompt:
+        first = adapter_prompt(conn, fa, c['seq_key']).get('first')
+        if first:           # 适配器的开场话接在「继续 …」后面（hook 认「继续」开头注入状态摘要）
+            c = dict(c, prompt=f'{c["prompt"] or "开工"}\n\n{first}')
     prov = provider_of_sid(conn, sid) if sid else provider_pref(conn, c)    # 恢复会话必须沿用开会话时的 Claude / Gemini
     meta_set(conn, f'camprov:{cid}', prov)
     if prov == 'gemini':
@@ -1720,6 +2087,16 @@ def launch(conn, cid, pane=None, no_prompt=False):
                MASHU_TMUX_SOCKET=cfg('tmux_socket') or '',
                MASHU_SEQ_DIR=str(seq_dir(f, c['seq_key'])) if f and c['seq_key'] else '',
                PATH=f'{BIN}:{os.environ.get("PATH", "/usr/bin:/bin")}', **{CODE_ENV: '1' if code else '0'})
+    if fa and has_adapter_hook(fa, 'launch_env'):
+        prev = c['resume_sid'] and meta_get(conn, f'adapter-env:{c["resume_sid"]}')
+        extra = adapter_call(conn, fa, 'launch_env', feature_view(conn, fa, c['seq_key']),
+                             dict(id=cid, name=c['name'], resume=bool(c['resume_sid']), claude_sid=sid,
+                                  env=json.loads(prev) if prev else {})) or {}
+        extra = {str(k): str(v) for k, v in (extra.items() if isinstance(extra, dict) else [])
+                 if v is not None and not str(k).startswith('MASHU_') and str(k) not in ('PATH', CODE_ENV)}
+        env.update(extra)
+        for k in ([f'adapter-env:{sid}'] if sid else []) + [f'adapter-env:cam:{cid}']:
+            meta_set(conn, k, json.dumps(extra, ensure_ascii=False))
     args = ['-c', str(cwd)]
     for k, v in env.items():
         args += ['-e', f'{k}={v}']
@@ -1986,8 +2363,10 @@ def add_route(conn, rid, **step):
 
 
 def create_report(conn, kind, source, film_id, key, text, summary=None, options=None, gate=None, confirm_stage=None,
-                  holder=None, meta=None):
-    """source：发起的会话行，None 表示调度器自动生成。holder 可指定首个处理者（'digest' = 直接进简报）。"""
+                  holder=None, meta=None, need=None):
+    """source：发起的会话行，None 表示调度器自动生成。holder 可指定首个处理者（'digest' = 直接进简报）。
+    need='executive' 且没有闸门：只能用户在网页回答（外部卡片用，麻薯不能代答）。"""
+    force_need = need
     source_role = source['role'] if source else 'system'
     if not holder:
         holder = next_level(source_role) if source else 'producer'
@@ -2007,6 +2386,8 @@ def create_report(conn, kind, source, film_id, key, text, summary=None, options=
     cat = trust_category(dict(kind=kind, gate=gate, need=need, film_id=film_id, seq_key=key, confirm_stage=confirm_stage), f)
     if cat and need == 'executive' and trust_row(conn, film_id, cat).get('delegated'):
         need = 'assistant'       # 这一类已经交给麻薯
+    if force_need:
+        need = force_need
     meta = dict(auto_meta(conn, f, key, kind, gate), **(meta or {}))
     summary = summary or text.strip().splitlines()[0][:80]
     cur = conn.execute(
@@ -2087,6 +2468,8 @@ def answer_report(conn, rid, cam, text):
     """批复上报：cam 为 None 表示用户（只能来自网页）。"""
     r = report(conn, rid)
     check_holder(conn, r, cam)
+    if json.loads(r.get('meta') or '{}').get('external'):
+        return answer_external(conn, r, cam, text)
     level = actor_level(cam)
     if not can_answer(r, level):
         need = LEVEL_LABEL[required_level(r)] if r['kind'] not in MUST_PASS else '用户'
@@ -2300,8 +2683,10 @@ def ac_summary(f, key):
 
 
 def claims_of(f, key, extra=True):
-    c = (seq_state(f, key) or {}).get('claims') or {}
-    return list(c.get('touches') or []) + (list(c.get('extra') or []) if extra else [])
+    data = seq_state(f, key) or {}
+    c = data.get('claims') or {}
+    wd = [str(data['workdir']).strip('/') + '/**'] if data.get('workdir') else []     # 功能自己的工作目录算在范围里
+    return wd + list(c.get('touches') or []) + (list(c.get('extra') or []) if extra else [])
 
 
 def hotspots(f):
@@ -3083,6 +3468,7 @@ def _tick(conn):
         if c['last_stop'] >= c['last_active']:
             handle_wrap(conn, c)
     crew_linger_guard(conn)
+    adapters_tick(conn, threaded=ADAPTER_THREADED)
     refresh_running_usage(conn)
     report_timeouts(conn)
     maybe_digest(conn)
@@ -4752,6 +5138,17 @@ def _pretool(tool, ti):
                 audit(conn, actor_label(c), 'blocked-write', c['film_id'], c['seq_key'], why)
                 return deny(why)
     hit = risky(tool, ti, f)
+    if f and c['role'] == 'crew' and c['seq_key'] and has_adapter_hook(f, 'pretool'):
+        # 项目适配器的闸门（例如工单系统的发布批准）：拒绝就拒绝；担保放行（True）就不再要麻薯的 prod 审批
+        v = adapter_call(conn, f, 'pretool', feature_view(conn, f, c['seq_key']), tool, ti, list(hit) if hit else None)
+        if isinstance(v, str) and v.strip():
+            audit(conn, actor_label(c), 'blocked-adapter', c['film_id'], c['seq_key'], v[:300])
+            return deny(v)
+        if v is True and (not hit or hit[0] != 'irreversible'):
+            if hit:
+                audit(conn, actor_label(c), 'adapter-allow', c['film_id'], c['seq_key'],
+                      f'{hit[1]}：{json.dumps(ti, ensure_ascii=False)[:200]}')
+            return
     if not hit:
         return
     gate, label = hit
@@ -5297,7 +5694,7 @@ def cmd_pitch(args):
             raise SystemExit('麻薯开功能要带方案：先和用户把需求、技术方案谈清楚，写成文件后 `--plan <文件>`；开好后等用户批准开工')
         plan = Path(args.plan).expanduser().read_text()
     f, key, cam = pitch(conn, args.film, args.slug, args.brief, args.title, by=c, playbook=args.playbook, workflow=args.workflow,
-                        touches=args.touches, plan=plan, account=args.account)
+                        touches=args.touches, plan=plan, account=args.account, workdir=args.workdir)
     if c:
         record_decision(conn, c, f['id'], key, f'开新功能 {seq_label(f, key)}：{args.title or args.slug}（等用户批准开工）')
     if not cam:
@@ -5745,6 +6142,7 @@ def main(argv=None):
     s.add_argument('--touches', nargs='+', help='预计改动范围（glob）；同项目有别的执行者在跑时，不重叠才能并行')
     s.add_argument('--plan', help='方案文件（需求 + 技术方案 + 验收标准，已和用户谈清楚）；麻薯开功能必填，开好后等用户批准开工')
     s.add_argument('--account', help='归哪个账号（项目有 .mashu/accounts.json 时；不写按 accounts.json 的 features / 改动范围推）')
+    s.add_argument('--workdir', help='执行者的工作目录：工程文件夹里已存在的子目录（相对路径）；不写就是工程根目录。项目适配器开功能时也可能自己设')
     s = sub.add_parser('playbook', aliases=['workflow'], help='工作流（可复用流程）')
     s.add_argument('action', choices=['list', 'show', 'check', 'commit', 'apply', 'restore'])
     s.add_argument('target', nargs='?', help='template:<id> 或 film:<id>'); s.add_argument('--note'); s.add_argument('--template')

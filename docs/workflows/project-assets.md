@@ -4,7 +4,7 @@ km_type: workflow
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-16
+last_verified: 2026-11-24
 source_of_truth:
   - mashu/studio.py
   - mashu/server.py
@@ -35,6 +35,7 @@ related:
 | 行为模板 | `<工程>/.mashu/playbooks/behaviors/<id>.md` + `README.md` 对照表 | `mashu_studio/playbooks/behaviors/`（目前没有） |
 | 工作流面板配置 | `<工程>/.mashu/playbooks/dashboards/<工作流id>.json` | `mashu_studio/playbooks/dashboards/<id>.json`（目前有 direct） |
 | 按账号分组（一个项目运营几个账号） | `<工程>/.mashu/accounts.json` | — |
+| 接外部系统（工单系统等）的调度扩展 | `<工程>/.mashu/adapter.py` + `adapter/`（见下文「项目适配器」） | — |
 | 长期记住的事、做过的决定 | `<工程>/.mashu/producer-notes.md` | 麻薯记忆 `docs/memory/`（只放跨项目的用户偏好和守则，主脑维护） |
 | 给人看的成品 | `<工程>/.mashu/deliverables/` | — |
 
@@ -167,6 +168,25 @@ related:
 功能归属（`studio.feature_account`，后端统一算，网页和 `mashu status` 只读结果）优先级：① 功能 state.json 的 `account` → ② `features[key]` → ③ 开功能时的 `--touches` 按 `paths` 前缀匹配（最长前缀胜）→ ④ `default`。
 
 网页：侧栏和项目右栏的功能列表按账号分组（组标题 + 计数，侧栏组可收起）；项目页「工作流」视图顶部有「全部 / 各账号」切换（按项目记在浏览器里），选账号后工作流标签、看板、概况行（含面板配置的 overview）都只算这个账号；选「全部」时看板每列按账号分段。改 accounts.json 不用重启，网页刷新就重读。
+
+## 项目适配器（.mashu/adapter.py，可选）
+
+项目要把外部系统（例如研发工单系统）接进麻薯调度时，在 `.mashu/adapter.py` 写几个约定好的函数；没有这个文件就完全按默认行为。麻薯按需调用，**适配器出错只记运行日志（`mashu logs`，kind=`adapter-error`），不影响调度**；`adapter.py` 或 `adapter/*.py` 改了自动重新加载，不用重启服务。适配器归项目自己维护（写在哪个功能里就由那个功能的执行者改），例子：cysj 工作区的 wf 适配器。
+
+每个函数第一个参数是 `ctx`（麻薯给的接口）：`ctx.root` 工程目录、`ctx.docs` 即 `.mashu/`、`ctx.get(k)` / `ctx.set(k, v)` 持久键值（存麻薯数据库，重启不丢）、`ctx.notice(text, key=None)` 发到项目 / 功能频道、`ctx.log(kind, **detail)` 记运行日志、`ctx.features()` / `ctx.feature(key)` 功能列表。`feature` 是 dict：`key`、`num`、`slug`、`title`、`data`（state.json）、`adapter`（state.json 里适配器自己的字段）、`workdir`、`dir`（执行者工作目录的绝对路径）、`done`、`open_cards`（这个功能名下还开着的外部卡片 ref）。
+
+| 函数 | 什么时候调 | 返回 |
+| --- | --- | --- |
+| `on_new(ctx, feature)` | 开功能后、派执行者前 | 要并进 state.json 的字段，例如 `{"workdir": "issues/1069-ticket", "adapter": {...}}`；`workdir` 必须是工程里已存在的子目录 |
+| `launch_env(ctx, feature, session)` | 启动执行者 | 追加的环境变量（不能改 `MASHU_*`、`PATH`）。`session["resume"]` 为真时 `session["env"]` 是这个会话上次的值，恢复会话要沿用 |
+| `launch_prompt(ctx, feature)` | 启动执行者 | 系统提示附加文本；或 `{"text": …, "replace": true, "first": …}`：`replace` 换掉默认的「怎么做」一节，`first` 接在开场「继续 …」后面 |
+| `pretool(ctx, feature, tool, input, risky)` | 执行者每次调工具（在麻薯自己的 git 规矩、写文件检查之后） | `None` 没意见（照麻薯的闸门）；字符串 = 拒绝原因；`True` = 适配器担保放行，跳过麻薯的 prod 审批（不可逆操作照样要用户审批）。`risky` 是麻薯的判定 `[闸门, 说明]` 或 `None`。hook 只有 10 秒，外部调用要更短 |
+| `sync(ctx, known)` | 每 `SYNC_SECONDS` 秒（默认 20，后台线程） | `{"cards": [...], "close": [...], "messages": [...]}`。`known` 是麻薯里还开着的外部卡片 `[{ref, key, rid}]` |
+| `answer(ctx, card, text)` | 用户在麻薯网页回答外部卡片 | `{"status": "answered"/"closed"/"error", "answer", "deliver", "notice", "message"}` |
+| `on_idle(ctx, feature, session)` | 随 sync，对每个空闲（本轮结束、没有后台任务）的执行者 | `None`，或 `{"action": "continue"/"stop"/"done", "note", "prompt"}`：`continue` 关掉本会话、换一个新执行者（新名字、不恢复会话）带着 `prompt` 接手；`stop` 收工；`done` 收工并把功能标为完成 |
+| `cron(ctx)` | 随 sync | 无。是否到点由适配器自己用 `ctx.get/set` 判断（先记再跑，重启不重复） |
+
+外部卡片：`cards` 每项 `{ref, key, title, text, summary, options, url, web_only, source}`。麻薯建成直接到用户手上的上报（`meta.external=1`），**只有用户能在网页回答**，子脑 / 主脑不能代答；按 `ref` 去重，用户静默过的不再出；`key` 对不上功能的进项目频道；`web_only` 的只显示「去外部网页处理」。`close` 每项 `{ref, answer, deliver}`：外部那边已处理，麻薯关卡片，`deliver` 投给该功能的执行者（没在跑就带着消息拉起一个）。`messages` 每项 `{key, text}`：有 `key` 投给执行者，没有就发到项目频道。
 
 ## 项目笔记（.mashu/producer-notes.md）
 
