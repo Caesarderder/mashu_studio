@@ -76,6 +76,16 @@ related:
 - 安全拦截和 Claude 一样是护栏，不是安全边界（hook 出错时放行；正则 / 结构判定见 `risky`）。CLI 换了 hook 输入格式就可能失效，所以版本不在已验证范围内不让选。
 - `--dangerously-bypass-hook-trust` 对 Codex 是整次会话生效：工程里如果有 `.codex/hooks.json`，它也会不经确认就运行。
 
+## 额度与花费来源（#3 3-quota-all）
+
+网页左下角纯数字展示各家额度与花费：
+
+- **Claude**：来自受管会话状态栏回报的 `rate_limits`，写入 `state/ratelimits.json`；包含 5 小时（`five_hour`）与本周（`seven_day`）的百分比及重置时间。
+- **Codex**：来自 rollout 会话记录（`state/codex-home/sessions` 与 `~/.codex/sessions`）中 `token_count` 事件携带的 `rate_limits` 字段（`primary` 为 5 小时 300 分钟窗口，`secondary` 为周 10080 分钟窗口）。只读扫描最新 rollout 文件。
+- **OpenCode**：按量付费，从本地 `~/.local/share/opencode/opencode.db` 只读汇总今日（0 点起）与本周（周一 0 点起）的会话花费（`cost`）。
+- **Gemini（agy）**：agy CLI 未在本地日志、文件或状态栏中暴露配额查询接口，前端展示「无额度数据」（悬停说明原因）。
+- **服务端节流与缓存**：`studio.read_limits()` 对各平台只读汇总，内存缓存 60 秒，避免前端轮询频繁扫盘或开库；Claude 收到新状态栏时立即失效缓存。
+
 ## 验证记录（2026-11-24）
 
 - 单测：`tests/test_platforms.py`（格式转换、拦截、会话 ID / 用量 / 回复、独立 CODEX_HOME 不改用户目录、OpenCode 启动参数、未验证版本不能选、开工卡配置）。

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -94,6 +95,95 @@ class TestPure(unittest.TestCase):
         self.assertEqual(plat.opencode_tool('cysj-ai-support-v2_change_apply', {}, mcp_names=['mcp__cysj-ai-support-v2__change_apply']),
                          [('mcp__cysj-ai-support-v2__change_apply', {})])
         self.assertEqual(plat.opencode_tool('foo_bar', {})[0][0], 'mcp__foo_bar')
+
+    def test_codex_rate_limits(self):
+        # 1. 正常带 rate_limits
+        entries = [
+            {'type': 'event_msg', 'timestamp': '2026-11-24T07:30:28.351Z', 'payload': {
+                'type': 'token_count',
+                'rate_limits': {
+                    'limit_id': 'codex',
+                    'primary': {'used_percent': 58.0, 'window_minutes': 300, 'resets_at': 1795437230},
+                    'secondary': {'used_percent': 39.0, 'window_minutes': 10080, 'resets_at': 1795572495},
+                    'credits': {'has_credits': True, 'balance': '61516.12'},
+                    'plan_type': 'plus',
+                }
+            }}
+        ]
+        res = plat.codex_rate_limits(entries)
+        self.assertIsNotNone(res)
+        self.assertEqual(res['five_hour']['used_percentage'], 58.0)
+        self.assertEqual(res['five_hour']['resets_at'], 1795437230)
+        self.assertEqual(res['seven_day']['used_percentage'], 39.0)
+        self.assertEqual(res['plan_type'], 'plus')
+        self.assertAlmostEqual(res['at'], 1795505428.351, places=1)
+
+        # 2. 旧文件：只有 token_count 没有 rate_limits
+        old_entries = [
+            {'type': 'event_msg', 'payload': {'type': 'token_count', 'info': {'total_token_usage': {'input_tokens': 100}}}}
+        ]
+        self.assertIsNone(plat.codex_rate_limits(old_entries))
+
+        # 3. 空 entries
+        self.assertIsNone(plat.codex_rate_limits([]))
+
+    def test_find_codex_rate_limits(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / 'sessions' / '2026' / '11' / '24'
+            base.mkdir(parents=True)
+            # 旧文件没有 rate_limits
+            old_f = base / 'rollout-2026-11-24T01-00-00-old.jsonl'
+            old_f.write_text(json.dumps({'type': 'event_msg', 'payload': {'type': 'token_count'}}) + '\n')
+            # 新文件带 rate_limits
+            new_f = base / 'rollout-2026-11-24T02-00-00-new.jsonl'
+            new_f.write_text(json.dumps({'type': 'event_msg', 'timestamp': '2026-11-24T02:00:00Z', 'payload': {
+                'type': 'token_count',
+                'rate_limits': {
+                    'primary': {'used_percent': 10.0, 'resets_at': 1795500000},
+                    'secondary': {'used_percent': 20.0, 'resets_at': 1795600000},
+                }
+            }}) + '\n')
+            res = plat.find_codex_rate_limits([Path(td) / 'sessions'])
+            self.assertIsNotNone(res)
+            self.assertEqual(res['five_hour']['used_percentage'], 10.0)
+
+            # 空目录或不存在目录
+            self.assertIsNone(plat.find_codex_rate_limits([Path(td) / 'nonexistent']))
+
+    def test_opencode_costs(self):
+        import tempfile, sqlite3
+        from datetime import datetime
+        with tempfile.TemporaryDirectory() as td:
+            db_p = Path(td) / 'opencode.db'
+            conn = sqlite3.connect(db_p)
+            conn.execute('CREATE TABLE session (id text primary key, time_created integer, cost real)')
+            # 设基准时间：周三 12:00
+            base_dt = datetime(2026, 11, 25, 12, 0, 0)
+            now_ts = base_dt.timestamp()
+
+            # 今日 session (周三 10:00): $1.5
+            t_today = int(datetime(2026, 11, 25, 10, 0, 0).timestamp() * 1000)
+            conn.execute('INSERT INTO session VALUES ("s1", ?, 1.5)', (t_today,))
+
+            # 本周较早 session (周一 10:00): $2.0
+            t_this_week = int(datetime(2026, 11, 23, 10, 0, 0).timestamp() * 1000)
+            conn.execute('INSERT INTO session VALUES ("s2", ?, 2.0)', (t_this_week,))
+
+            # 上周 session (周日 10:00): $5.0
+            t_last_week = int(datetime(2026, 11, 22, 10, 0, 0).timestamp() * 1000)
+            conn.execute('INSERT INTO session VALUES ("s3", ?, 5.0)', (t_last_week,))
+            conn.commit()
+            conn.close()
+
+            res = plat.opencode_costs(db_p, now=now_ts)
+            self.assertIsNotNone(res)
+            self.assertAlmostEqual(res['today'], 1.5)
+            self.assertAlmostEqual(res['week'], 3.5)
+            self.assertAlmostEqual(res['at'], t_today / 1000.0)
+
+            # 不存在的 db
+            self.assertIsNone(plat.opencode_costs(Path(td) / 'missing.db'))
 
 
 class PlatBase(Base):
@@ -371,6 +461,37 @@ class TestKickoffExec(PlatBase):
         p = self.tmp / 'plan.md'
         p.write_text('# 方案\n')
         return p
+
+
+class TestQuotaStudio(PlatBase):
+    def test_collect_limits_and_cache(self):
+        rf = self.tmp / 'ratelimits.json'
+        rf.write_text(json.dumps({
+            'five_hour': {'used_percentage': 50, 'resets_at': 1795500000},
+            'seven_day': {'used_percentage': 80, 'resets_at': 1795600000},
+            'at': 1000.0
+        }))
+        res = studio.collect_limits(home=self.tmp)
+        self.assertIn('claude', res)
+        self.assertEqual(res['claude']['five_hour']['used_percentage'], 50)
+        self.assertEqual(res['five_hour']['used_percentage'], 50)
+        self.assertIn('codex', res)
+        self.assertIn('opencode', res)
+        self.assertIn('gemini', res)
+        self.assertEqual(res['gemini']['reason'], 'agy CLI 未提供额度查询接口')
+
+        # 缓存与失效测试
+        saved_cache = studio._LIMITS_CACHE.copy()
+        try:
+            studio._LIMITS_CACHE['data'] = {'claude': {'mock': True}}
+            studio._LIMITS_CACHE['at'] = time.time()
+            self.assertEqual(studio.read_limits(), {'claude': {'mock': True}})
+            # 失效后重新计算
+            studio._LIMITS_CACHE['at'] = 0
+            new_data = studio.read_limits()
+            self.assertIn('gemini', new_data)
+        finally:
+            studio._LIMITS_CACHE.update(saved_cache)
 
 
 if __name__ == '__main__':

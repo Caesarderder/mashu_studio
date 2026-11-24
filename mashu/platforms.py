@@ -2,10 +2,13 @@
 
 不依赖 studio.py（studio 调这里），方便单测。各家怎么注入 hooks、会话记录在哪、已知限制见 docs/references/platforms.md。
 """
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
 import re
+import sqlite3
+import time
 
 EFFORT_ORDER = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 
@@ -343,3 +346,104 @@ def opencode_tool(tool, args, cwd=None, mcp_names=()):
         if len(parts) >= 3 and norm(tool) == norm(''.join(parts[1:])):
             return [(full, a)]
     return [('mcp__' + tool, a)]
+
+
+# ---------- 额度与花费采集（mashu-studio #3）----------
+
+def codex_rate_limits(entries, mtime=None):
+    """从 rollout entries 中提取最后一个 token_count 里的 rate_limits。
+    若无有效 rate_limits 返回 None。"""
+    for d in reversed(entries or []):
+        t, p = d.get('type'), d.get('payload') or {}
+        if t == 'event_msg' and p.get('type') == 'token_count' and isinstance(p.get('rate_limits'), dict):
+            rl = p['rate_limits']
+            pri = rl.get('primary') or {}
+            sec = rl.get('secondary') or {}
+            five_hour = None
+            if pri.get('used_percent') is not None:
+                five_hour = {
+                    'used_percentage': pri.get('used_percent'),
+                    'resets_at': pri.get('resets_at'),
+                    'window_minutes': pri.get('window_minutes', 300),
+                }
+            seven_day = None
+            if sec.get('used_percent') is not None:
+                seven_day = {
+                    'used_percentage': sec.get('used_percent'),
+                    'resets_at': sec.get('resets_at'),
+                    'window_minutes': sec.get('window_minutes', 10080),
+                }
+            at = mtime
+            ts = d.get('timestamp')
+            if ts:
+                try:
+                    at = datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
+                except Exception:
+                    pass
+            return {
+                'five_hour': five_hour,
+                'seven_day': seven_day,
+                'credits': rl.get('credits'),
+                'plan_type': rl.get('plan_type'),
+                'at': at,
+            }
+    return None
+
+
+def find_codex_rate_limits(dirs):
+    """在一组 sessions 目录里按修改时间倒序找最新一条 Codex rate_limits。只读。"""
+    candidates = []
+    for d in dirs:
+        p_dir = Path(d).expanduser().resolve()
+        if not p_dir.is_dir():
+            continue
+        try:
+            for p in p_dir.glob('*/*/*/rollout-*.jsonl'):
+                try:
+                    candidates.append((p.stat().st_mtime, p))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    for mtime, p in candidates[:10]:
+        entries = read_jsonl_tail(p, tail=500_000)
+        res = codex_rate_limits(entries, mtime=mtime)
+        if res and (res.get('five_hour') or res.get('seven_day')):
+            return res
+    return None
+
+
+def opencode_costs(db_path=None, now=None):
+    """从 opencode.db 只读汇总今日和本周花费。
+    返回 dict(today=float, week=float, at=float) 或 None（若数据库不存在或读取失败）。"""
+    path = Path(db_path) if db_path else (Path.home() / '.local' / 'share' / 'opencode' / 'opencode.db')
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        return None
+    try:
+        now_ts = now if now is not None else time.time()
+        dt_now = datetime.fromtimestamp(now_ts)
+        today_start = datetime(dt_now.year, dt_now.month, dt_now.day)
+        today_ms = int(today_start.timestamp() * 1000)
+        week_start = today_start - timedelta(days=today_start.weekday())
+        week_ms = int(week_start.timestamp() * 1000)
+
+        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=2.0)
+        cur = conn.cursor()
+        cur.execute('SELECT COALESCE(SUM(cost), 0.0) FROM session WHERE time_created >= ?', (today_ms,))
+        today_cost = float(cur.fetchone()[0] or 0.0)
+        cur.execute('SELECT COALESCE(SUM(cost), 0.0) FROM session WHERE time_created >= ?', (week_ms,))
+        week_cost = float(cur.fetchone()[0] or 0.0)
+        cur.execute('SELECT MAX(time_created) FROM session')
+        row = cur.fetchone()
+        latest_at = (row[0] / 1000.0) if row and row[0] else now_ts
+        conn.close()
+        return {
+            'today': today_cost,
+            'week': week_cost,
+            'at': latest_at,
+        }
+    except Exception:
+        return None
+

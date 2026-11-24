@@ -810,6 +810,15 @@ th { background: var(--card-2); }
 
 .side-foot { flex-direction: row; }
 .quota { width: 100%; display: flex; flex-direction: column; gap: 4px; padding-bottom: 6px; margin-bottom: 2px; border-bottom: 1px dashed var(--line); }
+.q-plat-row { display: flex; align-items: baseline; gap: 8px; font-size: 11px; line-height: 1.45; white-space: nowrap; overflow: hidden; }
+.q-plat-row.q-dim { opacity: 0.55; }
+.q-plat-name { flex: none; width: 56px; font-weight: 600; color: var(--text); font-size: 11px; }
+.q-plat-vals { flex: 1; display: inline-flex; align-items: baseline; gap: 6px; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 11px; }
+.q-item { display: inline-flex; align-items: baseline; gap: 2px; white-space: nowrap; }
+.q-item b { font-weight: 600; color: var(--text); }
+.q-item.mid b { color: var(--amber); }
+.q-item.hi b { color: var(--red); }
+.q-rst { color: var(--faint); font-size: 10.5px; margin-left: 1px; font-style: normal; }
 .q-row { --c: var(--green); display: grid; grid-template-columns: 44px 1fr 34px; grid-template-rows: auto auto; column-gap: 8px; align-items: center; }
 .q-row.mid { --c: var(--amber); } .q-row.hi { --c: var(--red); }
 .q-l { font-size: 11.5px; color: var(--text); font-weight: 600; }

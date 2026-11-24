@@ -25,6 +25,7 @@ from pathlib import Path
 import random
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -4511,11 +4512,65 @@ def fresh_session(conn, channel, by='用户'):
     return f'「{new["name"]}」新会话{"已启动" if c and c["pane"] else "排队启动"}'
 
 
-def read_limits():
+_LIMITS_CACHE = {'data': None, 'at': 0}
+
+
+def collect_limits(home=None):
+    """采集 Claude、Codex、OpenCode、Gemini 各平台额度与花费。"""
+    h = Path(home) if home else HOME
+    now = time.time()
+
+    # 1. Claude
+    claude_data = None
     try:
-        return json.loads((HOME / 'ratelimits.json').read_text())
-    except (OSError, ValueError):
-        return None
+        rf = h / 'ratelimits.json'
+        if rf.is_file():
+            claude_data = json.loads(rf.read_text())
+    except Exception:
+        pass
+
+    # 2. Codex
+    codex_dirs = [h / 'codex-home' / 'sessions', CODEX_USER_HOME / 'sessions']
+    codex_data = plat.find_codex_rate_limits(codex_dirs)
+    codex_installed = bool(shutil.which(cfg('codex') or 'codex') or (CODEX_USER_HOME / 'sessions').is_dir())
+
+    # 3. OpenCode
+    oc_db = Path.home() / '.local' / 'share' / 'opencode' / 'opencode.db'
+    oc_costs = plat.opencode_costs(oc_db, now=now)
+    oc_installed = bool(shutil.which(cfg('opencode') or 'opencode') or oc_db.is_file())
+
+    # 4. Gemini
+    gemini_installed = bool(shutil.which(cfg('agy') or 'agy') or GEMINI_HOME.is_dir())
+    gemini_data = {
+        'installed': gemini_installed,
+        'available': False,
+        'reason': 'agy CLI 未提供额度查询接口',
+    }
+
+    res = {
+        'claude': claude_data if claude_data else {'installed': True, 'waiting': True},
+        'codex': codex_data if codex_data else {'installed': codex_installed, 'waiting': codex_installed},
+        'opencode': oc_costs if oc_costs is not None else {'installed': oc_installed, 'waiting': oc_installed},
+        'gemini': gemini_data,
+    }
+    # 向后兼容 Claude 顶层字段
+    if isinstance(claude_data, dict):
+        res.update({
+            'five_hour': claude_data.get('five_hour'),
+            'seven_day': claude_data.get('seven_day'),
+            'at': claude_data.get('at'),
+        })
+    return res
+
+
+def read_limits():
+    now = time.time()
+    if _LIMITS_CACHE['data'] is not None and now - _LIMITS_CACHE['at'] < 60:
+        return _LIMITS_CACHE['data']
+    data = collect_limits()
+    _LIMITS_CACHE['data'] = data
+    _LIMITS_CACHE['at'] = now
+    return data
 
 
 def usage_totals(entries, window=None):
@@ -5866,7 +5921,12 @@ def cmd_statusline(args):
         rl = d.get('rate_limits') or {}
         if rl.get('five_hour') or rl.get('seven_day'):     # 账号的 5 小时 / 周额度：任何一个受管会话报上来就记下
             f = HOME / 'ratelimits.json'
-            old = read_limits() or {}
+            _LIMITS_CACHE['at'] = 0
+            old = {}
+            try:
+                old = json.loads(f.read_text()) if f.is_file() else {}
+            except Exception:
+                pass
             if {k: old.get(k) for k in rl} != rl or time.time() - old.get('at', 0) > 60:
                 f.write_text(json.dumps(dict(rl, at=time.time()), ensure_ascii=False))
         sid = os.environ.get('MASHU_SESSION')

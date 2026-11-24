@@ -446,18 +446,97 @@ function resetShort(v) {
   if (m < 24 * 60) return `${Math.floor(m / 60)}小时${m % 60}分`;
   return `${Math.floor(m / 1440)}天${Math.floor((m % 1440) / 60)}小时`;
 }
+function resetCompact(v) {
+  const t = resetAt(v);
+  if (!t) return '';
+  const m = Math.max(0, Math.round((t - Date.now()) / 60000));
+  if (m < 60) return `${m}分`;
+  if (m < 24 * 60) {
+    const h = Math.floor(m / 60);
+    const r = m % 60;
+    return r ? `${h}h${r}分` : `${h}h`;
+  }
+  const d = Math.floor(m / 1440);
+  const h = Math.floor((m % 1440) / 60);
+  return h ? `${d}天${h}h` : `${d}天`;
+}
+function quotaStaleTag(at) {
+  if (!at) return '';
+  const age = Math.round((Date.now() / 1000 - at) / 60);
+  if (age < 15) return '';
+  const s = age >= 60 ? `${Math.floor(age / 60)}h前` : `${age}分前`;
+  return `<i class="q-rst" title="${age} 分钟前的数据">·${s}</i>`;
+}
+function renderRateLimitRow(name, data) {
+  if (!data) return '';
+  if (data.installed === false) {
+    return `<div class="q-plat-row q-dim" title="${name} 未安装"><span class="q-plat-name">${name}</span><span class="q-plat-vals">未安装</span></div>`;
+  }
+  const f5 = data.five_hour, fw = data.seven_day;
+  const p5 = f5 && f5.used_percentage != null ? Math.round(Number(f5.used_percentage)) : null;
+  const pw = fw && fw.used_percentage != null ? Math.round(Number(fw.used_percentage)) : null;
+  if (p5 == null && pw == null) {
+    return `<div class="q-plat-row" title="${name} 等待会话报上额度"><span class="q-plat-name">${name}</span><span class="q-plat-vals q-dim">等会话报上来</span></div>`;
+  }
+  const item = (label, p, r) => {
+    if (p == null) return '';
+    const cls = p >= 90 ? 'hi' : p >= 70 ? 'mid' : '';
+    const rTxt = r ? `<i class="q-rst">·${resetCompact(r)}</i>` : '';
+    const tDesc = r ? `，${resetText(r)}` : '';
+    return `<span class="q-item ${cls}" title="${name} ${label}额度已用 ${p}%${tDesc}">${label} <b>${p}%</b>${rTxt}</span>`;
+  };
+  return `<div class="q-plat-row">
+    <span class="q-plat-name">${name}</span>
+    <span class="q-plat-vals">
+      ${item('5h', p5, f5 && f5.resets_at)}
+      ${item('周', pw, fw && fw.resets_at)}
+      ${quotaStaleTag(data.at)}
+    </span>
+  </div>`;
+}
+function renderOpenCodeRow(data) {
+  if (!data) return '';
+  if (data.installed === false) {
+    return `<div class="q-plat-row q-dim" title="OpenCode 未安装"><span class="q-plat-name">OpenCode</span><span class="q-plat-vals">未安装</span></div>`;
+  }
+  if (data.today == null && data.week == null) {
+    return `<div class="q-plat-row" title="OpenCode 等待花费数据"><span class="q-plat-name">OpenCode</span><span class="q-plat-vals q-dim">等数据</span></div>`;
+  }
+  const tStr = `$${Number(data.today || 0).toFixed(2)}`;
+  const wStr = `$${Number(data.week || 0).toFixed(2)}`;
+  return `<div class="q-plat-row" title="OpenCode 今日花费 ${tStr}，本周花费 ${wStr}">
+    <span class="q-plat-name">OpenCode</span>
+    <span class="q-plat-vals">
+      <span class="q-item" title="今日花费">今日 <b>${tStr}</b></span>
+      <span class="q-item" title="本周花费">本周 <b>${wStr}</b></span>
+      ${quotaStaleTag(data.at)}
+    </span>
+  </div>`;
+}
+function renderGeminiRow(data) {
+  if (!data) return '';
+  if (data.installed === false) {
+    return `<div class="q-plat-row q-dim" title="Gemini (agy) 未安装"><span class="q-plat-name">Gemini</span><span class="q-plat-vals">未安装</span></div>`;
+  }
+  const reason = data.reason || 'agy CLI 未提供额度查询接口';
+  return `<div class="q-plat-row" title="Gemini：${esc(reason)}">
+    <span class="q-plat-name">Gemini</span>
+    <span class="q-plat-vals q-dim">无额度数据</span>
+  </div>`;
+}
 function quotaHtml() {
   const L = state.limits;
-  if (!L || !(L.five_hour || L.seven_day)) return '<div class="quota"><div class="q-stale">额度：等受管会话的状态栏报上来</div></div>';
-  const row = (label, x) => {
-    if (!x) return '';
-    const p = Math.round(Number(x.used_percentage) || 0);
-    return `<div class="q-row ${p >= 90 ? 'hi' : p >= 70 ? 'mid' : ''}" title="${label}额度已用 ${p}%${x.resets_at ? `，${resetText(x.resets_at)}` : ''}">
-      <span class="q-l">${label}</span><span class="q-bar"><i style="width:${Math.min(100, p)}%"></i></span><span class="q-p">${p}%</span>
-      <span class="q-r">${x.resets_at ? `${icon('clock', 11)}${resetShort(x.resets_at)}` : ''}</span></div>`;
-  };
-  const age = Math.round((Date.now() / 1000 - (L.at || 0)) / 60);
-  return `<div class="quota">${row('5小时', L.five_hour)}${row('本周', L.seven_day)}${age >= 15 ? `<div class="q-stale">${age} 分钟前的数据（有会话运行时自动更新）</div>` : ''}</div>`;
+  if (!L || (!L.claude && !L.codex && !L.opencode && !L.gemini && !L.five_hour && !L.seven_day)) {
+    return '<div class="quota"><div class="q-stale">额度：等受管会话的状态栏报上来</div></div>';
+  }
+  const claude = L.claude || (L.five_hour || L.seven_day ? L : null);
+  const rows = [
+    renderRateLimitRow('Claude', claude),
+    renderRateLimitRow('Codex', L.codex),
+    renderOpenCodeRow(L.opencode),
+    renderGeminiRow(L.gemini),
+  ].filter(Boolean).join('');
+  return `<div class="quota">${rows}</div>`;
 }
 
 // ---------- 按账号分组（#8）：项目有 .mashu/accounts.json 时，侧栏、项目页功能列表、工作流面板按账号分组 / 筛选；没有就完全照旧 ----------
