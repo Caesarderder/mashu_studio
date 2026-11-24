@@ -642,14 +642,16 @@ function sessCtl(ch, role, cam, buttons) {
   const ctx = cam && cam.alive && cam.context_pct != null ? cam.context_pct : null;
   const prov = p.provider || p.dp, pl = platOf(prov), camProv = cam && cam.alive ? cam.provider || 'claude' : '';
   const nowModel = cam && (cam.provider || 'claude') === prov ? cam.model : '';
+  const full = `${PROV_CN[prov] || prov} · ${p.mk(prov) || p.dmk(prov) || nowModel || '默认模型'} · 思考 ${p.effort || p.de || (cam && cam.effort) || '默认'}`;
   return `<div class="sess-ctl">
-    <div class="sess-pill">
+    <div class="sess-pill" title="${esc(full)}">
       <label class="sel prov" title="用哪家 CLI（Claude / Gemini / Codex / OpenCode）。只对新会话（点「新会话」或交接后）生效，恢复会话沿用原来那家；灰掉的是现在不能用的（悬停看原因）${camProv ? `；现在的会话：${PROV_CN[camProv] || camProv}` : ''}">
         <select data-pref="provider" data-ch="${esc(ch)}"><option value="">${PROV_CN[p.dp] || 'Claude'}（默认）</option>
           ${provOpts(p.provider)}</select></label>
       ${camProv && camProv !== prov ? `<span class="sp-pend" title="现在的会话还是 ${PROV_CN[camProv]}，点「新会话」或交接后换成 ${PROV_CN[prov]}">待新会话</span>` : ''}
       <span class="sp-sep">·</span>
-      <label class="sel" title="${esc(pl.label)} 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。第一项 = 用默认。切换时会话在原窗格重开，对话不丢${prov === 'opencode' && !(pl.models || []).length ? '。还没有 OpenCode 模型列表：到「会话监控」的默认设置里点刷新' : ''}">
+      <label class="sel" title="${esc(full)}
+${esc(pl.label)} 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。第一项 = 用默认。切换时会话在原窗格重开，对话不丢${prov === 'opencode' && !(pl.models || []).length ? '。还没有 OpenCode 模型列表：到「会话监控」的默认设置里点刷新' : ''}">
         <select data-pref="${esc(pl.model_key)}" data-ch="${esc(ch)}">${opts(pl.models || [], p.mk(prov), p.dmk(prov), prov === 'claude' ? shortModel(nowModel) : nowModel, '默认模型')}</select></label>
       <span class="sp-sep">·</span>
       <label class="sel eff" title="思考程度${cam && cam.effort ? `（现在：${esc(cam.effort)}）` : ''}。Codex / OpenCode 会换成这个模型支持的最接近一档。切换时会话在原窗格重开，对话不丢">
