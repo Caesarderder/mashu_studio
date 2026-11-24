@@ -29,6 +29,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -4175,8 +4176,67 @@ def codex_model_info():
     return {}
 
 
+_MODEL_REFRESH_LOCK = threading.Lock()
+_MODEL_REFRESHING = set()
+_MODEL_REFRESH_ATTEMPT = {}
+
+
+def maybe_refresh_models_async(prov):
+    """如果 OpenCode 或 Gemini 缓存不存在或超过 1 天，后台异步刷新（加锁，失败只记日志，不阻塞当前请求）。"""
+    f = HOME / ('opencode-models.json' if prov == 'opencode' else 'gemini-models.json')
+    now = time.time()
+    last_attempt = _MODEL_REFRESH_ATTEMPT.get(prov, 0)
+    if now - last_attempt < 300:
+        return
+
+    needs_refresh = False
+    if not f.is_file():
+        needs_refresh = True
+    else:
+        try:
+            mtime = f.stat().st_mtime
+            if now - mtime > 86400:
+                needs_refresh = True
+            else:
+                d = json.loads(f.read_text())
+                if now - (d.get('at') or 0) > 86400:
+                    needs_refresh = True
+        except Exception:
+            needs_refresh = True
+
+    if not needs_refresh:
+        return
+
+    with _MODEL_REFRESH_LOCK:
+        if prov in _MODEL_REFRESHING:
+            return
+        _MODEL_REFRESHING.add(prov)
+        _MODEL_REFRESH_ATTEMPT[prov] = now
+
+    def _worker():
+        try:
+            if prov == 'opencode':
+                refresh_opencode_models()
+            elif prov == 'gemini':
+                refresh_gemini_models()
+        except Exception as exc:
+            try:
+                (HOME / 'logs').mkdir(parents=True, exist_ok=True)
+                with (HOME / 'logs' / 'models_refresh.log').open('a', encoding='utf-8') as lf:
+                    lf.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] 自动刷新 {prov} 模型失败: {exc}\n')
+            except Exception:
+                pass
+        finally:
+            with _MODEL_REFRESH_LOCK:
+                _MODEL_REFRESHING.discard(prov)
+
+    t = threading.Thread(target=_worker, name=f'refresh-{prov}-models', daemon=True)
+    t.start()
+
+
 def opencode_model_info():
     """OpenCode 可选模型 {provider/model: dict(variants, context, free)}：mashu opencode-models --refresh 缓存的 opencode models --verbose。"""
+    maybe_refresh_models_async('opencode')
     try:
         got = json.loads((HOME / 'opencode-models.json').read_text()).get('models') or {}
         return got if isinstance(got, dict) else {}
@@ -4238,6 +4298,7 @@ GEMINI_MODEL_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9 ._()/:-]{0,79}')
 
 
 def gemini_models():
+    maybe_refresh_models_async('gemini')
     try:
         got = json.loads((HOME / 'gemini-models.json').read_text()).get('models') or []
         if got:
@@ -6123,6 +6184,8 @@ def status_data(conn):
 
 def platforms_view():
     """网页用的平台表：能不能选（不能就写原因）、模型列表、对话偏好里的模型键。"""
+    maybe_refresh_models_async('opencode')
+    maybe_refresh_models_async('gemini')
     out = []
     for p in PROVIDERS:
         st = platform_status(p)

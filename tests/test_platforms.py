@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import unittest
 
@@ -492,6 +493,44 @@ class TestQuotaStudio(PlatBase):
             self.assertIn('gemini', new_data)
         finally:
             studio._LIMITS_CACHE.update(saved_cache)
+
+    def test_models_async_refresh(self):
+        called = []
+        done = threading.Event()
+
+        def fake_refresh():
+            called.append('opencode')
+            done.set()
+
+        orig_fn = studio.refresh_opencode_models
+        studio.refresh_opencode_models = fake_refresh
+        try:
+            studio._MODEL_REFRESH_ATTEMPT.clear()
+            studio._MODEL_REFRESHING.clear()
+            # 临时 HOME 没有 opencode-models.json 时触发
+            studio.maybe_refresh_models_async('opencode')
+            self.assertTrue(done.wait(timeout=2.0))
+            self.assertEqual(called, ['opencode'])
+
+            # 缓存存在且未过期 (<1 天) 不触发
+            f = studio.HOME / 'opencode-models.json'
+            f.write_text(json.dumps({'models': {'x': {}}, 'at': time.time()}))
+            called.clear()
+            done.clear()
+            studio._MODEL_REFRESH_ATTEMPT.clear()
+            studio.maybe_refresh_models_async('opencode')
+            time.sleep(0.1)
+            self.assertEqual(called, [])
+
+            # 缓存超过 1 天触发后台刷新
+            f.write_text(json.dumps({'models': {'x': {}}, 'at': time.time() - 90000}))
+            os.utime(f, (time.time() - 90000, time.time() - 90000))
+            studio._MODEL_REFRESH_ATTEMPT.clear()
+            studio.maybe_refresh_models_async('opencode')
+            self.assertTrue(done.wait(timeout=2.0))
+            self.assertEqual(called, ['opencode'])
+        finally:
+            studio.refresh_opencode_models = orig_fn
 
 
 if __name__ == '__main__':
