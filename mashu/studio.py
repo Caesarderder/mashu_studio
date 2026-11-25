@@ -3302,6 +3302,9 @@ def resume_prompts(conn):
 API_ERROR_RE = re.compile(r'API Error|Connection lost mid-response|overloaded_error|Overloaded|Request timed out|'
                           r'rate_limit_error|Internal server error|ECONNRESET|socket hang up|fetch failed|Unable to connect to API', re.I)
 RETRYING_RE = re.compile(r'Retrying in|attempt \d+/\d+', re.I)
+# 余额 / 额度用完：重试没用，直接提醒用户（2026-11-25 cysj #11 OpenCode 的 DeepSeek 余额不足，用户问话没人回）
+BILLING_RE = re.compile(r'Insufficient Balance|insufficient_quota|credit balance is too low|Payment Required|'
+                        r'exceeded your current quota|余额不足|欠费', re.I)
 _health_seen = {}       # 机位 id → [屏幕签名, transcript 修改时间, 最近一次有进展的时间]
 _health_retry = {}      # 机位 id → [自动“继续”的次数, 上次时间]
 _health_tick = [0.0]
@@ -3358,6 +3361,12 @@ def health_guard(conn):
             continue
         stalled = now - seen[2]
         title = camera_title(conn, c)
+        bill = BILLING_RE.search('\n'.join(lines[-12:]))
+        if bill and stalled >= 45:
+            note = f'模型余额 / 额度不足（{bill.group(0)}），需要充值或换模型'
+            if set_health(conn, c, 'apierr', note):
+                health_alert(conn, f'{title}：{note}；它停在这里，不会自动重试')
+            continue
         err = API_ERROR_RE.search('\n'.join(lines[-12:]))
         if err and stalled >= 45:
             if RETRYING_RE.search(tail):
