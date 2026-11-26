@@ -178,6 +178,15 @@ def codex_session_file(codex_home, sid):
     return hits[0] if hits else None
 
 
+def find_codex_session(homes, sid):
+    """账号池：每个号一个 CODEX_HOME，会话在哪个号目录里就去哪找。返回 (rollout 文件, 所在的 CODEX_HOME) 或 (None, None)。"""
+    for h in homes:
+        p = codex_session_file(h, sid)
+        if p:
+            return p, Path(h)
+    return None, None
+
+
 def codex_models(cache_path):
     """Codex 可选模型：~/.codex/models_cache.json 里 visibility=list 的，带支持的思考档位和窗口。"""
     try:
@@ -216,12 +225,13 @@ def toml_str(s):
     return json.dumps(str(s), ensure_ascii=False)
 
 
-def build_codex_home(home, user_home, skills=None, extra=''):
+def build_codex_home(home, user_home, skills=None, extra='', link_auth=True):
     """建麻薯专用的 CODEX_HOME（不改用户的 ~/.codex）：
     - config.toml：用户 config.toml 的副本（去掉 hooks / 插件 / 项目信任），用户的改了就重抄；Codex 自己往里写的信任只落在这份副本；
     - auth.json（和 auth.lock）：软链接到用户的，登录状态共用，Codex 刷新令牌时写回同一个文件；
     - AGENTS.md：软链接到用户的全局说明（和 Claude 会话读用户的 CLAUDE.md 一样）；
     - skills/<名>：麻薯给的 skill（caesar-docs）；extra：追加到 config.toml 末尾的内容（麻薯的 hooks）。
+    link_auth=False：账号池里麻薯自己持有的号，auth.json / auth.lock 是这个号目录自己的（codex login 写进来），不软链接。
     返回 home。"""
     home, user_home = Path(home), Path(user_home)
     home.mkdir(parents=True, exist_ok=True)
@@ -237,7 +247,7 @@ def build_codex_home(home, user_home, skills=None, extra=''):
         tmp.write_text(text)
         os.replace(tmp, cfgp)
         mark.write_text(src + extra)
-    for name in ('auth.json', 'auth.lock', 'AGENTS.md'):
+    for name in ('auth.json', 'auth.lock', 'AGENTS.md') if link_auth else ('AGENTS.md',):
         target, link = user_home / name, home / name
         if not target.exists():
             continue

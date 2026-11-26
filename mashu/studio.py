@@ -36,6 +36,7 @@ import uuid
 sys.modules.setdefault('studio', sys.modules[__name__])   # 以脚本运行时，让 selfiter 里的 import studio 拿到同一个模块
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import platforms as plat  # noqa: E402   Codex / OpenCode 的纯函数部分
+import accounts as acct  # noqa: E402   账号池：Codex / Gemini 多账号（#4）
 
 CODE = Path(__file__).resolve().parent.parent
 PROMPTS = Path(__file__).resolve().parent / 'prompts'
@@ -1507,7 +1508,14 @@ def check_exec(v):
         raise ValueError(f'{PROV_LABEL[cli]} 不认识模型 {model}')
     if effort and effort not in EFFORTS:
         raise ValueError(f'思考程度只能是 {" / ".join(EFFORTS)}：{effort}')
-    return dict(cli=cli, model=model, effort=effort)
+    out = dict(cli=cli, model=model, effort=effort)
+    aid = (v.get('account') or '').strip()
+    if aid and cli in ACCT_KEY:          # 账号池里指定的号（空 = 自动）；换了平台就作废
+        a = pool().get(aid)
+        if not a or a.get('platform') != cli:
+            raise ValueError(f'{PROV_LABEL[cli]} 账号池里没有 {aid}')
+        out['account'] = aid
+    return out
 
 
 def kickoff_exec(conn, f, key):
@@ -1515,7 +1523,11 @@ def kickoff_exec(conn, f, key):
     c = dict(id=0, role='crew', film_id=f['id'], seq_key=key, resume_sid=None, claude_sid=None)
     prov = provider_pref(conn, c)
     p = session_pref(conn, c, prov)
-    return dict(cli=prov, model=p['model'], effort=p['effort'])
+    out = dict(cli=prov, model=p['model'], effort=p['effort'])
+    ex = feature_exec(conn, c)
+    if prov in ACCT_KEY and (ex.get('cli') or 'claude') == prov and ex.get('account'):
+        out['account'] = ex['account']
+    return out
 
 
 def grant_kickoff(conn, f, key, who, exec_cfg=None):
@@ -1852,6 +1864,407 @@ def codex_home():
     return HOME / 'codex-home'
 
 
+# ---------- 账号池（#4）：Codex / Gemini 多账号，见 mashu/accounts.py、docs/references/platforms.md「账号池」----------
+ACCT_KEY = dict(codex='xacct', gemini='gacct')        # 对话偏好（pref:<频道>）里指定号的键
+ACCOUNTS_THREADED = True                              # 测试里设 False：体检同步跑
+_ACCT_JOB = {}
+_ACCT_Q = {}
+
+
+def pool():
+    return acct.Pool(HOME / 'accounts')
+
+
+def gemini_ops():
+    return acct.Gemini(pool(), cfg('agy'))
+
+
+def codex_acct_home(a):
+    """这个 Codex 号的 CODEX_HOME：本机默认号（本机导入的）就是 state/codex-home（auth.json 软链接到 ~/.codex），其余是池里自己的目录。"""
+    return codex_home() if (a or {}).get('source') == 'local' else pool().root / 'codex' / a['id']
+
+
+def codex_homes():
+    """麻薯会话可能用到的所有 CODEX_HOME：state/codex-home + 账号池里每个 Codex 号的目录（找 rollout、恢复会话用）。"""
+    return [codex_home()] + [pool().root / 'codex' / a['id'] for a in pool().list('codex') if a.get('source') != 'local']
+
+
+def find_codex_rollout(sid):
+    return plat.find_codex_session(codex_homes(), sid)[0]
+
+
+def codex_acct_quota(a):
+    """Codex 号的额度：它自己目录里 rollout 的 rate_limits（本机默认号再加上 ~/.codex/sessions）。缓存 60 秒。"""
+    hit = _ACCT_Q.get(a['id'])
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    dirs = [codex_acct_home(a) / 'sessions'] + ([CODEX_USER_HOME / 'sessions'] if a.get('source') == 'local' else [])
+    q = plat.find_codex_rate_limits(dirs)
+    _ACCT_Q[a['id']] = (time.time(), q)
+    return q
+
+
+def cli_accounts(platform=None):
+    """账号池（不含令牌）：Codex 号带上各自 rollout 里的额度，标出默认号、Gemini 钥匙串里现在是哪个号。"""
+    p = pool()
+    if not p.exists():
+        return []
+    out = p.view(platform)
+    defaults = {pl: (p.default(pl) or {}).get('id') for pl in acct.PLATFORMS}
+    for a in out:
+        if a['platform'] == 'codex':
+            a['quota'] = codex_acct_quota(a)
+        a['default'] = defaults.get(a['platform']) == a['id']
+        a['used'] = acct.used_pct(a)
+    if any(a['platform'] == 'gemini' for a in out):
+        hit = _ACCT_Q.get('gemini-active')
+        if not hit or time.time() - hit[0] > 30:
+            try:
+                hit = (time.time(), gemini_ops().active_id())
+            except Exception:
+                hit = (time.time(), None)
+            _ACCT_Q['gemini-active'] = hit
+        for a in out:
+            a['active'] = a['platform'] == 'gemini' and a['id'] == hit[1]
+    return out
+
+
+def choose_account(conn, c, prov):
+    """新会话用池里哪个号：对话里指定的 > 功能开工时定的（exec.account）> 自动（额度剩得最多）。
+    返回 (号 或 None, 原因)；池里这个平台没有号就是 (None, '')，按以前的单号行为开会话。"""
+    if prov not in ACCT_KEY:
+        return None, ''
+    accs = cli_accounts(prov)
+    if not accs:
+        return None, ''
+    ex = feature_exec(conn, c)
+    want = get_pref(conn, channel_of(c)).get(ACCT_KEY[prov]) or (ex.get('account') if (ex.get('cli') or 'claude') == prov else '')
+    d = pool().default(prov)
+    return acct.pick(accs, want or None, d and d['id'])
+
+
+def account_label(a):
+    return f'{a.get("label") or a.get("email") or a["id"]}（{a["id"]}）' if a else ''
+
+
+def accounts_in_use():
+    """正在运行的会话各用哪个号：{号: [机位]}（launch 时记 camacct:<机位>）。"""
+    conn = db()
+    out = {}
+    for c in rows(conn, f'SELECT id FROM cameras WHERE state IN {LIVE}'):
+        aid = meta_get(conn, f'camacct:{c["id"]}')
+        if aid:
+            out.setdefault(aid, []).append(c['id'])
+    return out
+
+
+def accounts_check(force=False, only=None):
+    """账号体检（后台每 10 分钟一轮，或网页「体检」）：
+    - Gemini：access_token 过期前 5 分钟用 RT 续期（Google 回了新 RT 就换上），顺便查额度；invalid_grant 标「已撤销」；
+    - Codex：读各号 auth.json 的登录状态、邮箱、套餐；麻薯自己持有的号超过 7 天没续期、又没有会话在用，就用 RT 续一次
+      （本机默认号由 Codex 自己续，麻薯不碰：OpenAI 的 RT 每次续期都换新，两边轮流续会有一边掉登录）。
+    返回 [(号, 结果)]。"""
+    p = pool()
+    if not p.exists():
+        return []
+    res = []
+    busy = None
+    for a in p.list():
+        if only and a['id'] != only:
+            continue
+        if a.get('disabled') and not force:
+            continue
+        if not force and time.time() - (a.get('last_check') or 0) < (600 if a['platform'] == 'gemini' else 1800):
+            continue
+        try:
+            if a['platform'] == 'gemini':
+                if a.get('status') == 'revoked' and not force:
+                    continue
+                b = gemini_ops().check(a['id'])
+                res.append((a['id'], f'{b["status"]}' + (f'，额度剩 {round(b["quota"]["remaining"] * 100)}%' if (b.get('quota') or {}).get('remaining') is not None else '')))
+                continue
+            home = codex_acct_home(a)
+            info = acct.codex_auth_info((CODEX_USER_HOME if a.get('source') == 'local' else home) / 'auth.json')
+            if not info.get('logged_in'):
+                p.update(a['id'], status='logged_out' if a.get('status') != 'pending' else 'pending', last_check=time.time(),
+                         error='auth.json 里没有登录' if a.get('status') != 'pending' else '')
+                res.append((a['id'], '未登录'))
+                continue
+            upd = dict(status='ok', error='', email=info.get('email') or a.get('email'), plan=info.get('plan') or a.get('plan'),
+                       label=a.get('label') or info.get('email'), last_refresh=info.get('last_refresh'), last_check=time.time())
+            stale = time.time() - (info.get('last_refresh') or 0) > 7 * 86400
+            if a.get('source') != 'local' and (stale or force == 'refresh'):
+                busy = accounts_in_use() if busy is None else busy
+                if a['id'] in busy and force != 'refresh':
+                    res.append((a['id'], '超过 7 天没续期，但有会话在用（Codex 自己会续），这次不动'))
+                else:
+                    info = acct.codex_refresh(home)
+                    upd.update(last_refresh=info.get('last_refresh'), plan=info.get('plan') or upd['plan'], email=info.get('email') or upd['email'])
+            p.update(a['id'], **upd)
+            res.append((a['id'], 'ok'))
+        except acct.Revoked as exc:
+            p.update(a['id'], status='revoked', error=str(exc), last_check=time.time())
+            res.append((a['id'], f'已撤销：{exc}'))
+        except acct.AccountError as exc:
+            if a['platform'] == 'codex':
+                p.update(a['id'], status='refresh_failed', error=str(exc), last_check=time.time())
+            res.append((a['id'], f'失败：{exc}'))
+        except Exception as exc:     # 体检出错不能挡调度器
+            res.append((a['id'], f'出错：{acct.redact(f"{type(exc).__name__}: {exc}")}'))
+    _ACCT_Q.clear()
+    _LIMITS_CACHE['at'] = 0
+    return res
+
+
+def accounts_tick(conn):
+    """调度器每拍：每 60 秒起一次后台体检（各号自己再按 10 / 30 分钟节流）。"""
+    if not pool().exists():
+        return
+    th = _ACCT_JOB.get('thread')
+    if th and th.is_alive() or time.time() - _ACCT_JOB.get('at', 0) < 60:
+        return
+    _ACCT_JOB['at'] = time.time()
+
+    def run():
+        try:
+            for aid, r in accounts_check():
+                if not r.startswith('ok'):
+                    log_event(db(), 'account-check', level='warn', account=aid, err=acct.redact(r)[:300])
+        except Exception as exc:
+            log_event(db(), 'account-check', level='error', err=acct.redact(f'{type(exc).__name__}: {exc}')[:300])
+    if ACCOUNTS_THREADED:
+        _ACCT_JOB['thread'] = threading.Thread(target=run, daemon=True, name='mashu-accounts')
+        _ACCT_JOB['thread'].start()
+    else:
+        run()
+
+
+def gemini_switch_for(conn, c, a):
+    """Gemini 新会话要用号 a：钥匙串里不是它就全局切号——只在没有运行中的 agy 时切（agy 全机只认钥匙串里那一个号），
+    有 agy 在跑就沿用当前号并提示。返回实际用的号 ID（不知道是 None）。"""
+    g = gemini_ops()
+    try:
+        cur = g.active_id()
+    except Exception:
+        cur = None
+    if cur == a['id']:
+        return cur
+    if acct.agy_running():
+        cur_a = pool().get(cur) if cur else None
+        notice(conn, channel_of(c), f'Gemini 想用 {account_label(a)}，但有 agy 会话在跑（agy 全机共用一个登录），'
+                                    f'这次沿用当前号{account_label(cur_a) or "（不在账号池里）"}')
+        log_event(conn, 'account-switch-skip', c, level='warn', account=a['id'], current=cur or '')
+        return cur
+    try:
+        g.activate(a['id'])
+    except acct.AccountError as exc:
+        notice(conn, channel_of(c), f'Gemini 切到 {account_label(a)} 失败（{exc}），这次沿用当前号')
+        log_event(conn, 'account-switch-fail', c, level='warn', account=a['id'], err=str(exc)[:300])
+        return cur
+    _ACCT_Q.pop('gemini-active', None)
+    log_event(conn, 'account-switch', c, account=a['id'], previous=cur or '')
+    return a['id']
+
+
+_ACCT_LOGIN = {}          # 网页上发起的登录：{任务 ID: dict(state, platform, account, url, code, output, error, started)}
+
+
+def codex_import_local():
+    """把本机 Codex 的登录（~/.codex/auth.json）登记成默认号：不复制，只登记——它的 CODEX_HOME 就是 state/codex-home（软链接）。"""
+    info = acct.codex_auth_info(CODEX_USER_HOME / 'auth.json')
+    if not info.get('logged_in'):
+        raise acct.AccountError(f'{CODEX_USER_HOME / "auth.json"} 里没有登录：先在终端运行一次 codex login')
+    p = pool()
+    a = next((x for x in p.list('codex') if x.get('source') == 'local'), None)
+    meta = dict(email=info.get('email'), plan=info.get('plan'), label=info.get('email') or '本机 Codex', status='ok', error='',
+                last_refresh=info.get('last_refresh'), last_check=time.time(), account_ref=info.get('account_id'))
+    a = p.update(a['id'], **meta) if a else p.add('codex', source='local', **meta)
+    if not p._read()['defaults'].get('codex'):
+        p.set_default('codex', a['id'])
+    return a
+
+
+def ensure_local_account(platform):
+    """第一次往池里加号时，先把本机当前的登录登记进来（不然自动选号时用不到它）；本机没登录就算了。"""
+    if any(a.get('source') == 'local' for a in pool().list(platform)):
+        return None
+    try:
+        return codex_import_local() if platform == 'codex' else gemini_ops().import_local()
+    except acct.AccountError:
+        return None
+
+
+def codex_login_home(a):
+    """给池里的 Codex 号建 CODEX_HOME（配置、hooks 和麻薯会话一样，auth.json 是这个号自己的）。"""
+    skills = {}
+    host = skill_host()
+    if host:
+        skills['caesar-docs'] = Path(os.path.realpath(host / '.claude' / 'skills' / 'caesar-docs'))
+    return plat.build_codex_home(codex_acct_home(a), CODEX_USER_HOME, skills, extra=plat.codex_hooks_toml(shlex.quote(str(BIN / 'mashu'))),
+                                 link_auth=False)
+
+
+def codex_finish_login(aid):
+    """codex login 结束后：读这个号的 auth.json，登上了就标正常；和池里已有的号是同一个（邮箱 + 账户）就删掉新加的。"""
+    p = pool()
+    a = p.get(aid)
+    info = acct.codex_auth_info(codex_acct_home(a) / 'auth.json')
+    if not info.get('logged_in'):
+        p.update(aid, status='pending', error='还没登录成功')
+        raise acct.AccountError('没登录成功（auth.json 里没有登录信息）')
+    for x in p.list('codex'):
+        if x['id'] == aid:
+            continue
+        ref = x.get('account_ref')
+        if x.get('source') == 'local':
+            ref = acct.codex_auth_info(CODEX_USER_HOME / 'auth.json').get('account_id')
+        if x.get('email') == info.get('email') and ref == info.get('account_id'):
+            p.remove(aid)
+            raise acct.AccountError(f'这个号（{info.get("email")}）已经在池里了：{x["id"]}')
+    return p.update(aid, status='ok', error='', email=info.get('email'), plan=info.get('plan'), label=info.get('email') or aid,
+                    last_refresh=info.get('last_refresh'), last_check=time.time(), account_ref=info.get('account_id'))
+
+
+def _login_job(kind, aid=None, device=True):
+    """后台登录任务（网页加号 / 重新登录）：Codex 跑 CODEX_HOME=<号目录> codex login [--device-auth]，把链接和一次性码交给网页；
+    Gemini 起本地回调走 Antigravity 的网页授权。返回任务 ID。"""
+    jid = uuid.uuid4().hex[:12]
+    job = dict(id=jid, state='starting', platform=kind, account=aid, url='', code='', output='', error='', started=time.time())
+    _ACCT_LOGIN[jid] = job
+    for k in [k for k, v in _ACCT_LOGIN.items() if time.time() - v['started'] > 3600]:
+        _ACCT_LOGIN.pop(k, None)
+
+    def run_codex():
+        p = pool()
+        new = False
+        try:
+            if aid:
+                a = p.get(aid)
+                if not a or a['platform'] != 'codex':
+                    raise acct.AccountError(f'没有这个 Codex 号：{aid}')
+                if a.get('source') == 'local':
+                    raise acct.AccountError('本机默认号用你自己终端里的 codex login 重新登录（它和 ~/.codex 共用）')
+            else:
+                ensure_local_account('codex')
+                a = p.add('codex', source='login', label='（登录中）')
+                new = True
+            job['account'] = a['id']
+            home = codex_login_home(a)
+            cmd = [cfg('codex'), 'login'] + (['--device-auth'] if device else [])
+            env = dict(os.environ, CODEX_HOME=str(home))
+            env.pop('MASHU_SESSION', None)
+            pr = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            job.update(state='waiting', pid=pr.pid)
+            end = time.time() + 900
+            buf = ''
+            import select
+            while pr.poll() is None and time.time() < end and job['state'] != 'cancelled':
+                r, _, _ = select.select([pr.stdout], [], [], 1)
+                if r:
+                    line = pr.stdout.readline()
+                    buf += line
+                    job['output'] = acct.redact(acct.ANSI_RE.sub('', buf))[-3000:]
+                    got = acct.parse_login_output(buf)
+                    job['url'], job['code'] = got['url'] or job['url'], got['code'] or job['code']
+            if pr.poll() is None:
+                pr.kill()
+                raise acct.AccountError('已取消' if job['state'] == 'cancelled' else '15 分钟内没完成登录，已取消')
+            buf += pr.stdout.read() or ''
+            job['output'] = acct.redact(acct.ANSI_RE.sub('', buf))[-3000:]
+            b = codex_finish_login(a['id'])
+            job.update(state='done', result=account_label(b))
+        except Exception as exc:
+            job.update(state='failed', error=acct.redact(str(exc))[:500])
+            if new and job.get('account') and pool().get(job['account']) and pool().get(job['account']).get('status') == 'pending':
+                try:
+                    pool().remove(job['account'])
+                except acct.AccountError:
+                    pass
+        finally:
+            _ACCT_Q.clear()
+            _LIMITS_CACHE['at'] = 0
+
+    def run_gemini():
+        try:
+            ensure_local_account('gemini')
+            job['state'] = 'waiting'
+            b = gemini_ops().oauth_login(lambda url: job.update(url=url), timeout=600)
+            job.update(state='done', account=b['id'], result=account_label(b))
+        except Exception as exc:
+            job.update(state='failed', error=acct.redact(str(exc))[:500])
+        finally:
+            _ACCT_Q.clear()
+            _LIMITS_CACHE['at'] = 0
+    threading.Thread(target=run_codex if kind == 'codex' else run_gemini, daemon=True, name=f'mashu-login-{jid}').start()
+    return jid
+
+
+def account_action(action, data=None):
+    """网页「账号」页和 mashu account 共用：加号 / 导入 / 禁用 / 删除 / 设默认 / 重新登录 / 体检 / 切号。返回 dict(result, …)。
+    令牌只在 data['rt'] 里进来，不出现在返回值和日志里。"""
+    data = data or {}
+    p = pool()
+    aid = (data.get('id') or '').strip()
+    a = p.get(aid) if aid else None
+    if aid and not a and action not in ('job', 'cancel'):
+        raise ValueError(f'没有这个号：{aid}')
+    if action == 'list':
+        return dict(accounts=cli_accounts())
+    if action == 'import-local':
+        plat_ = data.get('platform')
+        b = codex_import_local() if plat_ == 'codex' else gemini_ops().import_local() if plat_ == 'gemini' else None
+        if not b:
+            raise ValueError('platform 只能是 codex / gemini')
+        return dict(result=f'已登记本机 {PROV_LABEL[plat_]} 的登录：{account_label(b)}')
+    if action == 'add-gemini-rt':
+        ensure_local_account('gemini')
+        b = gemini_ops().import_rt(data.get('rt') or '')
+        return dict(result=f'已导入 {account_label(b)}' + (f'，额度剩 {round(b["quota"]["remaining"] * 100)}%' if (b.get('quota') or {}).get('remaining') is not None else ''))
+    if action in ('add-codex', 'add-gemini-login', 'relogin'):
+        kind = 'codex' if action == 'add-codex' else 'gemini' if action == 'add-gemini-login' else a['platform']
+        jid = _login_job(kind, aid if action == 'relogin' and kind == 'codex' else None, device=data.get('device', True) not in (False, 'false', '0'))
+        return dict(job=jid, result='已开始登录，按页面上的链接操作')
+    if action == 'job':
+        j = _ACCT_LOGIN.get(data.get('job') or '')
+        if not j:
+            raise ValueError('登录任务不存在（服务重启过？）')
+        return dict(job={k: v for k, v in j.items() if k != 'pid'})
+    if action == 'cancel':
+        j = _ACCT_LOGIN.get(data.get('job') or '')
+        if j and j['state'] in ('starting', 'waiting'):
+            j['state'] = 'cancelled'
+        return dict(result='已取消')
+    if not a:
+        raise ValueError('要指定号（id）')
+    if action in ('disable', 'enable'):
+        p.update(aid, disabled=action == 'disable')
+        _LIMITS_CACHE['at'] = 0
+        return dict(result=f'{account_label(a)} 已{"禁用：自动选号不再选它" if action == "disable" else "启用"}')
+    if action == 'default':
+        p.set_default(a['platform'], aid)
+        _LIMITS_CACHE['at'] = 0
+        return dict(result=f'{PROV_LABEL[a["platform"]]} 默认号改成 {account_label(a)}')
+    if action == 'remove':
+        if accounts_in_use().get(aid):
+            raise ValueError(f'{account_label(a)} 正在被会话使用，等会话结束再删')
+        p.remove(aid)
+        _ACCT_Q.clear()
+        _LIMITS_CACHE['at'] = 0
+        return dict(result=f'已删除 {account_label(a)}' + ('（只是取消登记，~/.codex 里你自己的登录不动）' if a.get('source') == 'local' and a['platform'] == 'codex' else ''))
+    if action in ('check', 'refresh'):
+        res = accounts_check(force='refresh' if action == 'refresh' else True, only=aid)
+        return dict(result='；'.join(f'{x}：{r}' for x, r in res) or '没有要体检的')
+    if action == 'activate':
+        if a['platform'] != 'gemini':
+            raise ValueError('只有 Gemini 需要全局切号（Codex 每个会话用自己的号目录）')
+        if acct.agy_running():
+            raise ValueError('有 agy 会话在跑（agy 全机共用一个登录），先关掉再切')
+        gemini_ops().activate(aid)
+        _ACCT_Q.pop('gemini-active', None)
+        return dict(result=f'本机 agy 已切到 {account_label(a)}')
+    raise ValueError(f'不认识的操作：{action}')
+
+
 def opencode_config_dir():
     """麻薯会话的 OPENCODE_CONFIG_DIR：plugins/mashu.js 软链接到 integrations/opencode/mashu.js，只有麻薯开的 OpenCode 会加载。"""
     d = HOME / 'opencode-config'
@@ -1872,7 +2285,7 @@ def has_transcript(cwd, sid):
         return False
     if (CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(cwd)) / f'{sid}.jsonl').exists():
         return True
-    if plat.codex_session_file(codex_home(), sid):     # Codex 会话（麻薯 CODEX_HOME 里的 rollout）
+    if find_codex_rollout(sid):     # Codex 会话（麻薯 CODEX_HOME / 账号池各号目录里的 rollout）
         return True
     if sid.startswith('ses_') and (HOME / 'opencode-sessions' / sid).exists():     # OpenCode 会话（hook 收到会话 ID 时记下）
         return True
@@ -1888,7 +2301,7 @@ def transcript_file(conn, c):
     try:
         if prov == 'codex':
             p = meta_get(conn, f'transcript:{sid}')
-            return Path(p) if p else plat.codex_session_file(codex_home(), sid)
+            return Path(p) if p else find_codex_rollout(sid)
         if prov == 'opencode':
             return HOME / 'live' / f'{c["id"]}.json'
         if prov == 'gemini':
@@ -2112,6 +2525,12 @@ def agy_cmd(conn, c, cwd, sid, as_file, no_prompt):
     if sid:
         cmd += ['--conversation', sid]
         meta_set(conn, f'provider:{sid}', 'gemini')
+    else:               # 账号池：新会话按规则挑号，钥匙串里不是它就全局切（有 agy 在跑就不切）；恢复会话不换号
+        a, why = choose_account(conn, c, 'gemini')
+        used = gemini_switch_for(conn, c, a) if a else None
+        meta_set(conn, f'camacct:{c["id"]}', used or '')
+        if a:
+            log_event(conn, 'account-pick', c, provider='gemini', account=a['id'], used=used or '', why=why)
     if not no_prompt:
         cmd += ['-i', as_file('prompt', c['prompt'] or '开工')]
     return cmd, sid
@@ -2135,9 +2554,22 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
     host = skill_host()
     if host:
         skills['caesar-docs'] = Path(os.path.realpath(host / '.claude' / 'skills' / 'caesar-docs'))
-    home = plat.build_codex_home(codex_home(), CODEX_USER_HOME, skills, extra=plat.codex_hooks_toml(shlex.quote(str(BIN / 'mashu'))))
+    # 账号池：新会话按规则挑号（每个号一个 CODEX_HOME，会话之间互不影响）；恢复会话回到 rollout 所在的那个号目录，中途不换号
+    a, why = (None, '')
+    if sid:
+        _, h = plat.find_codex_session(codex_homes(), sid)
+        a = next((x for x in pool().list('codex') if h and codex_acct_home(x) == h), None)
+        home_dir = h or codex_home()
+    else:
+        a, why = choose_account(conn, c, 'codex')
+        home_dir = codex_acct_home(a) if a else codex_home()
+    meta_set(conn, f'camacct:{c["id"]}', a['id'] if a else '')
+    if a and not sid:
+        log_event(conn, 'account-pick', c, provider='codex', account=a['id'], why=why)
+    home = plat.build_codex_home(home_dir, CODEX_USER_HOME, skills, extra=plat.codex_hooks_toml(shlex.quote(str(BIN / 'mashu'))),
+                                 link_auth=home_dir == codex_home())
     auth = home / 'auth.json'
-    if auth.exists() and not auth.is_symlink():
+    if home_dir == codex_home() and auth.exists() and not auth.is_symlink():
         notice(conn, channel_of(c), f'{auth} 变成了普通文件（Codex 刷新登录时换掉了软链接）：麻薯的 Codex 会话和你自己的登录可能不同步，'
                                     f'确认能用后可以删掉它，麻薯下次启动会重新链接到 {CODEX_USER_HOME / "auth.json"}')
     pref = session_pref(conn, c, 'codex')
@@ -3733,6 +4165,7 @@ def _tick(conn):
             handle_wrap(conn, c)
     crew_linger_guard(conn)
     adapters_tick(conn, threaded=ADAPTER_THREADED)
+    accounts_tick(conn)
     refresh_running_usage(conn)
     report_timeouts(conn)
     maybe_digest(conn)
@@ -4417,6 +4850,20 @@ def code_mode_of(conn, sid):
 
 def set_pref(conn, channel, **kw):
     p = get_pref(conn, channel)
+    for prov, k in ACCT_KEY.items():     # 账号池：指定这个对话用哪个号（空 = 自动），只对新会话生效，不触发重开
+        if kw.get(k) is None:
+            continue
+        v = (kw.pop(k) or '').strip()
+        a = pool().get(v) if v else None
+        if v and (not a or a.get('platform') != prov):
+            raise ValueError(f'{PROV_LABEL[prov]} 账号池里没有 {v}')
+        if v:
+            p[k] = v
+        else:
+            p.pop(k, None)
+        meta_set(conn, f'pref:{channel}', json.dumps(p, ensure_ascii=False))
+        if all(kw.get(x) is None for x in ('model', 'effort', 'provider', 'code') + tuple(MODEL_KEY.values()) + tuple(ACCT_KEY.values())):
+            return f'已记下：{PROV_LABEL[prov]} 用{account_label(a) if a else "自动选的号"}，下次新会话（新会话 / 交接）生效；会话中途不换号'
     if kw.get('code') is not None:      # Code Mode 只对新会话生效（恢复会话必须沿用原模式），不触发重开
         v = (kw.pop('code') or '').strip()
         if v not in ('', 'on', 'off'):
@@ -4624,8 +5071,26 @@ def collect_limits(home=None):
     gemini_data = {
         'installed': gemini_installed,
         'available': False,
-        'reason': 'agy CLI 未提供额度查询接口',
+        'reason': 'agy CLI 不报额度：到「会话监控 → 账号」导入 Gemini 号（RT），麻薯用它查各模型剩余额度',
     }
+
+    # 5. 账号池（#4）：Codex、Gemini 显示默认号的数字，accounts 里是所有号（悬停显示）
+    try:
+        accs = cli_accounts() if home is None else []
+    except Exception:
+        accs = []
+    brief = lambda a: {k: a.get(k) for k in ('id', 'label', 'email', 'plan', 'status', 'status_cn', 'disabled', 'default', 'active', 'quota', 'used', 'source')}  # noqa: E731
+    cx = [a for a in accs if a['platform'] == 'codex']
+    if cx:
+        d = next((a for a in cx if a['default']), cx[0])
+        codex_data = dict(d.get('quota') or {'installed': codex_installed, 'waiting': True}, account=d['id'], accounts=[brief(a) for a in cx])
+    gm = [a for a in accs if a['platform'] == 'gemini']
+    if gm:
+        d = next((a for a in gm if a.get('active')), None) or next((a for a in gm if a['default']), gm[0])
+        q = d.get('quota') or {}
+        gemini_data = dict(installed=True, available=q.get('remaining') is not None, remaining=q.get('remaining'), reset=q.get('reset'),
+                           low_model=q.get('low_model'), at=q.get('at'), account=d['id'], accounts=[brief(a) for a in gm],
+                           reason='' if q.get('remaining') is not None else f'{account_label(d)} 还没查到额度（{d.get("status_cn")}）')
 
     res = {
         'claude': claude_data if claude_data else {'installed': True, 'waiting': True},
@@ -5614,7 +6079,7 @@ def _hook_stop(payload, agy, fmt='claude'):
         c = camera(conn, c['id'])
         try:        # 预算统计失败不影响回复
             if fmt == 'codex':
-                path = payload.get('transcript_path') or plat.codex_session_file(codex_home(), sid)
+                path = payload.get('transcript_path') or find_codex_rollout(sid)
                 if path:
                     record_codex_usage(conn, c, path)
             else:
@@ -6182,7 +6647,8 @@ def status_data(conn):
                               trust=rows(conn, 'SELECT category, streak, total, delegated FROM trust WHERE film_id=?', f['id']),
                               check_configured='MASHU_CHECK_UNCONFIGURED' not in ((film_docs(f) / 'check.sh').read_text()
                                                                                   if (film_docs(f) / 'check.sh').exists() else 'MASHU_CHECK_UNCONFIGURED')))
-    cams = [cam_view(c, alive) | dict(title=camera_title(conn, c), film_id=c['film_id'], seq_key=c['seq_key'], provider=cam_provider(conn, c))
+    cams = [cam_view(c, alive) | dict(title=camera_title(conn, c), film_id=c['film_id'], seq_key=c['seq_key'], provider=cam_provider(conn, c),
+                                     account=meta_get(conn, f'camacct:{c["id"]}') or '')
             for c in rows(conn, 'SELECT * FROM cameras WHERE state IN ("queued","running","idle") ORDER BY role="crew", role="producer", id')]
     return dict(
         assistant=cam_view_bg(conn, active_assistant(conn), alive), films=out_films, cameras=cams,
@@ -6192,7 +6658,7 @@ def status_data(conn):
         decisions_pending=one(conn, 'SELECT COUNT(*) n FROM decisions WHERE status="待追认"')['n'],
         self_iterate_pending=selfiter_call('pending_count', conn, default=0),
         tmux=session_name(), stage_names=STAGES, approval_ttl_hours=cfg('approval_ttl_hours'),
-        live=live_replies(conn), limits=read_limits(),
+        live=live_replies(conn), limits=read_limits(), cli_accounts=cli_accounts(),
         prefs={r['k'][5:]: json.loads(r['v'] or '{}') for r in rows(conn, 'SELECT k, v FROM meta WHERE k LIKE "pref:%"')},
         pref_defaults=dict(models=cfg('models') or {}, efforts=cfg('efforts') or {}, codes=cfg('code_modes') or {},
                            providers=cfg('providers') or {}, gmodels=cfg('gemini_models') or {},
@@ -6432,7 +6898,7 @@ def cmd_pitch(args):
         if not args.plan:
             raise SystemExit('麻薯开功能要带方案：先和用户把需求、技术方案谈清楚，写成文件后 `--plan <文件>`；开好后等用户批准开工')
         plan = Path(args.plan).expanduser().read_text()
-    ex = {k: v for k, v in dict(cli=args.cli, model=args.model, effort=args.effort).items() if v}
+    ex = {k: v for k, v in dict(cli=args.cli, model=args.model, effort=args.effort, account=getattr(args, 'cli_account', None)).items() if v}
     try:
         f, key, cam = pitch(conn, args.film, args.slug, args.brief, args.title, by=c, playbook=args.playbook, workflow=args.workflow,
                             touches=args.touches, plan=plan, account=args.account, workdir=args.workdir, exec_cfg=ex or None)
@@ -6873,6 +7339,80 @@ def platform_selfcheck(prov):
     return out
 
 
+def fmt_account(a):
+    q = a.get('quota') or {}
+    if a['platform'] == 'gemini':
+        qs = f'剩 {round(q["remaining"] * 100)}%（{q.get("low_model") or ""}）' if q.get('remaining') is not None else '额度未知'
+    else:
+        parts = [f'{k} 用了 {round(w["used_percentage"])}%' for k, w in (('5h', q.get('five_hour')), ('周', q.get('seven_day')))
+                 if isinstance(w, dict) and w.get('used_percentage') is not None]
+        qs = '，'.join(parts) or '额度未知（用这个号跑过会话才有）'
+    flags = [x for x in ('默认' if a.get('default') else '', '钥匙串当前' if a.get('active') else '', '已禁用' if a.get('disabled') else '') if x]
+    return (f'  {a["id"]:<6} {a.get("label") or a.get("email") or "-"}  {a.get("plan") or ""}  [{a.get("status_cn")}]'
+            f'{"（" + "、".join(flags) + "）" if flags else ""}  来源 {a.get("source") or "-"}  {qs}'
+            + (f'\n         {a["error"]}' if a.get('error') else ''))
+
+
+def cmd_account(args):
+    """mashu account：账号池（Codex / Gemini 多账号）。RT 只从文件或标准输入读，不从命令行参数传（会进 shell 历史）。"""
+    act = args.action
+    if act == 'list':
+        accs = cli_accounts(args.target if args.target in acct.PLATFORMS else None)
+        if not accs:
+            print('账号池是空的：mashu account import-local codex|gemini 登记本机登录，mashu account add codex|gemini 加号')
+            return
+        for pl in acct.PLATFORMS:
+            sub_ = [a for a in accs if a['platform'] == pl]
+            if sub_:
+                print(f'{PROV_LABEL[pl]}：')
+                print('\n'.join(fmt_account(a) for a in sub_))
+        return
+    if act == 'add':
+        if args.target == 'codex':
+            ensure_local_account('codex')
+            p = pool()
+            a = p.add('codex', source='login', label='（登录中）')
+            home = codex_login_home(a)
+            env = dict(os.environ, CODEX_HOME=str(home))
+            env.pop('MASHU_SESSION', None)
+            print(f'新号 {a["id"]}：CODEX_HOME={home}，下面是 codex login 的输出，按提示在浏览器登录')
+            r = subprocess.run([cfg('codex'), 'login'] + (['--device-auth'] if args.device else []), env=env)
+            try:
+                b = codex_finish_login(a['id'])
+            except acct.AccountError as exc:
+                if (pool().get(a['id']) or {}).get('status') == 'pending':
+                    pool().remove(a['id'])
+                raise ValueError(f'{exc}（codex login 退出码 {r.returncode}）')
+            print(f'已加号：{account_label(b)}')
+            return
+        if args.target == 'gemini':
+            if args.login:
+                ensure_local_account('gemini')
+                b = gemini_ops().oauth_login(lambda url: print(f'在浏览器打开这个链接，用要加的谷歌账号授权（10 分钟内）：\n{url}', flush=True))
+                print(f'已加号：{account_label(b)}')
+                return
+            if args.rt_file:
+                fp = Path(args.rt_file).expanduser()
+                if fp.stat().st_mode & 0o077:
+                    print(f'提醒：{fp} 别人也能读，用完删掉或 chmod 600')
+                rt = fp.read_text().strip()
+            elif not sys.stdin.isatty():
+                rt = sys.stdin.read().strip()
+            else:
+                raise ValueError('RT 从 --rt-file <0600 文件> 或标准输入给（不要写在命令行参数里）；或用 --login 走网页授权')
+            print(account_action('add-gemini-rt', dict(rt=rt))['result'])
+            return
+        raise ValueError('mashu account add codex [--device] | gemini (--rt-file F | --login | 从标准输入读 RT)')
+    if act == 'import-local':
+        print(account_action('import-local', dict(platform=args.target))['result'])
+        return
+    if act == 'check' and not args.target:
+        res = accounts_check(force=True)
+        print('\n'.join(f'{x}：{r}' for x, r in res) or '账号池是空的')
+        return
+    print(account_action(act, dict(id=args.target or ''))['result'])
+
+
 def cmd_platforms(args):
     for prov in PROVIDERS:
         st = platform_status(prov)
@@ -6949,6 +7489,7 @@ def main(argv=None):
     s.add_argument('--account', help='归哪个账号（项目有 .mashu/accounts.json 时；不写按 accounts.json 的 features / 改动范围推）')
     s.add_argument('--workdir', help='执行者的工作目录：工程文件夹里已存在的子目录（相对路径）；不写就是工程根目录。项目适配器开功能时也可能自己设')
     s.add_argument('--cli', choices=PROVIDERS, help='执行者用哪家 CLI（不写 = 执行者默认）；开工审批卡上用户可以再改')
+    s.add_argument('--cli-account', help='执行者用账号池里哪个号（cx-2、gm-1…；要配 --cli codex / gemini，不写 = 自动选号）')
     s.add_argument('--model', help='执行者的模型（该 CLI 的模型名，mashu platforms 可查；不写 = 默认）')
     s.add_argument('--effort', choices=EFFORTS, help='执行者的思考程度（不写 = 默认）')
     s = sub.add_parser('playbook', aliases=['workflow'], help='工作流（可复用流程）')
@@ -7013,6 +7554,12 @@ def main(argv=None):
         s.add_argument('--agy', action='store_true', help='Gemini（agy）调用：输入输出用 agy 的格式')
         s.add_argument('--codex', action='store_true', help='Codex 调用（格式同 Claude，工具名不同）')
         s.add_argument('--opencode', action='store_true', help='麻薯的 OpenCode 插件调用')
+    s = sub.add_parser('account', help='账号池：Codex / Gemini 多账号（list / add / import-local / check / refresh / default / disable / enable / remove / activate）')
+    s.add_argument('action', choices=['list', 'add', 'import-local', 'check', 'refresh', 'default', 'disable', 'enable', 'remove', 'activate'])
+    s.add_argument('target', nargs='?', help='add / import-local：codex 或 gemini；其余：号 ID（cx-1、gm-2…）')
+    s.add_argument('--device', action='store_true', help='Codex：用设备码登录（不在本机浏览器里登录时用）')
+    s.add_argument('--rt-file', help='Gemini：RT 所在的文件（建议 0600，用完删掉）；不给就从标准输入读')
+    s.add_argument('--login', action='store_true', help='Gemini：走 Antigravity 的网页授权加号')
     s = sub.add_parser('platforms', help='各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型，--check 跑一遍安全拦截自检')
     s.add_argument('--check', action='store_true')
     s = sub.add_parser('opencode-models', help='OpenCode 可选模型；--refresh 跑 opencode models --verbose 更新缓存')
@@ -7032,7 +7579,7 @@ def main(argv=None):
         'statusline': cmd_statusline, 'hook-prompt': cmd_hook_prompt, 'hook-stop': cmd_hook_stop, 'hook-notify': cmd_hook_notify,
         'hook-pretool': cmd_hook_pretool, 'hook-session': cmd_hook_session,
         'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,
-        'opencode-models': cmd_opencode_models, 'init': cmd_init,
+        'opencode-models': cmd_opencode_models, 'init': cmd_init, 'account': cmd_account,
         'self-iterate': lambda a: __import__('selfiter').cmd(a)}[cmd]
     try:
         handler(args)

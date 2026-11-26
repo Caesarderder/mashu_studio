@@ -479,7 +479,8 @@ class TestQuotaStudio(PlatBase):
         self.assertIn('codex', res)
         self.assertIn('opencode', res)
         self.assertIn('gemini', res)
-        self.assertEqual(res['gemini']['reason'], 'agy CLI 未提供额度查询接口')
+        self.assertIn('agy CLI 不报额度', res['gemini']['reason'])      # 没导入 Gemini 号时（#4 账号池）
+        self.assertFalse(res['gemini']['available'])
 
         # 缓存与失效测试
         saved_cache = studio._LIMITS_CACHE.copy()

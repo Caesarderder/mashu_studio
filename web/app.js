@@ -467,6 +467,21 @@ function quotaStaleTag(at) {
   const s = age >= 60 ? `${Math.floor(age / 60)}h前` : `${age}分前`;
   return `<i class="q-rst" title="${age} 分钟前的数据">·${s}</i>`;
 }
+// 账号池：左下角显示默认号（Gemini 是本机当前号）的数字，悬停列出所有号
+function acctTip(data) {
+  const list = (data && data.accounts) || [];
+  if (!list.length) return '';
+  return list.map((a) => {
+    const q = a.quota || {};
+    const v = q.remaining != null ? `剩 ${Math.round(q.remaining * 100)}%` : [q.five_hour && q.five_hour.used_percentage != null ? `5h ${Math.round(q.five_hour.used_percentage)}%` : '',
+      q.seven_day && q.seven_day.used_percentage != null ? `周 ${Math.round(q.seven_day.used_percentage)}%` : ''].filter(Boolean).join(' ') || '额度未知';
+    return `${a.id === data.account ? '▶ ' : '   '}${acctName(a)}：${v}${a.disabled ? '（禁用）' : a.status !== 'ok' ? `（${a.status_cn}）` : ''}`;
+  }).join('\n');
+}
+function acctBadge(data) {
+  const list = (data && data.accounts) || [];
+  return list.length > 1 ? `<i class="q-n" title="${esc(acctTip(data))}">${list.length}号</i>` : '';
+}
 function renderRateLimitRow(name, data) {
   if (!data) return '';
   if (data.installed === false) {
@@ -485,8 +500,8 @@ function renderRateLimitRow(name, data) {
     const tDesc = r ? `，${resetText(r)}` : '';
     return `<span class="q-item ${cls}" title="${name} ${label}额度已用 ${p}%${tDesc}">${label} <b>${p}%</b>${rTxt}</span>`;
   };
-  return `<div class="q-plat-row">
-    <span class="q-plat-name">${name}</span>
+  return `<div class="q-plat-row" ${data.accounts ? `title="${esc(acctTip(data))}"` : ''}>
+    <span class="q-plat-name">${name}${acctBadge(data)}</span>
     <span class="q-plat-vals">
       ${item('5h', p5, f5 && f5.resets_at)}
       ${item('周', pw, fw && fw.resets_at)}
@@ -517,6 +532,15 @@ function renderGeminiRow(data) {
   if (!data) return '';
   if (data.installed === false) {
     return `<div class="q-plat-row q-dim" title="Gemini (agy) 未安装"><span class="q-plat-name">Gemini</span><span class="q-plat-vals">未安装</span></div>`;
+  }
+  if (data.available && data.remaining != null) {
+    const r = Math.round(data.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
+    return `<div class="q-plat-row" title="${esc(acctTip(data))}">
+      <span class="q-plat-name">Gemini${acctBadge(data)}</span>
+      <span class="q-plat-vals">
+        <span class="q-item ${cls}" title="各模型里剩得最少的${data.low_model ? `：${esc(data.low_model)}` : ''}${data.reset ? `，${resetText(data.reset)}` : ''}">剩 <b>${r}%</b>${data.reset ? `<i class="q-rst">·${resetCompact(data.reset)}</i>` : ''}</span>
+        ${quotaStaleTag(data.at)}
+      </span></div>`;
   }
   const reason = data.reason || 'agy CLI 未提供额度查询接口';
   return `<div class="q-plat-row" title="Gemini：${esc(reason)}">
@@ -699,6 +723,7 @@ function prefOf(ch, role) {
     dmk: (prov) => (ex && (ex.cli || 'claude') === prov && ex.model) || (d[platOf(prov).default_key] || {})[role] || '' };
 }
 const PROV_CN = { claude: 'Claude', gemini: 'Gemini', codex: 'Codex', opencode: 'OpenCode' };
+const ACCT_PREF = { codex: 'xacct', gemini: 'gacct' };      // 对话偏好里指定账号池号的键
 // 平台表（后端 platforms_view）：能不能选、不能选的原因、模型列表、对话偏好里的模型键
 function plats() {
   return state.platforms || [
@@ -735,6 +760,9 @@ ${esc(pl.label)} 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。�
       <span class="sp-sep">·</span>
       <label class="sel eff" title="思考程度${cam && cam.effort ? `（现在：${esc(cam.effort)}）` : ''}。Codex / OpenCode 会换成这个模型支持的最接近一档。切换时会话在原窗格重开，对话不丢">
         <select data-pref="effort" data-ch="${esc(ch)}">${opts(state.effort_choices || [], p.effort, p.de, cam && cam.effort, '默认思考')}</select></label>
+      ${ACCT_PREF[prov] && cliAccts(prov).length ? `<span class="sp-sep">·</span>
+      <label class="sel acct" title="用账号池里哪个号：第一项 = 自动（状态正常、额度剩得最多的）。只对新会话（新会话 / 交接）生效，会话中途不换号${cam && cam.alive && cam.account ? `；现在的会话用的是 ${esc(acctName(cliAccts().find((a) => a.id === cam.account)) || cam.account)}` : ''}${prov === 'gemini' ? '。Gemini 全机共用一个登录：有 agy 在跑时不切号' : ''}">
+        <select data-pref="${ACCT_PREF[prov]}" data-ch="${esc(ch)}">${acctOpts(prov, ((state.prefs || {})[ch] || {})[ACCT_PREF[prov]] || '')}</select></label>` : ''}
       ${prov !== 'claude' ? '' : `<span class="sp-sep">·</span>
       <label class="sel" title="Claude Code 实验性 Code Mode（用 JavaScript 一次跑多个工具）。开了以后 Chrome 浏览器、computer use 用不了；只对新会话（新会话 / 交接）生效，恢复会话沿用原模式">
         <select data-pref="code" data-ch="${esc(ch)}"><option value="">Code ${p.dc === 'on' ? '开' : '关'}（默认）</option>
@@ -856,18 +884,24 @@ function kickExecHtml(r) {
     <select data-kick-cli="${r.id}">${provOpts(ex.cli || 'claude')}</select>
     <select data-kick-model="${r.id}">${kickModelOpts(ex.cli || 'claude', ex.model || '')}</select>
     <select data-kick-effort="${r.id}"><option value="">默认思考</option>${(state.effort_choices || []).map((x) => `<option value="${esc(x)}" ${x === ex.effort ? 'selected' : ''}>思考 ${esc(x)}</option>`).join('')}</select>
+    <select data-kick-acct="${r.id}" title="账号池里的号（自动 = 开工时挑额度剩得最多的）" ${ACCT_PREF[ex.cli] && cliAccts(ex.cli).length ? '' : 'hidden'}>${acctOpts(ex.cli, ex.account || '')}</select>
   </div>`;
 }
 function kickExecOf(rid, el) {
   const box = (el && el.querySelector(`[data-kick="${rid}"]`)) || document.querySelector(`[data-kick="${rid}"]`);
   if (!box) return null;
-  return { cli: box.querySelector('[data-kick-cli]').value, model: box.querySelector('[data-kick-model]').value, effort: box.querySelector('[data-kick-effort]').value };
+  const ac = box.querySelector('[data-kick-acct]');
+  return { cli: box.querySelector('[data-kick-cli]').value, model: box.querySelector('[data-kick-model]').value, effort: box.querySelector('[data-kick-effort]').value,
+    account: ac && !ac.hidden ? ac.value : '' };
 }
 document.addEventListener('change', (ev) => {
-  const s = ev.target.closest('select[data-kick-cli],select[data-kick-model],select[data-kick-effort]');
+  const s = ev.target.closest('select[data-kick-cli],select[data-kick-model],select[data-kick-effort],select[data-kick-acct]');
   if (!s) return;
   const box = s.closest('[data-kick]');
-  if (s.dataset.kickCli) { const m = box.querySelector('[data-kick-model]'); if (m) m.innerHTML = kickModelOpts(s.value, ''); }
+  if (s.dataset.kickCli) {
+    const m = box.querySelector('[data-kick-model]'); if (m) m.innerHTML = kickModelOpts(s.value, '');
+    const a = box.querySelector('[data-kick-acct]'); if (a) { a.innerHTML = acctOpts(s.value, ''); a.hidden = !(ACCT_PREF[s.value] && cliAccts(s.value).length); }
+  }
   kickSel[box.dataset.kick] = kickExecOf(box.dataset.kick, box.parentElement);
 });
 function muteBtn(r) { return `<button class="btn ghost mute" data-mute="${r.id}" title="静默：不处理这件事、不叫醒任何人，维持现状">${icon('moon', 13)}静默</button>`; }
@@ -1736,15 +1770,166 @@ document.addEventListener('click', async (ev) => {
   try { const d = await api('/api/camera', { action: b.dataset.ocrefresh !== undefined ? 'opencode-models' : 'gemini-models' }); toast(d.result); await refresh(); renderWall(); }
   catch (e) { toast(e.message); } finally { b.disabled = false; }
 });
+// ---------- 账号池（#4）：Codex / Gemini 多账号。令牌只在「粘贴 RT」时发给本机服务，页面上不显示 ----------
+let acctJob = loadJSON('mashu.acctjob', null);
+let acctPoolLast = '';       // 正在进行的网页登录：{ id, platform }
+function cliAccts(prov) { return (state.cli_accounts || []).filter((a) => !prov || a.platform === prov); }
+function acctName(a) { return a ? (a.label || a.email || a.id) : ''; }
+function acctQuota(a) {
+  const q = a.quota || {};
+  if (a.platform === 'gemini') {
+    if (q.remaining == null) return '<span class="q-dim">额度未知</span>';
+    const r = Math.round(q.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
+    const models = (q.models || []).map((m) => `${m.name} 剩 ${Math.round(m.remaining * 100)}%${m.reset ? `（${resetText(m.reset)}）` : ''}`).join('\n');
+    return `<span class="q-item ${cls}" title="${esc(models || '')}">最低剩 <b>${r}%</b>${q.low_model ? ` · ${esc(q.low_model)}` : ''}</span>`;
+  }
+  const it = (label, w) => {
+    if (!w || w.used_percentage == null) return '';
+    const p = Math.round(Number(w.used_percentage)), cls = p >= 90 ? 'hi' : p >= 70 ? 'mid' : '';
+    return `<span class="q-item ${cls}" title="已用 ${p}%${w.resets_at ? `，${resetText(w.resets_at)}` : ''}">${label} <b>${p}%</b></span>`;
+  };
+  const h = it('5h', q.five_hour) + it('周', q.seven_day);
+  return h || '<span class="q-dim" title="用这个号跑过 Codex 会话后才有">等会话报上来</span>';
+}
+function acctRow(a) {
+  const st = a.disabled ? 'off' : a.status;
+  const tags = [a.default ? '<span class="ac-tag def">默认</span>' : '', a.active ? '<span class="ac-tag act" title="本机 agy 现在登录的是这个号（钥匙串）">本机当前</span>' : '',
+    a.source === 'local' ? '<span class="ac-tag" title="本机自己的登录：Codex 和 ~/.codex 共用，不复制">本机</span>' : ''].join('');
+  const btn = (act, label, title, cls = '') => `<button class="btn small ${cls}" data-acct-act="${act}" data-acct="${esc(a.id)}" title="${esc(title)}">${label}</button>`;
+  return `<div class="ac-row ${a.disabled ? 'dim' : ''}">
+    <span class="ac-id">${esc(a.id)}</span>
+    <span class="ac-name" title="${esc(a.email || '')}">${esc(acctName(a))}${a.plan ? ` <i class="ac-plan">${esc(a.plan)}</i>` : ''}${tags}</span>
+    <span class="ac-st acs-${esc(st || '')}" title="${esc(a.error || '')}">${esc(a.disabled ? '已禁用' : a.status_cn || a.status || '')}${a.error ? ' ⓘ' : ''}</span>
+    <span class="ac-q">${acctQuota(a)}</span>
+    <span class="ac-t" title="最近续期 / 体检">${a.last_refresh ? `续期 ${ago(a.last_refresh)}前` : ''}${a.last_check ? ` · 体检 ${ago(a.last_check)}前` : ''}</span>
+    <span class="ac-acts">
+      ${a.default ? '' : btn('default', '设为默认', '没指定号、额度又差不多时优先用它；左下角显示默认号的额度')}
+      ${a.platform === 'gemini' && !a.active ? btn('activate', '切到本机', '把本机 agy 的登录（钥匙串）换成这个号；有 agy 在跑时不让切') : ''}
+      ${btn('check', '体检', a.platform === 'gemini' ? '用 RT 续期并查一次额度' : '读登录状态；池里的号超过 7 天没续期会用 RT 续一次')}
+      ${a.platform === 'codex' && a.source !== 'local' ? btn('relogin', '重新登录', '在这个号目录里重新跑 codex login（设备码）') : ''}
+      ${a.platform === 'gemini' && ['revoked', 'refresh_failed'].includes(a.status) ? btn('relogin', '重新授权', '网页授权：用同一个谷歌账号登录，更新它的 RT') : ''}
+      ${btn(a.disabled ? 'enable' : 'disable', a.disabled ? '启用' : '禁用', a.disabled ? '重新参与自动选号' : '自动选号不再选它（指定了也会改为自动）')}
+      ${btn('remove', '删除', a.source === 'local' && a.platform === 'codex' ? '只取消登记，不动 ~/.codex 里你自己的登录' : '删掉这个号的登录文件和记录', 'danger')}
+    </span></div>`;
+}
+function acctJobHtml() {
+  if (!acctJob || !acctJob.data) return '';
+  const j = acctJob.data;
+  const done = j.state === 'done', bad = j.state === 'failed' || j.state === 'cancelled';
+  return `<div class="ac-job ${done ? 'ok' : bad ? 'bad' : ''}">
+    <b>${j.platform === 'codex' ? 'Codex' : 'Gemini'} 登录</b>
+    ${done ? `<span>${icon('check', 13)}已加好：${esc(j.result || '')}</span>` : bad ? `<span>${icon('x', 13)}${esc(j.error || '没完成')}</span>`
+      : j.url ? `<span>在浏览器打开 <a href="${esc(j.url)}" target="_blank" rel="noopener">${esc(j.url.length > 60 ? j.url.slice(0, 60) + '…' : j.url)}</a>${j.code ? `，输入一次性码 <code class="ac-code">${esc(j.code)}</code>（15 分钟内有效）` : ''}，用要加的账号登录；完成后这里会自动变成「已加好」</span>`
+      : '<span>正在准备登录链接…</span>'}
+    ${done || bad ? '<button class="btn small" data-acct-jobclose>知道了</button>' : '<button class="btn small" data-acct-jobcancel>取消</button>'}
+    ${j.output && !done && !j.url ? `<pre class="ac-out">${esc(j.output.slice(-600))}</pre>` : ''}</div>`;
+}
+function acctPoolHtml() {
+  const sec = (prov, title, hint, adds) => {
+    const list = cliAccts(prov);
+    return `<div class="ac-sec"><div class="ac-sh"><b>${title}</b><span class="hint-inline">${hint}</span></div>
+      ${list.length ? list.map(acctRow).join('') : `<div class="hint">还没有 ${title} 号：先「登记本机登录」，再加别的号</div>`}
+      <div class="ac-adds">${adds}</div></div>`;
+  };
+  return `<div class="defaults card-lite acct-pool" id="acctPool"><div class="df-h">${icon('wallet', 15)}<b>账号池</b><span class="hint-inline">开新会话时自动挑「状态正常、没禁用、额度剩得最多」的号，也可以在对话 ⚙ 或开工卡上指定；会话中途不换号。号由你自己提供，多号轮换有违反服务条款、被封号的风险</span></div>
+    <div id="acctJob">${acctJobHtml()}</div>
+    ${sec('codex', 'Codex', '每个号一个独立的 CODEX_HOME，几个执行者可以同时用不同的号；本机默认号和 ~/.codex 共用登录（不复制，避免 RT 轮换掉登录）',
+      `<button class="btn small primary" data-acct-add="codex-device" title="打开 OpenAI 的设备登录页，输入一次性码（码在点了以后才生成，15 分钟有效）">${icon('plus', 13)}加号（设备码）</button>
+       <button class="btn small" data-acct-add="codex-browser" title="在本机浏览器里打开 OpenAI 登录页（codex login）">${icon('plus', 13)}加号（本机浏览器）</button>
+       <button class="btn small" data-acct-add="codex-local" title="把 ~/.codex 里你自己的登录登记成默认号（只登记，不复制）">登记本机登录</button>`)}
+    ${sec('gemini', 'Gemini（agy）', 'agy 全机只认钥匙串里的一个登录：开新会话要换号时，只在没有 agy 在跑时切，有就沿用当前号',
+      `<button class="btn small primary" data-acct-add="gemini-rt" title="粘贴 Antigravity 签发的 Refresh Token（例如从 Cockpit Tools 导出的）">${icon('plus', 13)}粘贴 RT 导入</button>
+       <button class="btn small" data-acct-add="gemini-login" title="用 Antigravity 的网页授权登录一个谷歌账号">${icon('plus', 13)}网页授权加号</button>
+       <button class="btn small" data-acct-add="gemini-local" title="把本机 agy 现在的登录（钥匙串）登记进来">导入本机 agy 登录</button>`)}
+  </div>`;
+}
+async function acctApi(body) {
+  const d = await api('/api/accounts', body);
+  if (d.result) toast(d.result);
+  return d;
+}
+async function acctRefresh() {
+  await refresh();
+  const el = $('#acctPool');
+  if (el) el.outerHTML = acctPoolHtml();
+}
+async function acctPoll() {
+  if (!acctJob) return;
+  try {
+    const d = await api('/api/accounts', { action: 'job', job: acctJob.id });
+    acctJob.data = d.job;
+  } catch (e) { acctJob.data = { platform: acctJob.platform, state: 'failed', error: e.message }; }
+  localStorage.setItem('mashu.acctjob', JSON.stringify({ id: acctJob.id, platform: acctJob.platform }));
+  const box = $('#acctJob');
+  if (box) box.innerHTML = acctJobHtml();
+  if (['done', 'failed', 'cancelled'].includes(acctJob.data.state)) { localStorage.removeItem('mashu.acctjob'); if (acctJob.data.state === 'done') acctRefresh(); return; }
+  setTimeout(acctPoll, 2000);
+}
+if (acctJob) setTimeout(acctPoll, 1500);
+async function acctStartJob(body, platform) {
+  const d = await acctApi(body);
+  acctJob = { id: d.job, platform, data: { platform, state: 'starting' } };
+  const box = $('#acctJob');
+  if (box) box.innerHTML = acctJobHtml();
+  setTimeout(acctPoll, 800);
+}
+function acctRtModal() {
+  openModal(`<div class="ac-modal"><h3>粘贴 Gemini（Antigravity）的 RT</h3>
+    <p class="hint">RT 只发给本机的麻薯服务，存进 <code>state/accounts/gemini/&lt;号&gt;/cred.json</code>（0600），页面和日志里只显示前 4 位。必须是 Antigravity 签发的 RT（Cockpit Tools 导出的就是）；Gemini CLI 的 <code>~/.gemini/oauth_creds.json</code> 里的大概率不行。</p>
+    <input type="password" id="acRt" placeholder="1//0…" autocomplete="off" spellcheck="false">
+    <div class="df-acts"><button class="btn primary" data-acct-rtgo>${icon('check', 14)}校验并导入</button><button class="btn" data-close>取消</button>
+      <span class="hint-inline">会先用它换一次 access_token、取邮箱、查额度</span></div></div>`);
+  setTimeout(() => $('#acRt')?.focus(), 50);
+}
+document.addEventListener('click', async (ev) => {
+  const add = ev.target.closest('[data-acct-add]'), act = ev.target.closest('[data-acct-act]');
+  const go = ev.target.closest('[data-acct-rtgo]'), jc = ev.target.closest('[data-acct-jobcancel]'), jx = ev.target.closest('[data-acct-jobclose]');
+  if (!add && !act && !go && !jc && !jx) return;
+  const b = add || act || go || jc || jx;
+  if (jx) { acctJob = null; localStorage.removeItem('mashu.acctjob'); $('#acctJob').innerHTML = ''; return; }
+  b.disabled = true;
+  try {
+    if (jc) { await acctApi({ action: 'cancel', job: acctJob && acctJob.id }); return; }
+    if (go) {
+      const rt = ($('#acRt').value || '').trim();
+      if (!rt) return toast('先粘贴 RT');
+      b.textContent = '校验中…';
+      await acctApi({ action: 'add-gemini-rt', rt });
+      $('#acRt').value = '';
+      closeModal(); await acctRefresh(); return;
+    }
+    if (add) {
+      const k = add.dataset.acctAdd;
+      if (k === 'gemini-rt') return acctRtModal();
+      if (k === 'codex-local' || k === 'gemini-local') { await acctApi({ action: 'import-local', platform: k.split('-')[0] }); await acctRefresh(); return; }
+      if (k === 'codex-device' || k === 'codex-browser') return await acctStartJob({ action: 'add-codex', device: k === 'codex-device' }, 'codex');
+      if (k === 'gemini-login') return await acctStartJob({ action: 'add-gemini-login' }, 'gemini');
+    }
+    if (act) {
+      const a = act.dataset.acctAct, id = act.dataset.acct;
+      if (a === 'remove' && !b.dataset.sure) { b.dataset.sure = '1'; b.textContent = '再点一次确认删除'; return; }
+      if (a === 'relogin') return await acctStartJob({ action: 'relogin', id }, cliAccts().find((x) => x.id === id)?.platform || 'codex');
+      if (a === 'check') b.textContent = '体检中…';
+      await acctApi({ action: a, id });
+      await acctRefresh();
+    }
+  } catch (e) { toast(e.message); } finally { b.disabled = false; }
+});
+// 对话 ⚙ / 开工卡里的「账号」下拉：只在这个平台的池里有号时出现
+function acctOpts(prov, cur) {
+  const list = cliAccts(prov);
+  return `<option value="">自动选号</option>` + list.map((a) => `<option value="${esc(a.id)}" ${a.id === cur ? 'selected' : ''} ${a.disabled || a.status !== 'ok' ? 'disabled' : ''}>${esc(acctName(a))}${a.disabled ? '（已禁用）' : a.status !== 'ok' ? `（${esc(a.status_cn)}）` : ''}</option>`).join('');
+}
 function renderWall() {
   const el = $('#view-wall');
   const cams = state.cameras.filter((c) => c.state !== 'queued');
-  el.innerHTML = `<h2>会话监控</h2>${defaultsHtml()}
+  el.innerHTML = `<h2>会话监控</h2>${defaultsHtml()}${acctPoolHtml()}
     <p class="hint">所有在运行会话的实时终端，2 秒刷新。要接管：终端里 <code>tmux attach -t ${esc(state.tmux)}</code>，麻薯在 <code>desk</code> 窗口，每个项目一个 <code>film-&lt;id&gt;</code> 窗口（Ctrl-b w 选窗口，Ctrl-b z 放大窗格，Ctrl-b d 退出不停止）。</p>
     <div class="wall">${cams.map((c) => `<div class="tile"><div class="th" data-zoom="${c.id}">
       ${c.role === 'assistant' ? mashuAv('av sm', camLight(c)) : letterAv(c.name, 'av sm', camLight(c))}
       <span class="meta">${esc(c.title)}</span><span class="tag">${pct(c.context_pct)}</span></div>
       <pre class="screen" id="scr-${c.id}"></pre></div>`).join('') || '<div class="empty">没有在运行的会话</div>'}</div>`;
+  acctPoolLast = acctPoolHtml();
   refreshScreens();
 }
 async function refreshScreens() {
@@ -2688,6 +2873,10 @@ async function refresh() {
       state = s;
       live = s.live || {};
       trackLive();
+      if (view === 'wall') {         // 账号池卡片跟着状态更新（额度、体检结果）；正在点按钮时不重画
+        const ap = $('#acctPool'), h = acctPoolHtml();
+        if (ap && h !== acctPoolLast && !ap.contains(document.activeElement)) { ap.outerHTML = h; acctPoolLast = h; }
+      }
       if (m.messages.length) { messages = messages.concat(m.messages); lastId = messages[messages.length - 1].id; }
       const newMsgs = m.messages;
       const need = new Set();

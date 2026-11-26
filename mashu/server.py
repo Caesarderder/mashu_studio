@@ -358,6 +358,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.upload()
             except OSError as exc:
                 return self.send_json({'error': f'保存失败：{exc}'}, 500)
+        if url.path == '/api/accounts':     # 账号池（#4）：要联网（Google / OpenAI），不占全局锁；令牌只进不出
+            try:
+                data = self.body() or {}
+                return self.send_json(studio.account_action(data.get('action') or 'list', data))
+            except ValueError as exc:
+                return self.send_json({'error': str(exc)}, 400)
+            except Exception as exc:
+                studio.log_event(studio.db(), 'error', level='error', where='POST /api/accounts',
+                                 err=studio.acct.redact(f'{type(exc).__name__}: {exc}')[:500])
+                return self.send_json({'error': studio.acct.redact(f'{type(exc).__name__}: {exc}')}, 500)
         try:
             data = self.body()
             conn = studio.db()
@@ -475,7 +485,7 @@ class Handler(BaseHTTPRequestHandler):
         if action == 'pref':
             return studio.set_pref(conn, data.get('channel') or 'assistant', model=data.get('model'), effort=data.get('effort'),
                                    code=data.get('code'), provider=data.get('provider'), gmodel=data.get('gmodel'),
-                                   xmodel=data.get('xmodel'), omodel=data.get('omodel'))
+                                   xmodel=data.get('xmodel'), omodel=data.get('omodel'), xacct=data.get('xacct'), gacct=data.get('gacct'))
         if action == 'interrupt-all':
             busy = [c for c in studio.rows(conn, f'SELECT * FROM cameras WHERE state IN {studio.LIVE} AND last_active>last_stop')]
             for c in busy:

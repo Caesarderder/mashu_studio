@@ -1441,6 +1441,37 @@ details.sd-sec summary { cursor: pointer; }
 .df-r.all { color: var(--accent); font-weight: 600; }
 .df-acts { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; }
 
+/* 账号池（#4）：会话监控里的「账号池」卡片 */
+.acct-pool .ac-sec { display: flex; flex-direction: column; gap: 4px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.ac-sh { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.ac-row { display: grid; grid-template-columns: 46px minmax(160px, 1.4fr) 72px minmax(130px, 1fr) minmax(120px, .9fr) auto; gap: 8px; align-items: center;
+  font-size: 13px; padding: 5px 6px; border-radius: 8px; }
+.ac-row:hover { background: var(--hover, rgba(127,127,127,.06)); }
+.ac-row.dim { opacity: .55; }
+.ac-id { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; color: var(--faint); }
+.ac-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ac-plan { font-style: normal; font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 4px; margin-left: 2px; }
+.ac-tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 4px; margin-left: 4px; }
+.ac-tag.def { color: var(--accent); border-color: var(--accent); }
+.ac-tag.act { color: var(--green); border-color: var(--green); }
+.ac-st { font-size: 12px; }
+.ac-st.acs-ok { color: var(--green); }
+.ac-st.acs-revoked, .ac-st.acs-refresh_failed, .ac-st.acs-logged_out { color: var(--red); }
+.ac-st.acs-pending, .ac-st.acs-off { color: var(--faint); }
+.ac-q { display: flex; gap: 8px; flex-wrap: wrap; }
+.ac-t { font-size: 12px; color: var(--faint); white-space: nowrap; }
+.ac-acts { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.ac-adds { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 0 2px; }
+.ac-job { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; padding: 8px 10px; border: 1px solid var(--accent); border-radius: 10px; }
+.ac-job.ok { border-color: var(--green); } .ac-job.bad { border-color: var(--red); }
+.ac-job a { word-break: break-all; }
+.ac-code { font-size: 15px; font-weight: 700; letter-spacing: 1px; padding: 1px 6px; border-radius: 6px; background: var(--hover, rgba(127,127,127,.1)); }
+.ac-out { width: 100%; max-height: 120px; overflow: auto; font-size: 11px; margin: 0; white-space: pre-wrap; color: var(--muted); }
+.ac-modal { display: flex; flex-direction: column; gap: 10px; min-width: min(560px, 80vw); }
+.ac-modal input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--text); font-family: var(--mono, ui-monospace, monospace); }
+.q-n { font-style: normal; font-size: 10px; color: var(--faint); margin-left: 3px; }
+@media (max-width: 900px) { .ac-row { grid-template-columns: 40px 1fr auto; } .ac-q, .ac-t { grid-column: 2 / -1; } .ac-acts { grid-column: 1 / -1; justify-content: flex-start; } }
+
 /* 聊天里 .md 附件的网页查看器 */
 .md-viewer { line-height: 1.7; font-size: 14px; }
 .md-viewer .lb-bar { position: sticky; top: -20px; background: var(--main); padding: 4px 0 10px; margin-bottom: 8px; border-bottom: 1px solid var(--line); z-index: 1; }
