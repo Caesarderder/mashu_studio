@@ -1972,6 +1972,12 @@ def accounts_check(force=False, only=None):
     for a in p.list():
         if only and a['id'] != only:
             continue
+        if (a['platform'] == 'codex' and a.get('status') == 'pending' and a.get('source') == 'login' and time.time() - (a.get('created') or 0) > 1800
+                and not (codex_acct_home(a) / 'auth.json').exists() and not any(j.get('account') == a['id'] and j['state'] in ('starting', 'waiting')
+                                                                              for j in _ACCT_LOGIN.values())):
+            p.remove(a['id'])        # 网页加号没登录完（服务重启、关了页面）留下的空号：半小时后清掉
+            res.append((a['id'], '没登录完的空号，已清掉'))
+            continue
         if a.get('disabled') and not force:
             continue
         if not force and time.time() - (a.get('last_check') or 0) < (600 if a['platform'] == 'gemini' else 1800):
@@ -2153,24 +2159,42 @@ def _login_job(kind, aid=None, device=True):
             cmd = [cfg('codex'), 'login'] + (['--device-auth'] if device else [])
             env = dict(os.environ, CODEX_HOME=str(home))
             env.pop('MASHU_SESSION', None)
-            pr = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # 输出接到伪终端上：codex login 往管道里什么都不打（实测 0.166），只有终端才显示链接和一次性码
+            import pty
+            import select
+            mfd, sfd = pty.openpty()
+            pr = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=sfd, stderr=sfd, close_fds=True)
+            os.close(sfd)
             job.update(state='waiting', pid=pr.pid)
             end = time.time() + 900
             buf = ''
-            import select
-            while pr.poll() is None and time.time() < end and job['state'] != 'cancelled':
-                r, _, _ = select.select([pr.stdout], [], [], 1)
-                if r:
-                    line = pr.stdout.readline()
-                    buf += line
-                    job['output'] = acct.redact(acct.ANSI_RE.sub('', buf))[-3000:]
-                    got = acct.parse_login_output(buf)
-                    job['url'], job['code'] = got['url'] or job['url'], got['code'] or job['code']
-            if pr.poll() is None:
-                pr.kill()
-                raise acct.AccountError('已取消' if job['state'] == 'cancelled' else '15 分钟内没完成登录，已取消')
-            buf += pr.stdout.read() or ''
-            job['output'] = acct.redact(acct.ANSI_RE.sub('', buf))[-3000:]
+
+            def pump(wait):
+                nonlocal buf
+                r, _, _ = select.select([mfd], [], [], wait)
+                if not r:
+                    return False
+                try:
+                    chunk = os.read(mfd, 4096)
+                except OSError:
+                    return False
+                if not chunk:
+                    return False
+                buf += chunk.decode(errors='ignore')
+                job['output'] = acct.redact(acct.ANSI_RE.sub('', buf))[-3000:]
+                got = acct.parse_login_output(buf)
+                job['url'], job['code'] = got['url'] or job['url'], got['code'] or job['code']
+                return True
+            try:
+                while pr.poll() is None and time.time() < end and job['state'] != 'cancelled':
+                    pump(1)
+                if pr.poll() is None:
+                    pr.kill()
+                    raise acct.AccountError('已取消' if job['state'] == 'cancelled' else '15 分钟内没完成登录，已取消')
+                while pump(0.2):
+                    pass
+            finally:
+                os.close(mfd)
             b = codex_finish_login(a['id'])
             job.update(state='done', result=account_label(b))
         except Exception as exc:

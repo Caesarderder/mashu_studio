@@ -454,6 +454,27 @@ class TestStudioPool(PlatBase):
         self.assertIn('只是取消登记', studio.account_action('remove', dict(id='cx-1'))['result'])
         self.assertTrue((self.user_codex / 'auth.json').exists())
 
+    def test_web_codex_login_job(self):
+        """网页「加号（设备码）」：codex login 只往终端打链接和一次性码（管道里什么都没有），任务要用伪终端读出来；登录完成自动登记。"""
+        auth = json.dumps(codex_auth(email='three@x.com', account='acc-3'))
+        fake = self.tmp / 'fake-codex-login'
+        fake.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 0.166.0"; exit 0; fi\n'
+                        '[ -t 1 ] || exit 3\n'
+                        'printf "1. Open this link\\n   \\033[94mhttps://auth.openai.com/codex/device\\033[0m\\n2. Enter this one-time code (expires)\\n   ABCD-12345\\n"\n'
+                        'sleep 1\n'
+                        f"cat > \"$CODEX_HOME/auth.json\" <<'J'\n{auth}\nJ\n")
+        fake.chmod(0o755)
+        studio.CONFIG_OVERRIDES['codex'] = str(fake)
+        d = studio.account_action('add-codex', dict(device=True))
+        seen = wait_for(lambda: studio.account_action('job', dict(job=d['job']))['job'].get('code'), timeout=10)
+        self.assertEqual(seen, 'ABCD-12345')
+        self.assertEqual(studio.account_action('job', dict(job=d['job']))['job']['url'], 'https://auth.openai.com/codex/device')
+        j = wait_for(lambda: (lambda x: x if x['state'] in ('done', 'failed') else None)(studio.account_action('job', dict(job=d['job']))['job']), timeout=15)
+        self.assertEqual(j['state'], 'done', j)
+        a = next(x for x in self.p.list('codex') if x.get('email') == 'three@x.com')
+        self.assertEqual(a['status'], 'ok')
+        self.assertFalse((studio.codex_acct_home(a) / 'auth.json').is_symlink())
+
     def test_gemini_switch_only_when_agy_idle(self):
         kc = FakeKeychain({'token': {'refresh_token': RT1, 'access_token': 'ya29.old'}, 'auth_method': 'consumer'})
         g = acct.Gemini(self.p, 'agy-not-installed', keychain=kc, token_file=self.tmp / 'none')
