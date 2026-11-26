@@ -1094,17 +1094,20 @@ body.panel-off .pg-btn::before { content: "‹"; }
 .term-link { color: var(--accent); cursor: pointer; text-decoration: none; }
 .term-link:hover { text-decoration: underline; }
 .bubble.live-card { display: block; min-width: min(420px, 100%); }
-.lv-title { display: flex; align-items: center; gap: 8px; color: var(--accent); font-weight: 600; font-size: 13.5px; }
-.lv-title .dots { padding: 0; }
+.lv-title { display: flex; align-items: center; gap: 8px; color: var(--accent); font-weight: 600; font-size: 13.5px; min-width: 0; }
+.lv-title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.lv-title .dots { padding: 0; flex: none; }
 .lv-title .dots i { background: var(--accent); width: 5px; height: 5px; }
-.lv-title .live-stop { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
+.lv-title .live-stop { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; flex: none; white-space: nowrap; }
 .lv-got { color: var(--muted); font-size: 12.5px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lv-tools { margin-top: 8px; display: flex; flex-direction: column; gap: 5px; border-top: 1px dashed var(--line); padding-top: 8px; }
-.lv-tool { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.lv-tool { display: flex; align-items: center; gap: 8px; font-size: 12.5px; min-width: 0; }
 .lv-tool.done .ic { color: var(--green); }
 .lv-tool.doing .ic { color: var(--accent); }
-.lv-tool b { font-family: var(--mono); font-weight: 600; font-size: 12px; }
-.lv-tool span { color: var(--faint); font-size: 11.5px; }
+.lv-tool.error .ic { color: var(--red); }
+.lv-tool b { font-family: var(--mono); font-weight: 600; font-size: 12px; flex: none; }
+.lv-tool code { font-family: var(--mono); font-size: 11.5px; color: var(--muted); flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lv-tool span { color: var(--faint); font-size: 11.5px; flex: none; margin-left: auto; }
 .lv-more { font-size: 11.5px; color: var(--faint); }
 .lv-text { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
 

@@ -385,6 +385,39 @@ class TestServerAndCLI(PlatBase):
         self.assertEqual(restored['settings']['stages'], 6)
         self.assertEqual(restored['web']['token'], 'CLI_TOK_SECRET_ABC')
 
+    def test_migrate_dedups_accounts_by_platform_and_email(self):
+        """二次迁移合并时按（平台 + 邮箱）去重：旧进程新写入的 gm-1 与主文件已有 gm-2 同邮箱时只更新 gm-2，不新建重复号。"""
+        h = self.tmp / 'dedup_mig'
+        h.mkdir()
+        # 主文件已有 gm-2（默认号）
+        cfg = cfgfile.normalize_config({})
+        cfg['accounts']['defaults']['gemini'] = 'gm-2'
+        cfg['accounts']['items'].append({
+            'id': 'gm-2', 'platform': 'gemini', 'email': 'alice@example.com', 'label': 'alice@example.com',
+            'source': 'local', 'status': 'ok', 'last_check': 200,
+            'credentials': {'refresh_token': 'RT_EXISTING'},
+        })
+        cfgfile.write_config(h / 'studio.json', cfg)
+        # 模拟旧服务进程又重建了 accounts/index.json（带同邮箱不同 ID 的 gm-1）和 cred.json
+        (h / 'accounts' / 'gemini' / 'gm-1').mkdir(parents=True)
+        (h / 'accounts' / 'index.json').write_text(json.dumps({
+            'defaults': {'gemini': 'gm-1'},
+            'accounts': [{
+                'id': 'gm-1', 'platform': 'gemini', 'email': 'ALICE@example.com', 'label': 'ALICE@example.com',
+                'source': 'local', 'status': 'ok', 'last_check': 300, 'quota': {'remaining': 0.9},
+            }],
+        }))
+        (h / 'accounts' / 'gemini' / 'gm-1' / 'cred.json').write_text(json.dumps({'refresh_token': 'RT_DUP'}))
+
+        res = cfgfile.migrate_if_needed(h)
+        self.assertTrue(res['migrated'])
+        after = cfgfile.read_config(h / 'studio.json')
+        gm_items = [a for a in after['accounts']['items'] if a['platform'] == 'gemini']
+        self.assertEqual(len(gm_items), 1)
+        self.assertEqual(gm_items[0]['id'], 'gm-2')
+        self.assertEqual(after['accounts']['defaults']['gemini'], 'gm-2')
+        self.assertEqual(gm_items[0]['quota']['remaining'], 0.9)
+
 
 if __name__ == '__main__':
     unittest.main()

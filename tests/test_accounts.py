@@ -508,5 +508,27 @@ class TestStudioPool(PlatBase):
         self.assertAlmostEqual(lim['gemini']['remaining'], 0.25)
         self.assertNotIn(RT2, json.dumps(studio.cli_accounts(), default=str))
 
+    def test_local_import_dedups_by_platform_and_email(self):
+        """登记本机登录（Codex / Gemini）按平台 + 邮箱去重（不区分大小写），更新已有号不新建重复号。"""
+        # 1. Codex：池里已有同邮箱非 local 号，再执行 codex_import_local 只更新它不新建
+        cx = self.p.add('codex', source='login', email='Alice@Example.com', label='Alice', status='ok')
+        before_cx = len(self.p.list('codex'))
+        (self.user_codex / 'auth.json').write_text(json.dumps(codex_auth(email='alice@example.com', account='acct-1')))
+        updated = studio.codex_import_local()
+        self.assertEqual(updated['id'], cx['id'])
+        self.assertEqual(len(self.p.list('codex')), before_cx)
+        self.assertEqual(updated['source'], 'local')
+
+        # 2. Gemini：池里已有同邮箱（大小写不同），再次 import_local 更新原号不新建
+        kc = FakeKeychain({'token': {'refresh_token': RT1, 'access_token': 'ya29.old'}, 'auth_method': 'consumer', 'id_token_email': 'G1@X.COM'})
+        g = acct.Gemini(self.p, 'agy-not-installed', keychain=kc, token_file=self.tmp / 'none')
+        self.p.set_gemini_clients(dict(sig='', pairs=[[self.http.good_client, 'GOCSPX-good']]))
+        gm = self.p.add('gemini', source='rt', email='G1@X.COM', label='G1@X.COM', status='ok')
+        before_gm = len(self.p.list('gemini'))
+        res = g.import_local()
+        self.assertEqual(res['id'], gm['id'])
+        self.assertEqual(len(self.p.list('gemini')), before_gm)
+        self.assertEqual(res['source'], 'local')
+
 if __name__ == '__main__':
     unittest.main()

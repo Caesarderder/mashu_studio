@@ -8,11 +8,13 @@ last_verified: 2026-11-26
 source_of_truth:
   - mashu/studio.py
   - mashu/platforms.py
+  - mashu/live_parsers.py
   - mashu/accounts.py
   - mashu/config_file.py
   - integrations/opencode/mashu.js
 validated_by:
   - tests/test_platforms.py
+  - tests/test_live_parsers.py
   - tests/test_accounts.py
   - tests/test_config_file.py
   - manual-real-session
@@ -48,7 +50,8 @@ related:
 | 会话 ID | 麻薯预先指定 | SessionStart hook 回写 | SessionStart / UserPromptSubmit hook 回写 | 插件第一轮回写 |
 | 系统提示 | `--append-system-prompt` | SessionStart hook 注入 | `-c developer_instructions=`（每次启动、恢复都传） | 插件 `experimental.chat.system.transform` 追加 `MASHU_SYSTEM_FILE` |
 | hooks 在哪 | `--settings state/claude-settings.json`（只对受管会话） | 全局 `~/.gemini/config/hooks.json` 的 `mashu` 项 | 麻薯专用 `CODEX_HOME`（`state/codex-home`）的 config.toml 里内联 `[[hooks.*]]` | 麻薯插件（`OPENCODE_CONFIG_DIR=state/opencode-config` → `plugins/mashu.js`） |
-| 会话记录 | `~/.claude/projects/<目录>/<ID>.jsonl` | `~/.gemini/antigravity-cli/brain/<ID>/` | `state/codex-home/sessions/YYYY/MM/DD/rollout-*-<ID>.jsonl` | OpenCode 自己的库 `~/.local/share/opencode/`；麻薯读插件写的 `state/live/<机位>.json` |
+| 会话记录 | `~/.claude/projects/<目录>/<ID>.jsonl` | `~/.gemini/antigravity-cli/brain/<ID>/.system_generated/logs/transcript.jsonl`（及 `transcript_full.jsonl`、`messages/`） | `state/codex-home/sessions/YYYY/MM/DD/rollout-*-<ID>.jsonl` | OpenCode 自己的库 `~/.local/share/opencode/`；麻薯读插件原子写的 `state/live/<机位>.json` |
+| 网页实时同步 | transcript 完整解析（工具/思考/待办/子代理/后台命令） | `live_parsers.parse_agy`（工具列表/状态/耗时、中间文字、思考、后台任务、子代理、待办、`agy_last_reply` 真实格式） | `live_parsers.parse_codex`（rollout 完整事件含 Code Mode 内层命令/改文件、推理摘要、`update_plan` 待办、后台 shell、子代理） | 插件写入 + `live_parsers.parse_opencode`（工具列表/状态/耗时、推理、待办、`task` 子代理及子工具、中间文字） |
 | 上下文 / 用量 | 状态栏 + transcript | 状态栏 | rollout 里的 `token_count`（Stop 时 + 长轮每 10 分钟） | 插件：每条助手消息完成调 `statusline --opencode`（占比 = 这条消息 tokens / `opencode models` 的窗口），每轮结束把会话累计 tokens 和花费交给 `hook-stop` |
 | 打断 | Esc | Esc | Esc | 连按两次 Esc |
 
@@ -74,7 +77,6 @@ related:
 
 ## 已知限制
 
-- Codex、OpenCode 的网页「详细」模式只显示这一轮的文字和正在用的工具；子代理、后台任务、待办、思考片段只认得 Claude Code 的记录。
 - Codex 走订阅，没在 `prices` 里配价格就不算钱；OpenCode 的花费用它自己按 models.dev 价格算的累计值。
 - Codex、OpenCode 不回报思考档位：麻薯记下启动时实际传的那档。
 - 安全拦截和 Claude 一样是护栏，不是安全边界（hook 出错时放行；正则 / 结构判定见 `risky`）。CLI 换了 hook 输入格式就可能失效，所以版本不在已验证范围内不让选。

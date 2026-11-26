@@ -37,6 +37,7 @@ sys.modules.setdefault('studio', sys.modules[__name__])   # 以脚本运行时�
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config_file as cfgfile  # noqa: E402   主配置文件、迁移、加密导出导入（#7）
 import platforms as plat  # noqa: E402   Codex / OpenCode 的纯函数部分
+import live_parsers as lp  # noqa: E402   Gemini / Codex / OpenCode 实时会话解析（#8）
 import accounts as acct  # noqa: E402   账号池：Codex / Gemini 多账号（#4）
 
 CODE = Path(__file__).resolve().parent.parent
@@ -2114,15 +2115,21 @@ _ACCT_LOGIN = {}          # 网页上发起的登录：{任务 ID: dict(state, p
 
 
 def codex_import_local():
-    """把本机 Codex 的登录（~/.codex/auth.json）登记成默认号：不复制，只登记——它的 CODEX_HOME 就是 state/codex-home（软链接）。"""
+    """把本机 Codex 的登录（~/.codex/auth.json）登记成默认号：不复制，只登记——它的 CODEX_HOME 就是 state/codex-home（软链接）。
+    按平台 + 邮箱去重：已有同邮箱号（或已有本机号）就更新它，不新建重复号。"""
     info = acct.codex_auth_info(CODEX_USER_HOME / 'auth.json')
     if not info.get('logged_in'):
         raise acct.AccountError(f'{CODEX_USER_HOME / "auth.json"} 里没有登录：先在终端运行一次 codex login')
     p = pool()
-    a = next((x for x in p.list('codex') if x.get('source') == 'local'), None)
+    email_key = (info.get('email') or '').strip().lower()
+    existing = p.list('codex')
+    a = next((x for x in existing if email_key and (x.get('email') or '').strip().lower() == email_key), None)
+    if a is None:
+        a = next((x for x in existing if x.get('source') == 'local'), None)
     meta = dict(email=info.get('email'), plan=info.get('plan'), label=info.get('email') or '本机 Codex', status='ok', error='',
-                last_refresh=info.get('last_refresh'), last_check=time.time(), account_ref=info.get('account_id'))
-    a = p.update(a['id'], **meta) if a else p.add('codex', source='local', **meta)
+                source='local', auth_ref='local_cli', last_refresh=info.get('last_refresh'), last_check=time.time(),
+                account_ref=info.get('account_id'))
+    a = p.update(a['id'], **meta) if a else p.add('codex', **meta)
     if not p._read()['defaults'].get('codex'):
         p.set_default('codex', a['id'])
     return a
@@ -2375,17 +2382,19 @@ def has_transcript(cwd, sid):
 
 
 def transcript_file(conn, c):
-    """这个机位当前会话的对话记录文件：Claude 的 projects/*.jsonl、Codex 的 rollout、OpenCode 插件写的实时文件；没有就 None。"""
-    sid = c['claude_sid'] if c else None
-    if not sid:
+    """这个机位当前会话的对话记录文件：Claude 的 projects/*.jsonl、Codex 的 rollout、Gemini 的 transcript、OpenCode 插件写的实时文件；没有就 None。"""
+    if not c:
         return None
     prov = cam_provider(conn, c)
+    if prov == 'opencode':
+        return HOME / 'live' / f'{c["id"]}.json'
+    sid = c['claude_sid']
+    if not sid:
+        return None
     try:
         if prov == 'codex':
             p = meta_get(conn, f'transcript:{sid}')
             return Path(p) if p else find_codex_rollout(sid)
-        if prov == 'opencode':
-            return HOME / 'live' / f'{c["id"]}.json'
         if prov == 'gemini':
             return agy_transcript(sid)
         return CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, c))) / f'{sid}.jsonl'
@@ -4314,13 +4323,59 @@ def tool_label(b):
 _LIVE_CACHE = {}
 
 
-def turn_progress_of(conn, cam, tail=256_000):
-    """读 transcript 末尾算当前这一轮的进度；文件没变就用缓存。Claude Code 按内容块落盘，所以是分段流式。"""
-    if not cam['claude_sid'] and cam_provider(conn, cam) != 'opencode':
-        return '', ''
-    prov = cam_provider(conn, cam)
+def _live_cache_key(prov, p):
+    st = p.stat()
     if prov == 'gemini':
+        full_p = p.with_name('transcript_full.jsonl')
+        full_k = (full_p.stat().st_size, full_p.stat().st_mtime) if full_p.is_file() else (0, 0)
+        mdir = p.parent.parent / 'messages' if p.parent.name == 'logs' else None
+        msg_k = max((f.stat().st_mtime for f in mdir.glob('*.json')), default=0) if (mdir and mdir.is_dir()) else 0
+        task_p = p.parent.parent.parent / 'task.md' if p.parent.name == 'logs' else None
+        task_k = task_p.stat().st_mtime if (task_p and task_p.is_file()) else 0
+        return (st.st_size, st.st_mtime, full_k, msg_k, task_k)
+    return (st.st_size, st.st_mtime)
+
+
+def live_detail_of(conn, cam, tail=1_500_000):
+    """非 Claude 平台（Gemini / Codex / OpenCode）统一实时解析，带文件变更缓存。"""
+    if not cam:
+        return lp.empty_detail()
+    prov = cam_provider(conn, cam)
+    if prov == 'claude':
+        return lp.empty_detail()
+    if not cam['claude_sid'] and prov != 'opencode':
+        return lp.empty_detail()
+    try:
+        p = transcript_file(conn, cam)
+        if not p:
+            return lp.empty_detail()
+        key = _live_cache_key(prov, p)
+    except (OSError, RuntimeError, AttributeError):
+        return lp.empty_detail()
+    ck = (prov, p, tail)
+    hit = _LIVE_CACHE.get(ck)
+    if hit and hit[0] == key:
+        return hit[1]
+    if prov == 'gemini':
+        res = lp.parse_agy(p, tail=tail)
+    elif prov == 'codex':
+        res = lp.parse_codex(p, tail=tail)
+    elif prov == 'opencode':
+        res = lp.parse_opencode_file(p)
+    else:
+        res = lp.empty_detail()
+    _LIVE_CACHE[ck] = (key, res)
+    return res
+
+
+def turn_progress_of(conn, cam, tail=256_000):
+    """读 transcript 末尾算当前这一轮的进度；文件没变就用缓存。四家 CLI 均支持。"""
+    prov = cam_provider(conn, cam)
+    if not cam['claude_sid'] and prov != 'opencode':
         return '', ''
+    if prov in ('gemini', 'codex', 'opencode'):
+        d = live_detail_of(conn, cam, tail=max(tail, 1_500_000))
+        return d.get('text') or '', d.get('tool') or ''
     try:
         p = transcript_file(conn, cam)
         st = p.stat()
@@ -4330,18 +4385,6 @@ def turn_progress_of(conn, cam, tail=256_000):
     hit = _LIVE_CACHE.get(p)
     if hit and hit[0] == key:
         return hit[1]
-    if prov == 'opencode':          # 插件写的实时文件：{text, tool, sid}
-        try:
-            d = json.loads(p.read_text())
-            out = ((d.get('text') or '').strip(), d.get('tool') or '')
-        except (OSError, ValueError):
-            out = ('', '')
-        _LIVE_CACHE[p] = (key, out)
-        return out
-    if prov == 'codex':
-        out = plat.codex_progress(plat.read_jsonl_tail(p, tail))
-        _LIVE_CACHE[p] = (key, out)
-        return out
     with p.open('rb') as fh:
         if st.st_size > tail:
             fh.seek(st.st_size - tail)
@@ -4391,7 +4434,16 @@ _BG_CACHE = {}
 
 def bg_tasks_of(conn, cam, tail=1_000_000):
     """会话 transcript 末尾里还没结束的后台任务数；文件没变就用缓存。"""
-    if not cam or not cam['claude_sid'] or cam_provider(conn, cam) != 'claude':     # 后台任务只认得 Claude Code 的记录
+    if not cam:
+        return 0
+    prov = cam_provider(conn, cam)
+    if prov != 'claude':
+        if not cam['claude_sid'] and prov != 'opencode':
+            return 0
+        d = live_detail_of(conn, cam, tail=tail)
+        return sum(1 for x in (d.get('agents') or []) if x.get('state') == 'running') + \
+            sum(1 for x in (d.get('shells') or []) if x.get('state') == 'running')
+    if not cam['claude_sid']:
         return 0
     try:
         p = CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, cam))) / f'{cam["claude_sid"]}.jsonl'
@@ -4475,9 +4527,44 @@ def _subagent_info(sdir, meta_by_tool, tool_id):
 _SUB_CACHE, _DETAIL_CACHE = {}, {}
 
 
+def session_limits_for(conn, cam, prov, all_limits=None):
+    """按会话所属平台取顶部状态栏额度（不串平台）：
+    - claude：保持原样（含顶层 five_hour / seven_day）
+    - codex：取这个会话所用 Codex 号（camacct:<机位>）的 five_hour / seven_day，未记录时退回默认号
+    - gemini：取这个会话所用 Gemini 号的 remaining / reset / low_model（与左下角 Gemini 同源）
+    - opencode：取今日 / 本周花费（today / week / at）"""
+    L = read_limits() if all_limits is None else (all_limits or {})
+    if prov == 'claude':
+        return L
+    aid = meta_get(conn, f'camacct:{cam["id"]}') if (conn and cam) else None
+    if prov == 'codex':
+        cx = L.get('codex') if isinstance(L.get('codex'), dict) else {}
+        accs = cx.get('accounts') or []
+        hit = next((a for a in accs if aid and a.get('id') == aid), None)
+        if hit and isinstance(hit.get('quota'), dict):
+            q = hit['quota']
+            return dict(five_hour=q.get('five_hour'), seven_day=q.get('seven_day'), at=q.get('at'), account=hit.get('id'))
+        return dict(five_hour=cx.get('five_hour'), seven_day=cx.get('seven_day'), at=cx.get('at'), account=aid or cx.get('account'))
+    if prov == 'gemini':
+        gm = L.get('gemini') if isinstance(L.get('gemini'), dict) else {}
+        accs = gm.get('accounts') or []
+        hit = next((a for a in accs if aid and a.get('id') == aid), None)
+        if hit and isinstance(hit.get('quota'), dict):
+            q = hit['quota']
+            return dict(available=q.get('remaining') is not None, remaining=q.get('remaining'), reset=q.get('reset'),
+                        low_model=q.get('low_model'), at=q.get('at'), account=hit.get('id'))
+        return dict(available=bool(gm.get('available')), remaining=gm.get('remaining'), reset=gm.get('reset'),
+                    low_model=gm.get('low_model'), at=gm.get('at'), account=aid or gm.get('account'),
+                    reason=gm.get('reason') or '')
+    if prov == 'opencode':
+        oc = L.get('opencode') if isinstance(L.get('opencode'), dict) else {}
+        return dict(today=oc.get('today'), week=oc.get('week'), at=oc.get('at'))
+    return {}
+
+
 def session_detail(conn, cam, tail=1_500_000):
-    """网页「详细」模式：从 transcript 和状态栏快照拼出 Claude Code 终端里能看到的信息——
-    这一轮的工具（带参数）、思考片段、待办、子代理 / 后台任务（描述、耗时、token、最近工具）、状态栏（模型、目录、花费、额度）。"""
+    """网页「详细」模式：从 transcript 和状态栏快照拼出终端里能看到的信息——
+    这一轮的工具（带参数）、思考片段、待办、子代理 / 后台任务（描述、耗时、token、最近工具）、状态栏（模型、目录、花费、按平台对齐的额度）。"""
     if not cam:
         return {}
     status = {}
@@ -4485,15 +4572,56 @@ def session_detail(conn, cam, tail=1_500_000):
         status = json.loads((HOME / 'statusline' / f'{cam["id"]}.json').read_text())
     except (OSError, ValueError):
         pass
-    out = dict(status=status, limits=read_limits(), code_mode=code_mode_of(conn, cam['claude_sid']), tools=[], agents=[], shells=[], todos=[], thinking='', turn_start=None,
+    prov = cam_provider(conn, cam)
+    out = dict(status=status, limits=session_limits_for(conn, cam, prov), code_mode=code_mode_of(conn, cam['claude_sid']),
+               tools=[], agents=[], shells=[], todos=[], thinking='', turn_start=None,
                turn_out=0, busy=bool(cam['last_active'] > cam['last_stop']))
+    if prov != 'claude':
+        d = live_detail_of(conn, cam, tail=tail)
+        st = dict(status)
+        # 补齐状态栏字段（Codex 没有 statusLine hook；agy 的 effort 在 model.effort 里；OpenCode 补 cwd/effort）
+        m = dict(st.get('model') or {})
+        if not (m.get('display_name') or m.get('id')):
+            mname = cam['model'] or d.get('model') or ''
+            if mname:
+                m = dict(id=mname, display_name=mname)
+        if m:
+            st['model'] = m
+        eff = (st.get('effort') or {}).get('level') or m.get('effort') or st.get('variant') or cam['effort'] or ''
+        if eff and eff != 'default':
+            st['effort'] = dict(level=eff)
+        ws = dict(st.get('workspace') or {})
+        if not ws.get('current_dir') and not st.get('cwd'):
+            try:
+                ws['current_dir'] = str(camera_cwd(conn, cam))
+            except RuntimeError:
+                pass
+        if ws:
+            st['workspace'] = ws
+        cw = dict(st.get('context_window') or {})
+        if cw.get('used_percentage') is None:
+            pct = d.get('context_pct') if d.get('context_pct') is not None else cam['context_pct']
+            if pct is not None:
+                cw['used_percentage'] = round(pct * 100, 1)
+        if not cw.get('context_window_size'):
+            win = d.get('ctx_window') or cam.get('ctx_window')
+            if win:
+                cw['context_window_size'] = win
+        if cw:
+            st['context_window'] = cw
+        tl = d.get('tools') or []
+        return dict(
+            out, status=st, provider=prov,
+            tools=tl[-10:], tools_total=d.get('tools_total', len(tl)),
+            thinking=(d.get('thinking') or '')[-1500:],
+            todos=d.get('todos') or [],
+            agents=(d.get('agents') or [])[-12:],
+            shells=(d.get('shells') or [])[-12:],
+            turn_start=d.get('turn_start'),
+            turn_out=d.get('turn_out') or 0,
+        )
     if not cam['claude_sid']:
         return out
-    prov = cam_provider(conn, cam)
-    if prov != 'claude':        # 别家：只给这一轮的文字 / 正在用的工具（详细的工具表、子代理只认得 Claude Code 的记录）
-        text, tool = turn_progress_of(conn, cam)
-        return dict(out, provider=prov, tools=[dict(name=tool.split(' · ')[0], detail=tool.split(' · ', 1)[1] if ' · ' in tool else '',
-                                                     state='doing', start=None, end=None, id='live')] if tool else [])
     try:
         base = CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, cam)))
         p = base / f'{cam["claude_sid"]}.jsonl'
@@ -4603,12 +4731,33 @@ def live_replies(conn):
         out[m['channel']] = dict(role='crew' if '/' in m['channel'] else ('assistant' if m['channel'] == 'assistant' else 'producer'),
                                  name='', crew_role='', film_id=m['film_id'], text='', tool='', waiting=True)
     for c in rows(conn, f'SELECT * FROM cameras WHERE state IN {LIVE} AND last_active>last_stop'):
-        text, tool = turn_progress_of(conn, c)
+        prov = cam_provider(conn, c)
+        if prov in ('gemini', 'codex', 'opencode'):
+            det = live_detail_of(conn, c)
+            text, tool = det.get('text') or '', det.get('tool') or ''
+            tl = det.get('tools') or []
+            rtools = [dict(name=t['name'], detail=t.get('detail') or '', state=t.get('state') or 'done') for t in tl[-8:]]
+            ttotal = det.get('tools_total', len(tl))
+        else:
+            text, tool = turn_progress_of(conn, c)
+            rtools, ttotal = None, 0
+            try:
+                sd = session_detail(conn, c)
+                tl = sd.get('tools') or []
+                if tl:
+                    rtools = [dict(name=t['name'], detail=t.get('detail') or '', state=t.get('state') or 'done') for t in tl[-8:]]
+                    ttotal = sd.get('tools_total', len(tl))
+            except Exception:
+                pass
         seen = _health_seen.get(c['id'])      # health_guard 记的「最近一次屏幕或记录有变化」的时间
-        out[channel_of(c)] = dict(role=c['role'], name=c['name'], crew_role=c['crew_role'], film_id=c['film_id'],
-                                  text=text, tool=tool, waiting=False,
-                                  health=c['health'] or '', health_note=c['health_note'] or '', health_at=c['health_at'],
-                                  stalled_min=int((time.time() - seen[2]) // 60) if seen else 0)   # 按分钟取整，免得每秒推一次
+        entry = dict(role=c['role'], name=c['name'], crew_role=c['crew_role'], film_id=c['film_id'],
+                     text=text, tool=tool, waiting=False,
+                     health=c['health'] or '', health_note=c['health_note'] or '', health_at=c['health_at'],
+                     stalled_min=int((time.time() - seen[2]) // 60) if seen else 0)   # 按分钟取整，免得每秒推一次
+        if rtools:
+            entry['tools'] = rtools
+            entry['tools_total'] = ttotal
+        out[channel_of(c)] = entry
     return out
 
 
@@ -6009,55 +6158,12 @@ def agy_note(conn, c, payload):
 
 
 def agy_transcript(conv):
-    return GEMINI_HOME / 'brain' / conv / '.system_generated' / 'logs' / 'transcript.jsonl' if conv else None
+    return lp.resolve_agy_transcript(None, conv, GEMINI_HOME) if conv else None
 
 
 def agy_last_reply(path, tail=400_000):
-    """从 agy 的 transcript.jsonl 取这一轮最后一段回复。格式没公开：按常见字段（role/type/source + text/content/response）
-    从末尾往前找，碰到用户消息就停。【待登录后实测，格式对不上就改这里】"""
-    try:
-        p = Path(path)
-        size = p.stat().st_size
-        with p.open('rb') as fh:
-            if size > tail:
-                fh.seek(size - tail)
-                fh.readline()
-            raw = fh.read().decode(errors='ignore')
-    except (OSError, TypeError):
-        return ''
-    def text_of(x, depth=0):
-        if depth > 5:
-            return ''
-        if isinstance(x, str):
-            return x
-        if isinstance(x, list):
-            return '\n'.join(t for t in (text_of(i, depth + 1) for i in x) if t)
-        if isinstance(x, dict):
-            if str(x.get('type', '')).lower() in ('thinking', 'tool_use', 'tool_call', 'function_call', 'tool_result'):
-                return ''
-            for k in ('text', 'content', 'response', 'modifiedResponse', 'message', 'parts', 'plannerResponse'):
-                if k in x:
-                    t = text_of(x[k], depth + 1)
-                    if t.strip():
-                        return t
-        return ''
-    for line in reversed(raw.splitlines()):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(e, dict):
-            continue
-        msg = e.get('message') if isinstance(e.get('message'), dict) else {}
-        kind = ' '.join(str(d.get(k, '')) for d in (e, msg) for k in ('role', 'type', 'source', 'author', 'stepType', 'step_type')).lower()
-        bot = any(w in kind for w in ('assistant', 'model', 'planner', 'response', 'agent'))
-        if bot:
-            t = text_of(e).strip()
-            if t:
-                return t
-        elif 'user' in kind:
-            break
-    return ''
+    """从 agy 真实的 transcript_full.jsonl / transcript.jsonl 取这一轮最终回复（#8）。"""
+    return lp.agy_last_reply(path, tail=tail)
 
 
 def agy_tool_payload(payload):
@@ -6180,7 +6286,7 @@ def _hook_stop(payload, agy, fmt='claude'):
         conn.commit()
         if payload.get('terminationReason') not in (None, '', 'model_stop'):
             log_event(conn, 'agy-stop', c, level='warn', reason=payload.get('terminationReason'), err=(payload.get('error') or '')[:300])
-        path = payload.get('transcriptPath') or agy_transcript(conv or c['claude_sid'])
+        path = lp.resolve_agy_transcript(payload.get('transcriptPath'), conv or c['claude_sid'], GEMINI_HOME)
         text = agy_last_reply(path)
         if not text:
             log_event(conn, 'agy-reply-missing', c, level='warn', path=str(path or ''))

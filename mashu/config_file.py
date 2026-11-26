@@ -310,22 +310,64 @@ def migrate_if_needed(home):
             tok_file.unlink()
             migrated_files.append('token')
 
-        items_by_id = {a['id']: a for a in cfg['accounts']['items']}
+        def _email_key(item):
+            pl = (item.get('platform') or '').strip().lower()
+            em = (item.get('email') or '').strip().lower()
+            return (pl, em) if (pl and em) else None
+
+        def _merge_account(dst, src):
+            for k in ('email', 'label', 'plan', 'account_ref', 'auth_ref'):
+                if src.get(k) and not dst.get(k):
+                    dst[k] = src[k]
+            if src.get('source') == 'local' and not dst.get('source'):
+                dst['source'] = 'local'
+            if src.get('credentials') and not dst.get('credentials'):
+                dst['credentials'] = copy.deepcopy(src['credentials'])
+            if (src.get('last_check') or 0) > (dst.get('last_check') or 0):
+                if src.get('quota'):
+                    dst['quota'] = copy.deepcopy(src['quota'])
+                dst['last_check'] = src['last_check']
+                if src.get('status') == 'ok':
+                    dst['status'] = 'ok'
+                    dst['error'] = ''
+
+        items_by_id = {}
+        items_by_email = {}
+        id_remap = {}
+        deduped_items = []
+        for cur_a in cfg['accounts']['items']:
+            if not isinstance(cur_a, dict) or not cur_a.get('id'):
+                continue
+            ek = _email_key(cur_a)
+            if ek and ek in items_by_email:
+                _merge_account(items_by_email[ek], cur_a)
+                id_remap[cur_a['id']] = items_by_email[ek]['id']
+                continue
+            deduped_items.append(cur_a)
+            items_by_id[cur_a['id']] = cur_a
+            if ek:
+                items_by_email[ek] = cur_a
+        cfg['accounts']['items'] = deduped_items
+
         if idx_file.exists():
             _backup_file(idx_file, bdir / 'accounts' / 'index.json')
             old_idx = read_json(idx_file, {}) or {}
-            for pl, aid in (old_idx.get('defaults') or {}).items():
-                if aid and pl not in cfg['accounts']['defaults']:
-                    cfg['accounts']['defaults'][pl] = aid
             for old_a in old_idx.get('accounts') or []:
                 if not isinstance(old_a, dict) or not old_a.get('id'):
                     continue
                 aid = old_a['id']
-                a = items_by_id.get(aid)
+                ek = _email_key(old_a)
+                a = items_by_id.get(aid) or (items_by_email.get(ek) if ek else None)
                 if a is None:
                     a = copy.deepcopy(old_a)
                     cfg['accounts']['items'].append(a)
                     items_by_id[aid] = a
+                    if ek:
+                        items_by_email[ek] = a
+                else:
+                    _merge_account(a, old_a)
+                    if a['id'] != aid:
+                        id_remap[aid] = a['id']
                 if a.get('platform') == 'gemini':
                     cp = gemini_dir / aid / 'cred.json'
                     if cp.exists():
@@ -345,14 +387,22 @@ def migrate_if_needed(home):
                             ad = read_json(ap, {}) or {}
                             if ad and not a.get('credentials'):
                                 a['credentials'] = ad
+            for pl, aid in (old_idx.get('defaults') or {}).items():
+                mapped = id_remap.get(aid, aid)
+                if mapped and pl not in cfg['accounts']['defaults']:
+                    cfg['accounts']['defaults'][pl] = mapped
             idx_file.unlink()
             migrated_files.append('accounts/index.json')
+
+        for pl, aid in list(cfg['accounts']['defaults'].items()):
+            if aid in id_remap:
+                cfg['accounts']['defaults'][pl] = id_remap[aid]
 
         for cp in sorted(gemini_dir.glob('*/cred.json')) if gemini_dir.is_dir() else []:
             aid = cp.parent.name
             _backup_file(cp, bdir / 'accounts' / 'gemini' / aid / 'cred.json')
             c = read_json(cp, {}) or {}
-            a = items_by_id.get(aid)
+            a = items_by_id.get(id_remap.get(aid, aid))
             if a is not None and c and not a.get('credentials'):
                 a['credentials'] = c
             cp.unlink()

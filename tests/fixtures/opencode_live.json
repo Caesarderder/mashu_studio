@@ -1,0 +1,75 @@
+{
+  "sid": "ses_demo_live_01",
+  "text": "先读取配置文件并跑一下单测。",
+  "last_reply": "检查完成，配置正常。",
+  "tool": "Bash · python3 -m unittest",
+  "tools": [
+    {
+      "id": "call_read_1",
+      "name": "Read",
+      "detail": "studio.py",
+      "state": "done",
+      "start": 1795659920.1,
+      "end": 1795659920.3
+    },
+    {
+      "id": "call_edit_2",
+      "name": "Edit",
+      "detail": "platforms.py",
+      "state": "error",
+      "start": 1795659921.0,
+      "end": 1795659921.2
+    },
+    {
+      "id": "call_todo_3",
+      "name": "TodoWrite",
+      "detail": "",
+      "state": "done",
+      "start": 1795659922.0,
+      "end": 1795659922.1
+    },
+    {
+      "id": "call_bash_4",
+      "name": "Bash",
+      "detail": "python3 -m unittest",
+      "state": "doing",
+      "start": 1795659923.0,
+      "end": null
+    }
+  ],
+  "tools_total": 4,
+  "thinking": "Need to verify parser output before running full suite.",
+  "todos": [
+    {
+      "text": "检查配置文件",
+      "state": "completed"
+    },
+    {
+      "text": "运行单元测试",
+      "state": "in_progress"
+    },
+    {
+      "text": "整理回复",
+      "state": "pending"
+    }
+  ],
+  "agents": [
+    {
+      "id": "ses_sub_01",
+      "kind": "agent",
+      "tool": "Read · app.js",
+      "type": "explore",
+      "desc": "查找前端渲染逻辑",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "state": "running",
+      "start": 1795659922.5,
+      "end": null,
+      "bg": true
+    }
+  ],
+  "shells": [],
+  "turn_start": 1795659919.5,
+  "turn_out": 512,
+  "model": "opencode/deepseek-v4.1-flash-free",
+  "at": 1795659925.0
+}

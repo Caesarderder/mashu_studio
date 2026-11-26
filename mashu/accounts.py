@@ -562,8 +562,12 @@ class Gemini:
             raise AccountError('RT 格式不对（应是一整串，没有空格换行）')
         t = self.refresh_token(rt)
         info = self.userinfo(t['access_token'])
-        email = info.get('email') or jwt_claims(t.get('id_token')).get('email') or (extra or {}).get('email') or ''
-        same = next((a for a in self.pool.list('gemini') if email and a.get('email') == email), None)
+        email = (info.get('email') or jwt_claims(t.get('id_token')).get('email') or (extra or {}).get('email') or '').strip()
+        email_key = email.lower()
+        existing = self.pool.list('gemini')
+        same = next((a for a in existing if email_key and (a.get('email') or '').strip().lower() == email_key), None)
+        if same is None and not email_key and source == 'local':
+            same = next((a for a in existing if a.get('source') == 'local'), None)
         a = same or self.pool.add('gemini', source=source, email=email, label=email or 'Gemini 号', status='pending')
         cred = dict(refresh_token=t['refresh_token'], access_token=t['access_token'], expiry=t['expiry'], client_id=t['client_id'],
                     email=email, added=time.time())

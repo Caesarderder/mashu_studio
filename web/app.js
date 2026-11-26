@@ -410,7 +410,7 @@ function liveText(ch) {
   if (!l) return '';
   if (l.waiting) return '等待接收';
   if (l.health) return `⚠️ ${l.health_note || (l.health === 'stuck' ? '可能卡住' : 'API 报错')}`;
-  const base = l.tool ? `正在用 ${toolName(l.tool)}` : (l.text ? '正在写回复' : '思考中');
+  const base = l.tool ? `正在用 ${toolName(l.tool)}` : (l.text ? '正在写回复' : (l.tools_total ? `思考中 · 已执行 ${l.tools_total} 步` : '思考中'));
   return l.stalled_min >= STALL_HINT_MIN ? `${base} · ${l.stalled_min} 分钟没动静` : base;
 }
 // 卡住 / API 报错时，侧栏圆点和状态显示真实原因，而不是一直「执行中」
@@ -1131,8 +1131,13 @@ function liveHtml(l) {
   const st = liveText(current);
   const mine = channelMessages(current).filter((x) => x.sender === 'executive');
   const got = mine.length ? firstLine(mine[mine.length - 1].text, 80) : '';
-  const tools = detailOn ? [] : liveTools[current] || [];
-  const shown = tools.slice(-8);
+  const hasServerTools = Array.isArray(l.tools) && l.tools.length > 0;
+  const shown = detailOn ? [] : (hasServerTools
+    ? l.tools.slice(-8).map((t) => ({ name: toolName(t.name), detail: t.detail || '', state: t.state || 'done' }))
+    : (liveTools[current] || []).slice(-8).map((t) => ({ name: t.name, detail: '', state: t.done ? 'done' : 'doing' })));
+  const totalTools = hasServerTools ? Math.max(l.tools_total || 0, shown.length) : (liveTools[current] || []).length;
+  const lvIcon = (s) => s === 'doing' ? icon('loader', 14, 'spin') : (s === 'error' ? icon('x', 14) : icon('check', 14));
+  const lvSt = (s) => s === 'doing' ? '进行中' : (s === 'error' ? '出错' : '已完成');
   return `<div class="msg ${l.role} live" id="liveMsg">${avOf(m)}<div class="body">
     <div class="who"><b>${esc(name)}</b><span class="sep">·</span><span>${l.waiting ? '排队中' : '正在执行'}</span>${l.waiting ? '' : `<span class="sep">·</span><a class="term-link" data-screen title="看它的终端画面">看终端</a>`}</div>
     <div class="bubble live-card">
@@ -1140,8 +1145,8 @@ function liveHtml(l) {
       <div class="lv-title"><span>${esc(st)}</span><span class="dots"><i></i><i></i><i></i></span>
         ${l.waiting ? '' : `<button class="live-stop" data-interrupt title="打断这一轮，会话不关">${icon('stop', 11)}打断 <span class="kbd">Esc</span></button>`}</div>
       ${got ? `<div class="lv-got">收到：${esc(got)}</div>` : ''}
-      ${shown.length ? `<div class="lv-tools">${tools.length > shown.length ? `<div class="lv-more">前面还用过 ${tools.length - shown.length} 次工具</div>` : ''}${shown.map((t) =>
-        `<div class="lv-tool ${t.done ? 'done' : 'doing'}">${t.done ? icon('check', 14) : icon('loader', 14, 'spin')}<b>${esc(t.name)}</b><span>${t.done ? '已完成' : '进行中'}</span></div>`).join('')}</div>` : ''}
+      ${shown.length ? `<div class="lv-tools">${totalTools > shown.length ? `<div class="lv-more">前面还用过 ${totalTools - shown.length} 次工具</div>` : ''}${shown.map((t) =>
+        `<div class="lv-tool ${t.state}">${lvIcon(t.state)}<b>${esc(t.name)}</b>${t.detail ? `<code>${esc(t.detail)}</code>` : ''}<span>${lvSt(t.state)}</span></div>`).join('')}</div>` : ''}
       ${l.text ? `<div class="lv-text">${md(l.text)}</div>` : ''}
     </div></div></div>`;
 }
@@ -1200,6 +1205,13 @@ function detailHtml(d) {
   const cwd = (ws.current_dir || st.cwd || '').replace(/^\/Users\/[^/]+/, '~');
   const chip = (k, v, t = '') => v === '' || v == null ? '' : `<span class="sd-chip" ${t ? `title="${esc(t)}"` : ''}><i>${esc(k)}</i>${esc(v)}</span>`;
   const lim = (k, x) => x && x.used_percentage != null ? chip(k, `${Math.round(x.used_percentage)}%`, resetIn(x.resets_at)) : '';
+  const limChips = d.provider === 'gemini'
+    ? [L.remaining != null ? chip('额度', `剩 ${Math.round(L.remaining * 100)}%`,
+        [L.low_model ? `最低 ${L.low_model}` : '', L.reset ? resetText(L.reset) : ''].filter(Boolean).join(' · ')) : '']
+    : (d.provider === 'opencode'
+      ? [L.today != null ? chip('今日花费', `$${(+L.today).toFixed(2)}`, L.week != null ? `本周 $${(+L.week).toFixed(2)}` : '') : '',
+        L.week != null ? chip('本周花费', `$${(+L.week).toFixed(2)}`) : '']
+      : [lim('5h', L.five_hour), lim('7d', L.seven_day)]);
   const stat = [
     chip('模型', m.display_name || m.id || ''), chip('思考', (st.effort || {}).level || ''), d.code_mode ? chip('Code Mode', '开') : '',
     chip('目录', cwd, ws.project_dir || ''),
@@ -1207,7 +1219,7 @@ function detailHtml(d) {
     cost.total_cost_usd != null ? chip('花费', `$${(+cost.total_cost_usd).toFixed(2)}`) : '',
     cost.total_duration_ms != null ? chip('时长', fmtDur(cost.total_duration_ms / 1000), cost.total_api_duration_ms != null ? `API ${fmtDur(cost.total_api_duration_ms / 1000)}` : '') : '',
     cost.total_lines_added != null ? chip('改动', `+${cost.total_lines_added} / -${cost.total_lines_removed || 0} 行`) : '',
-    lim('5h', L.five_hour), lim('7d', L.seven_day),
+    ...limChips,
     chip('输出风格', (st.output_style || {}).name && st.output_style.name !== 'default' ? st.output_style.name : ''),
     chip('版本', st.version || ''),
   ].join('');
