@@ -6215,7 +6215,10 @@ def cmd_hook_prompt(args):
             out.append('[麻薯电脑秘书 · 状态文件]\n' + status_text(f, c['seq_key']))
     text = '\n\n'.join(x for x in out if x and x.strip())
     if text:
-        print(text)
+        if fmt == 'codex':
+            print(json.dumps({'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': text}}, ensure_ascii=False))
+        else:
+            print(text)
 
 
 _USAGE_AT = {}
@@ -6544,8 +6547,12 @@ def cmd_hook_session(args):
     if not c:
         return
     if not getattr(args, 'agy', False):
-        if hook_fmt(args) == 'codex':        # Codex 的 SessionStart 带 session_id / transcript_path：新会话在这里拿到会话 ID
+        if hook_fmt(args) == 'codex':        # Codex 的 SessionStart 带 session_id / transcript_path：新会话在这里拿到会话 ID；输出必须是 JSON
             note_session(conn, c, 'codex', payload.get('session_id'), payload.get('transcript_path'))
+            ctx = session_context(conn, c)
+            if ctx and ctx.strip():
+                print(json.dumps({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': ctx}}, ensure_ascii=False))
+            return
         print(session_context(conn, c))
         return
     # agy 没有 --append-system-prompt：新会话第一次 SessionStart 时把系统提示（launch 写的文件）作为系统消息注入

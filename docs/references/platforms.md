@@ -61,7 +61,7 @@ related:
   - `config.toml`：用户 config.toml 的副本（模型提供方、MCP、默认模型都一样），去掉 `hooks` / `plugins` / `marketplaces` / `projects` 这几节，末尾加麻薯的 hooks；用户的改了就重抄。工作目录的信任由麻薯写进这份副本（不然 TUI 会弹「Trust this folder?」）。
   - `auth.json`、`auth.lock`、`AGENTS.md`：软链接到用户的（登录共用；Codex 刷新令牌时写回同一个文件，锁也共用）。如果某天 `auth.json` 变成了普通文件，麻薯会提醒，删掉后下次启动重新链接。
   - `skills/caesar-docs`：麻薯的 docs skill。
-- **hooks**：`SessionStart`（matcher `startup|resume|clear|compact`）、`UserPromptSubmit`、`Stop`、`PreToolUse`（matcher `*`），命令是 `mashu hook-… --codex`。Codex 的 hook 输入输出和 Claude 同格式（`session_id`、`transcript_path`、`tool_input`、`last_assistant_message`；拒绝用 `hookSpecificOutput.permissionDecision=deny`）。内联 hooks 没在 `/hooks` 里点过信任，所以带 `--dangerously-bypass-hook-trust`（它也会放行项目级 `.codex/hooks.json`，麻薯的工程里一般没有）。
+- **hooks**：`SessionStart`（matcher `startup|resume|clear|compact`）、`UserPromptSubmit`、`Stop`、`PreToolUse`（matcher `*`），命令是 `mashu hook-… --codex`。Codex 的 hook 输入和 Claude 同格式（`session_id`、`transcript_path`、`tool_input`、`last_assistant_message`），输出必须为合法 JSON（`SessionStart` / `UserPromptSubmit` 走 `hookSpecificOutput.additionalContext` 注入上下文与状态文件；`PreToolUse` 拒绝用 `hookSpecificOutput.permissionDecision=deny`）。内联 hooks 没在 `/hooks` 里点过信任，所以带 `--dangerously-bypass-hook-trust`（它也会放行项目级 `.codex/hooks.json`，麻薯的工程里一般没有）。
 - **工具名**：shell / `exec_command` 报成 `Bash`（`command`）；`apply_patch` 的 `command` 是补丁全文，麻薯拆出每个文件当 `Write` 检查（一个被拦就整次拦下）；`write_stdin` 往已开终端里打的字按 Bash 命令查。code mode（JS `exec` 里调工具）下内层的 exec_command / apply_patch 照样过 PreToolUse（实测）。
 - 用户自己的 `~/.codex/hooks.json`（Muxy、Tower 等）不进麻薯会话；用户手开的 Codex 不受麻薯 hooks 影响。
 
