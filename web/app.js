@@ -11,6 +11,7 @@ const reports = {};
 let live = {};   // 频道 → 正在进行的回复（SSE live 推送）
 let current = load('mashu.channel', MAIN);
 let view = load('mashu.view', 'chat');
+if (['board', 'decisions', 'library', 'budget'].includes(view)) view = 'chat';   // 这几页顶部不显示了：上次停在那里就回聊天
 let seen = loadJSON('mashu.seen', {});
 let collapsed = loadJSON('mashu.collapsed', { _cands: true });
 let query = '';
@@ -335,7 +336,7 @@ function renderTabs() {
   const n = (state.inbox || []).length;
   const d = state.decisions_pending || 0;
   const badge = (x, cls = '') => (x ? ` <span class="badge ${cls}">${x}</span>` : '');
-  const tab = (v, ic, t, extra = '') => { const b = document.querySelector(`[data-view="${v}"]`); const h = `${icon(ic, 16)}<span>${t}</span>${extra}`; if (b._html !== h) { b.innerHTML = h; b._html = h; } };
+  const tab = (v, ic, t, extra = '') => { const b = document.querySelector(`[data-view="${v}"]`); if (!b) return; const h = `${icon(ic, 16)}<span>${t}</span>${extra}`; if (b._html !== h) { b.innerHTML = h; b._html = h; } };
   tab('chat', 'chat', '聊天', badge(n, 'gold'));
   tab('mail', 'mail', '邮箱', badge(mailPending(), 'gold'));
   tab('board', 'board', '看板');
@@ -1930,6 +1931,7 @@ function renderWall() {
       <span class="meta">${esc(c.title)}</span><span class="tag">${pct(c.context_pct)}</span></div>
       <pre class="screen" id="scr-${c.id}"></pre></div>`).join('') || '<div class="empty">没有在运行的会话</div>'}</div>`;
   acctPoolLast = acctPoolHtml();
+  renderWall.ready = !!state.platforms;
   refreshScreens();
 }
 async function refreshScreens() {
@@ -2622,8 +2624,8 @@ document.documentElement.style.setProperty('--pw', `${panelW}px`);
   g.addEventListener('pointercancel', end);
 })();
 
-const VIEWS = [['chat', 'chat', '聊天'], ['mail', 'mail', '邮箱'], ['board', 'board', '看板'], ['wall', 'monitor', '会话监控'],
-  ['decisions', 'notebook', '决策记录'], ['library', 'library', '资料库'], ['budget', 'wallet', '用量'], ['selfiter', 'refresh', '自迭代']];
+// 顶部只留用户常看的几页（用户 2026-11-26：看板、决策记录、资料库、用量不显示）；这几页的视图代码还在，聊天里的文件链接、右栏「去看看」照样能打开
+const VIEWS = [['chat', 'chat', '聊天'], ['mail', 'mail', '邮箱'], ['wall', 'monitor', '会话监控'], ['selfiter', 'refresh', '自迭代']];
 let pal = { items: [], sel: 0 };
 function paletteItems() {
   const out = [];
@@ -2691,7 +2693,7 @@ document.addEventListener('keydown', (ev) => {
   if (mod && ev.key.toLowerCase() === 'k') { ev.preventDefault(); return $('#palette').hidden ? openPalette() : closePalette(); }
   if (mod && ev.key === '\\') { ev.preventDefault(); return togglePanel(); }
   if (mod && ev.key.toLowerCase() === 'j') { ev.preventDefault(); return nextPending(focusEl && /^card-/.test(focusEl) ? Number(focusEl.split('-')[1]) : 0); }
-  if (ev.altKey && /^Digit[1-8]$/.test(ev.code)) { ev.preventDefault(); return setView(VIEWS[Number(ev.code.slice(5)) - 1][0]); }
+  if (ev.altKey && /^Digit[1-8]$/.test(ev.code) && VIEWS[Number(ev.code.slice(5)) - 1]) { ev.preventDefault(); return setView(VIEWS[Number(ev.code.slice(5)) - 1][0]); }
   if (!typing && !mod && ev.key === '/') { ev.preventDefault(); if (view !== 'chat') setView('chat'); return $('#input').focus(); }
 });
 document.addEventListener('click', (ev) => {
@@ -2873,6 +2875,7 @@ async function refresh() {
       state = s;
       live = s.live || {};
       trackLive();
+      if (view === 'wall' && !renderWall.ready && state.platforms) renderWall();   // 第一次画时状态还没到（平台表、账号池是空的）：到了重画一次
       if (view === 'wall') {         // 账号池卡片跟着状态更新（额度、体检结果）；正在点按钮时不重画
         const ap = $('#acctPool'), h = acctPoolHtml();
         if (ap && h !== acctPoolLast && !ap.contains(document.activeElement)) { ap.outerHTML = h; acctPoolLast = h; }
