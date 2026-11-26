@@ -1827,7 +1827,7 @@ function acctPoolHtml() {
   const sec = (prov, title, hint, adds) => {
     const list = cliAccts(prov);
     return `<div class="ac-sec"><div class="ac-sh"><b>${title}</b><span class="hint-inline">${hint}</span></div>
-      ${list.length ? list.map(acctRow).join('') : `<div class="hint">还没有 ${title} 号：先「登记本机登录」，再加别的号</div>`}
+      ${list.length ? list.map(acctRow).join('') : `<div class="hint">${prov === 'gemini' ? '还没登记：点「登记 / 同步本机 agy 登录」' : `还没有 ${title} 号：先「登记本机登录」，再加别的号`}</div>`}
       <div class="ac-adds">${adds}</div></div>`;
   };
   return `<div class="defaults card-lite acct-pool" id="acctPool"><div class="df-h">${icon('wallet', 15)}<b>账号池</b><span class="hint-inline">Codex 开新会话时自动挑「状态正常、没禁用、额度剩得最多」的号，也可以在对话 ⚙ 或开工卡上指定；会话中途不换号。号由你自己提供，多号轮换有违反服务条款、被封号的风险</span></div>
