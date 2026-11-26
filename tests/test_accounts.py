@@ -475,35 +475,40 @@ class TestStudioPool(PlatBase):
         self.assertEqual(a['status'], 'ok')
         self.assertFalse((studio.codex_acct_home(a) / 'auth.json').is_symlink())
 
-    def test_gemini_switch_only_when_agy_idle(self):
+    def test_gemini_single_account(self):
+        """Gemini 只留单号（#157）：只跟着本机钥匙串的号续期、查额度；不能加第二个号、不能指定 / 自动挑号、不切号。"""
         kc = FakeKeychain({'token': {'refresh_token': RT1, 'access_token': 'ya29.old'}, 'auth_method': 'consumer'})
         g = acct.Gemini(self.p, 'agy-not-installed', keychain=kc, token_file=self.tmp / 'none')
         acct.write_json(self.p.root / 'gemini' / 'clients.json', dict(sig='', pairs=[[self.http.good_client, 'GOCSPX-good']]))
-        saved = (studio.gemini_ops, acct.agy_running)
-        self.addCleanup(lambda: (setattr(studio, 'gemini_ops', saved[0]), setattr(acct, 'agy_running', saved[1])))
+        saved = studio.gemini_ops
+        self.addCleanup(setattr, studio, 'gemini_ops', saved)
         studio.gemini_ops = lambda: g
-        g.import_local()
-        b = g.import_rt(RT2)
+        self.assertIn('g1@x.com', studio.account_action('import-local', dict(platform='gemini'))['result'])
+        self.assertEqual([a['id'] for a in self.p.list('gemini')], ['gm-1'])
+        for act, data in (('add-gemini-rt', dict(rt=RT2)), ('add-gemini-login', {}), ('activate', dict(id='gm-1')), ('relogin', dict(id='gm-1'))):
+            with self.assertRaises(ValueError) as cm:
+                studio.account_action(act, data)
+            self.assertIn('只管本机 agy 当前登录的这一个号', str(cm.exception))
+        with self.assertRaises(SystemExit):
+            studio.main(['account', 'add', 'gemini'])
+        self.assertEqual(len(self.p.list('gemini')), 1)
         cam = dict(id=1, role='assistant', film_id=None, seq_key=None, name='麻薯')
-        acct.agy_running = lambda: True
-        self.assertEqual(studio.gemini_switch_for(self.conn, cam, b), 'gm-1')     # 有 agy 在跑：不切，沿用当前号
+        self.assertEqual(studio.choose_account(self.conn, cam, 'gemini'), (None, ''))     # 不挑号
+        self.assertNotIn('account', studio.check_exec(dict(cli='gemini', account='gm-1')))
+        # 用户自己用 agy 换了号：体检时跟上，旧号删掉；钥匙串一次也没被麻薯写过
+        kc.value = {'token': {'refresh_token': RT2, 'access_token': 'ya29.new'}, 'auth_method': 'consumer'}
+        studio._ACCT_Q.clear()
+        res = dict(studio.accounts_check())
+        self.assertIn('已跟上', res['gm-2'])
+        self.assertEqual([(a['id'], a['email']) for a in self.p.list('gemini')], [('gm-2', 'g2@x.com')])
+        self.assertEqual(self.p.default('gemini')['id'], 'gm-2')
         self.assertEqual(kc.writes, 0)
-        self.assertTrue(studio.one(self.conn, 'SELECT id FROM messages WHERE text LIKE "%有 agy 会话在跑%"'))
-        acct.agy_running = lambda: False
-        self.assertEqual(studio.gemini_switch_for(self.conn, cam, b), 'gm-2')
-        self.assertEqual(kc.writes, 1)
-        self.assertEqual(kc.value['token']['refresh_token'], RT2)
         studio._ACCT_Q.clear()
         lim = studio.collect_limits()
         self.assertTrue(lim['gemini']['available'])
-        self.assertEqual(lim['gemini']['account'], 'gm-2')                       # 显示钥匙串当前的号
+        self.assertEqual(lim['gemini']['account'], 'gm-2')
         self.assertAlmostEqual(lim['gemini']['remaining'], 0.25)
         self.assertNotIn(RT2, json.dumps(studio.cli_accounts(), default=str))
-        studio.meta_set(self.conn, 'pref:assistant', json.dumps({'gacct': 'gm-1'}))
-        a, why = studio.choose_account(self.conn, studio.camera(self.conn, studio.active_assistant(self.conn)['id'])
-                                       if studio.active_assistant(self.conn) else dict(cam, role='assistant'), 'gemini')
-        self.assertEqual((a['id'], why), ('gm-1', '指定'))
-
 
 if __name__ == '__main__':
     unittest.main()

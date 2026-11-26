@@ -1865,7 +1865,9 @@ def codex_home():
 
 
 # ---------- 账号池（#4）：Codex / Gemini 多账号，见 mashu/accounts.py、docs/references/platforms.md「账号池」----------
-ACCT_KEY = dict(codex='xacct', gemini='gacct')        # 对话偏好（pref:<频道>）里指定号的键
+ACCT_KEY = dict(codex='xacct')        # 对话偏好（pref:<频道>）里指定号的键。Gemini 只留单号（#157），不能指定 / 自动挑号
+GEMINI_SINGLE = ('Gemini 只管本机 agy 当前登录的这一个号（续期 + 额度），不加第二个号、不切号：'
+                 'Google 在封第三方工具走 Antigravity 登录、多号轮换的号（#156 / #157）。要换号请自己在终端运行 agy 登录，麻薯会自动跟上')
 ACCOUNTS_THREADED = True                              # 测试里设 False：体检同步跑
 _ACCT_JOB = {}
 _ACCT_Q = {}
@@ -1969,6 +1971,14 @@ def accounts_check(force=False, only=None):
         return []
     res = []
     busy = None
+    if p.list('gemini') and not only:      # Gemini 单号：钥匙串里换了号就跟上（不是麻薯切的，是用户自己用 agy 登录的）
+        try:
+            g = gemini_ops()
+            if not g.active_id() and ((g.kc.read() or {}).get('token') or {}).get('refresh_token'):
+                b = gemini_sync_local()
+                res.append((b['id'], f'ok（本机 agy 换成了 {b.get("email")}，已跟上）'))
+        except acct.AccountError as exc:
+            res.append(('gemini', f'同步本机登录失败：{exc}'))
     for a in p.list():
         if only and a['id'] != only:
             continue
@@ -2095,9 +2105,22 @@ def ensure_local_account(platform):
     if any(a.get('source') == 'local' for a in pool().list(platform)):
         return None
     try:
-        return codex_import_local() if platform == 'codex' else gemini_ops().import_local()
+        return codex_import_local() if platform == 'codex' else gemini_sync_local()
     except acct.AccountError:
         return None
+
+
+def gemini_sync_local():
+    """Gemini 单号（#157）：池里只留本机 agy 当前登录（钥匙串）这一个号。钥匙串换了号（用户自己用 agy 重新登录）就换成新的，旧的删掉。"""
+    g = gemini_ops()
+    b = g.import_local()
+    p = pool()
+    for x in p.list('gemini'):
+        if x['id'] != b['id']:
+            p.remove(x['id'])
+    p.set_default('gemini', b['id'])
+    _ACCT_Q.pop('gemini-active', None)
+    return p.get(b['id'])
 
 
 def codex_login_home(a):
@@ -2234,9 +2257,11 @@ def account_action(action, data=None):
         raise ValueError(f'没有这个号：{aid}')
     if action == 'list':
         return dict(accounts=cli_accounts())
+    if action in ('add-gemini-rt', 'add-gemini-login', 'activate') or (action == 'relogin' and a and a['platform'] == 'gemini'):
+        raise ValueError(GEMINI_SINGLE)
     if action == 'import-local':
         plat_ = data.get('platform')
-        b = codex_import_local() if plat_ == 'codex' else gemini_ops().import_local() if plat_ == 'gemini' else None
+        b = codex_import_local() if plat_ == 'codex' else gemini_sync_local() if plat_ == 'gemini' else None
         if not b:
             raise ValueError('platform 只能是 codex / gemini')
         return dict(result=f'已登记本机 {PROV_LABEL[plat_]} 的登录：{account_label(b)}')
@@ -2549,12 +2574,9 @@ def agy_cmd(conn, c, cwd, sid, as_file, no_prompt):
     if sid:
         cmd += ['--conversation', sid]
         meta_set(conn, f'provider:{sid}', 'gemini')
-    else:               # 账号池：新会话按规则挑号，钥匙串里不是它就全局切（有 agy 在跑就不切）；恢复会话不换号
-        a, why = choose_account(conn, c, 'gemini')
-        used = gemini_switch_for(conn, c, a) if a else None
-        meta_set(conn, f'camacct:{c["id"]}', used or '')
-        if a:
-            log_event(conn, 'account-pick', c, provider='gemini', account=a['id'], used=used or '', why=why)
+    else:               # 账号池：Gemini 只留单号（#157），不挑号、不切号；只记下这个会话用的是钥匙串里的哪个号
+        cur = next((a['id'] for a in cli_accounts('gemini') if a.get('active')), '')
+        meta_set(conn, f'camacct:{c["id"]}', cur)
     if not no_prompt:
         cmd += ['-i', as_file('prompt', c['prompt'] or '开工')]
     return cmd, sid
@@ -7383,7 +7405,7 @@ def cmd_account(args):
     if act == 'list':
         accs = cli_accounts(args.target if args.target in acct.PLATFORMS else None)
         if not accs:
-            print('账号池是空的：mashu account import-local codex|gemini 登记本机登录，mashu account add codex|gemini 加号')
+            print('账号池是空的：mashu account import-local codex|gemini 登记本机登录，mashu account add codex 加 Codex 号')
             return
         for pl in acct.PLATFORMS:
             sub_ = [a for a in accs if a['platform'] == pl]
@@ -7410,23 +7432,8 @@ def cmd_account(args):
             print(f'已加号：{account_label(b)}')
             return
         if args.target == 'gemini':
-            if args.login:
-                ensure_local_account('gemini')
-                b = gemini_ops().oauth_login(lambda url: print(f'在浏览器打开这个链接，用要加的谷歌账号授权（10 分钟内）：\n{url}', flush=True))
-                print(f'已加号：{account_label(b)}')
-                return
-            if args.rt_file:
-                fp = Path(args.rt_file).expanduser()
-                if fp.stat().st_mode & 0o077:
-                    print(f'提醒：{fp} 别人也能读，用完删掉或 chmod 600')
-                rt = fp.read_text().strip()
-            elif not sys.stdin.isatty():
-                rt = sys.stdin.read().strip()
-            else:
-                raise ValueError('RT 从 --rt-file <0600 文件> 或标准输入给（不要写在命令行参数里）；或用 --login 走网页授权')
-            print(account_action('add-gemini-rt', dict(rt=rt))['result'])
-            return
-        raise ValueError('mashu account add codex [--device] | gemini (--rt-file F | --login | 从标准输入读 RT)')
+            raise ValueError(GEMINI_SINGLE + '；登记本机当前登录用 mashu account import-local gemini')
+        raise ValueError('mashu account add codex [--device]（Gemini 只登记本机当前登录：mashu account import-local gemini）')
     if act == 'import-local':
         print(account_action('import-local', dict(platform=args.target))['result'])
         return
@@ -7513,7 +7520,7 @@ def main(argv=None):
     s.add_argument('--account', help='归哪个账号（项目有 .mashu/accounts.json 时；不写按 accounts.json 的 features / 改动范围推）')
     s.add_argument('--workdir', help='执行者的工作目录：工程文件夹里已存在的子目录（相对路径）；不写就是工程根目录。项目适配器开功能时也可能自己设')
     s.add_argument('--cli', choices=PROVIDERS, help='执行者用哪家 CLI（不写 = 执行者默认）；开工审批卡上用户可以再改')
-    s.add_argument('--cli-account', help='执行者用账号池里哪个号（cx-2、gm-1…；要配 --cli codex / gemini，不写 = 自动选号）')
+    s.add_argument('--cli-account', help='执行者用账号池里哪个 Codex 号（cx-2…；要配 --cli codex，不写 = 自动选号）')
     s.add_argument('--model', help='执行者的模型（该 CLI 的模型名，mashu platforms 可查；不写 = 默认）')
     s.add_argument('--effort', choices=EFFORTS, help='执行者的思考程度（不写 = 默认）')
     s = sub.add_parser('playbook', aliases=['workflow'], help='工作流（可复用流程）')
@@ -7578,12 +7585,10 @@ def main(argv=None):
         s.add_argument('--agy', action='store_true', help='Gemini（agy）调用：输入输出用 agy 的格式')
         s.add_argument('--codex', action='store_true', help='Codex 调用（格式同 Claude，工具名不同）')
         s.add_argument('--opencode', action='store_true', help='麻薯的 OpenCode 插件调用')
-    s = sub.add_parser('account', help='账号池：Codex / Gemini 多账号（list / add / import-local / check / refresh / default / disable / enable / remove / activate）')
-    s.add_argument('action', choices=['list', 'add', 'import-local', 'check', 'refresh', 'default', 'disable', 'enable', 'remove', 'activate'])
+    s = sub.add_parser('account', help='账号池：Codex 多账号；Gemini 只管本机当前登录的一个号（list / add / import-local / check / refresh / default / disable / enable / remove）')
+    s.add_argument('action', choices=['list', 'add', 'import-local', 'check', 'refresh', 'default', 'disable', 'enable', 'remove'])
     s.add_argument('target', nargs='?', help='add / import-local：codex 或 gemini；其余：号 ID（cx-1、gm-2…）')
     s.add_argument('--device', action='store_true', help='Codex：用设备码登录（不在本机浏览器里登录时用）')
-    s.add_argument('--rt-file', help='Gemini：RT 所在的文件（建议 0600，用完删掉）；不给就从标准输入读')
-    s.add_argument('--login', action='store_true', help='Gemini：走 Antigravity 的网页授权加号')
     s = sub.add_parser('platforms', help='各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型，--check 跑一遍安全拦截自检')
     s.add_argument('--check', action='store_true')
     s = sub.add_parser('opencode-models', help='OpenCode 可选模型；--refresh 跑 opencode models --verbose 更新缓存')

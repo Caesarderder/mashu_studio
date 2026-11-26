@@ -86,12 +86,14 @@ related:
 - **Codex**：来自 rollout 会话记录（`state/codex-home/sessions` 与 `~/.codex/sessions`）中 `token_count` 事件携带的 `rate_limits` 字段（`primary` 为 5 小时 300 分钟窗口，`secondary` 为周 10080 分钟窗口）。只读扫描最新 rollout 文件。
 - **OpenCode**：按量付费，从本地 `~/.local/share/opencode/opencode.db` 只读汇总今日（0 点起）与本周（周一 0 点起）的会话花费（`cost`）。
 - **Gemini（agy）**：agy CLI 自己不报额度；账号池里有 Gemini 号时，麻薯用它的 RT 换 access_token 调 Code Assist 的 `fetchAvailableModels`，显示各模型里剩得最少的比例（见下节「账号池」）。没导入号时显示「无额度数据」。
-- **账号池**：Codex、Gemini 显示默认号（Gemini 是钥匙串当前的号）的数字，名字后面标「N号」，悬停列出所有号。
+- **账号池**：Codex 显示默认号的数字，多号时名字后面标「N号」，悬停列出所有号；Gemini 只有本机当前登录这一个号。
 - **服务端节流与缓存**：`studio.read_limits()` 对各平台只读汇总，内存缓存 60 秒，避免前端轮询频繁扫盘或开库；Claude 收到新状态栏时立即失效缓存。
 
 ## 账号池（#4 4-account-pool）
 
-麻薯自己管多个 Codex、Gemini（agy）账号：加号、续期、按号额度、开会话自动挑号或手动指定。Claude、OpenCode 不在范围内。代码：`mashu/accounts.py`（纯逻辑，网络走可替换的 `HTTP`）+ `studio.py` 的「账号池」一节；网页在「会话监控 → 账号池」；命令 `mashu account …`。
+麻薯自己管多个 Codex 账号：加号、续期、按号额度、开会话自动挑号或手动指定。Gemini（agy）只管本机当前登录的**一个号**：续期 + 额度。Claude、OpenCode 不在范围内。
+
+> **Gemini 为什么不做多号 / 切号**（用户 2026-11-26 定，#156 / #157）：Google 的 Antigravity 条款第 6 条把「用第三方软件、工具接入」算违约，可停用 Antigravity / Gemini CLI 账号；2026-02 起一直在封走第三方工具（OpenClaw、OpenCode、CLIProxyAPI 等）用 Antigravity 登录的号，11 月又有一波（403 `TOS_VIOLATION`，有报告整个 Google 账号被停、申诉只有一次机会），第三方整理还点名「多账号自动轮换」「把 agy -p 包在第三方 agent 里」。所以 Gemini 的加第二个号、自动挑号、全局切号入口都关了（`account_action` 直接拒绝，网页 / 命令行没有入口；`accounts.Gemini` 里的导入 RT、网页授权、写钥匙串的代码留着但调不到）。要换 Gemini 号：用户自己在终端运行 agy 登录，麻薯体检时发现钥匙串换了号就跟上（`gemini_sync_local`，旧号记录删掉）。要让第三方工具用 Gemini，走 AI Studio / Vertex 的 API key。代码：`mashu/accounts.py`（纯逻辑，网络走可替换的 `HTTP`）+ `studio.py` 的「账号池」一节；网页在「会话监控 → 账号池」；命令 `mashu account …`。
 
 ### 存放（`state/accounts/`，目录 0700、文件 0600）
 
@@ -104,17 +106,17 @@ related:
 
 - 本机默认号：Codex 的「本机」号**不复制**，就是 `state/codex-home`（`auth.json` 软链接到 `~/.codex/auth.json`），由 Codex 自己续期；Gemini 的「本机」号是钥匙串里那个 RT 的副本（Google 的 RT 续期不换新，两边都能用）。
 - 第一次往池里加号时，先把本机当前登录登记进来（`ensure_local_account`），不然自动选号用不到它。
-- 令牌只在 `auth.json` / `cred.json` / 钥匙串里；网页、接口、日志、报错一律经 `mask()`（前 4 位 + …）/ `redact()`。网页「粘贴 RT」只发给本机服务；命令行的 RT 只从 `--rt-file` 或标准输入读，不从参数传（会进 shell 历史）。
+- 令牌只在 `auth.json` / `cred.json` / 钥匙串里；网页、接口、日志、报错一律经 `mask()`（前 4 位 + …）/ `redact()`。
 
 ### 加号
 
 | | 命令行 | 网页（会话监控 → 账号池） |
 | --- | --- | --- |
 | Codex | `mashu account add codex [--device]`（前台跑 `CODEX_HOME=<号目录> codex login`） | 「加号（设备码）」显示 `https://auth.openai.com/codex/device` + 一次性码（点了才生成，15 分钟有效）；「加号（本机浏览器）」在本机浏览器打开登录页。后台任务读 `codex login` 的输出，完成后自动登记 |
-| Gemini | `mashu account add gemini --rt-file <文件>`（或标准输入）；`--login` 走网页授权 | 「粘贴 RT 导入」；「网页授权加号」（本地 127.0.0.1 回调 + PKCE，用 agy 的 OAuth 客户端） |
-| 本机 | `mashu account import-local codex|gemini` | 「登记本机登录」/「导入本机 agy 登录」 |
+| Gemini | 不能加号（#157） | 只有「登记 / 同步本机 agy 登录」 |
+| 本机 | `mashu account import-local codex|gemini` | 「登记本机登录」/「登记 / 同步本机 agy 登录」 |
 
-- Gemini 导入 RT 时先换一次 access_token 校验、取邮箱、查额度；同一个邮箱已经在池里就更新它的 RT。RT 必须是 Antigravity 的 OAuth 客户端签发的（agy 二进制里有三组候选，实测本机 RT 只有其中一组认）；Gemini CLI 的 `~/.gemini/oauth_creds.json` 是另一个客户端，**待确认**，大概率不行。
+- Gemini 登记本机登录时先用钥匙串里的 RT 换一次 access_token 校验、取邮箱、查额度。RT 必须是 Antigravity 的 OAuth 客户端签发的（agy 二进制里有三组候选，实测本机 RT 只有其中一组认）；Gemini CLI 的 `~/.gemini/oauth_creds.json` 是另一个客户端，**待确认**，大概率不行。
 - Codex 同一个号（邮箱 + 账户 ID 都一样）再登录一次会被拒（池里已有）。
 
 ### 续期与体检（调度器每 60 秒起一轮后台体检，各号再按 10 / 30 分钟节流；网页「体检」立即做）
@@ -125,10 +127,10 @@ related:
 
 ### 选号与切号（只在新会话开工时选，会话中途不换号）
 
-- 优先级：对话 ⚙ 里指定的号（`pref:<频道>` 的 `xacct` / `gacct`）> 功能开工时定的（`state.json` 的 `exec.account`，开工卡上的「账号」下拉；`mashu new-feature … --cli codex --cli-account cx-2`）> 自动。
-- 自动（`accounts.pick`）：状态正常、没禁用的号里额度用得最少的（Codex 取 5 小时和本周里大的那个；Gemini 取各模型剩余比例最小的；未知按 0），用满（≥100%）的排最后，一样多时默认号优先。指定的号不能用（禁用 / 撤销 / 被删）就改为自动并记日志。池里这个平台没有号就按以前的单号行为。
+- 优先级（Codex）：对话 ⚙ 里指定的号（`pref:<频道>` 的 `xacct`）> 功能开工时定的（`state.json` 的 `exec.account`，开工卡上的「账号」下拉；`mashu new-feature … --cli codex --cli-account cx-2`）> 自动。
+- 自动（`accounts.pick`，只用于 Codex）：状态正常、没禁用的号里额度用得最少的（取 5 小时和本周里大的那个；未知按 0），用满（≥100%）的排最后，一样多时默认号优先。指定的号不能用（禁用 / 撤销 / 被删）就改为自动并记日志。池里这个平台没有号就按以前的单号行为。
 - Codex：会话的 `CODEX_HOME=<该号目录>`，每个号互相隔离，几个执行者可以同时用不同的号。rollout、额度、恢复会话都在所有号目录里找（`codex_homes()` / `plat.find_codex_session`）；恢复会话回到 rollout 所在的那个号目录。
-- Gemini：agy 全机只认钥匙串（服务 `gemini`、账户 `antigravity`，值 `go-keyring-base64:` + base64 JSON `{token{access_token,token_type,refresh_token,expiry,expires_in},auth_method,id_token_email}`）里的一个登录，所以是**全局切号**：新会话要的号不是钥匙串当前的号时，只在**没有运行中的 agy 进程**（麻薯的、用户手开的都算，`pgrep`）时写钥匙串（`security -i` 走标准输入，令牌不进命令行参数）；有 agy 在跑就沿用当前号并在对话里提示。备用文件 `~/.gemini/jetski-standalone-oauth-token` 存在时按原格式同步改，不存在不建。网页「切到本机」可以手动切。
+- Gemini：agy 全机只认钥匙串（服务 `gemini`、账户 `antigravity`，值 `go-keyring-base64:` + base64 JSON `{token{access_token,token_type,refresh_token,expiry,expires_in},auth_method,id_token_email}`）里的一个登录，麻薯**不切号**（#157）：Gemini 会话一律用钥匙串当前的号，只记下 `camacct:<机位>`。（曾实现过「没有 agy 在跑时写钥匙串全局切号」，代码 `Gemini.activate` / `gemini_switch_for` 留着但不再调用。）
 - **`JETSKI_OAUTH_TOKEN` 不能按会话注入账号**（agy 1.5.15 实测 2026-11-26）：设成一个无效的 access token 跑 `agy -p`，结果和不设完全一样（照常走钥匙串里的登录），说明这个变量不会覆盖钥匙串，所以 Gemini 没法像 Codex 那样按会话隔离。
 - 每次开会话记 `camacct:<机位>`；网页 ⚙ 悬停显示现在的会话用的是哪个号；正在被会话用的号不能删。
 
@@ -139,7 +141,7 @@ related:
 
 ### 回滚
 
-删掉 `state/accounts/` 就回到以前的单号行为：Codex 会话用 `state/codex-home`（软链接 `~/.codex/auth.json` 不变），Gemini 用钥匙串里当前的登录。在用池里号的 Codex 会话恢复时找不到原号目录，会退回 `state/codex-home`。Gemini 切过号的话，钥匙串里留的是最后切到的号：用 agy 自己重新登录，或删池之前先「切到本机」切回本机号。
+删掉 `state/accounts/` 就回到以前的单号行为：Codex 会话用 `state/codex-home`（软链接 `~/.codex/auth.json` 不变），Gemini 用钥匙串里当前的登录（麻薯从不改钥匙串）。在用池里号的 Codex 会话恢复时找不到原号目录，会退回 `state/codex-home`。
 
 ### 风险
 

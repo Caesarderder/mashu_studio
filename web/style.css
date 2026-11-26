@@ -1467,8 +1467,6 @@ details.sd-sec summary { cursor: pointer; }
 .ac-job a { word-break: break-all; }
 .ac-code { font-size: 15px; font-weight: 700; letter-spacing: 1px; padding: 1px 6px; border-radius: 6px; background: var(--hover, rgba(127,127,127,.1)); }
 .ac-out { width: 100%; max-height: 120px; overflow: auto; font-size: 11px; margin: 0; white-space: pre-wrap; color: var(--muted); }
-.ac-modal { display: flex; flex-direction: column; gap: 10px; min-width: min(560px, 80vw); }
-.ac-modal input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--text); font-family: var(--mono, ui-monospace, monospace); }
 .q-n { font-style: normal; font-size: 10px; color: var(--faint); margin-left: 3px; }
 @media (max-width: 900px) { .ac-row { grid-template-columns: 40px 1fr auto; } .ac-q, .ac-t { grid-column: 2 / -1; } .ac-acts { grid-column: 1 / -1; justify-content: flex-start; } }
 

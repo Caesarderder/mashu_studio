@@ -724,7 +724,7 @@ function prefOf(ch, role) {
     dmk: (prov) => (ex && (ex.cli || 'claude') === prov && ex.model) || (d[platOf(prov).default_key] || {})[role] || '' };
 }
 const PROV_CN = { claude: 'Claude', gemini: 'Gemini', codex: 'Codex', opencode: 'OpenCode' };
-const ACCT_PREF = { codex: 'xacct', gemini: 'gacct' };      // 对话偏好里指定账号池号的键
+const ACCT_PREF = { codex: 'xacct' };      // 对话偏好里指定账号池号的键（Gemini 只留单号，不能指定：#157）
 // 平台表（后端 platforms_view）：能不能选、不能选的原因、模型列表、对话偏好里的模型键
 function plats() {
   return state.platforms || [
@@ -1804,12 +1804,10 @@ function acctRow(a) {
     <span class="ac-q">${acctQuota(a)}</span>
     <span class="ac-t" title="最近续期 / 体检">${a.last_refresh ? `续期 ${ago(a.last_refresh)}前` : ''}${a.last_check ? ` · 体检 ${ago(a.last_check)}前` : ''}</span>
     <span class="ac-acts">
-      ${a.default ? '' : btn('default', '设为默认', '没指定号、额度又差不多时优先用它；左下角显示默认号的额度')}
-      ${a.platform === 'gemini' && !a.active ? btn('activate', '切到本机', '把本机 agy 的登录（钥匙串）换成这个号；有 agy 在跑时不让切') : ''}
+      ${a.default || a.platform === 'gemini' ? '' : btn('default', '设为默认', '没指定号、额度又差不多时优先用它；左下角显示默认号的额度')}
       ${btn('check', '体检', a.platform === 'gemini' ? '用 RT 续期并查一次额度' : '读登录状态；池里的号超过 7 天没续期会用 RT 续一次')}
       ${a.platform === 'codex' && a.source !== 'local' ? btn('relogin', '重新登录', '在这个号目录里重新跑 codex login（设备码）') : ''}
-      ${a.platform === 'gemini' && ['revoked', 'refresh_failed'].includes(a.status) ? btn('relogin', '重新授权', '网页授权：用同一个谷歌账号登录，更新它的 RT') : ''}
-      ${btn(a.disabled ? 'enable' : 'disable', a.disabled ? '启用' : '禁用', a.disabled ? '重新参与自动选号' : '自动选号不再选它（指定了也会改为自动）')}
+      ${a.platform === 'gemini' ? '' : btn(a.disabled ? 'enable' : 'disable', a.disabled ? '启用' : '禁用', a.disabled ? '重新参与自动选号' : '自动选号不再选它（指定了也会改为自动）')}
       ${btn('remove', '删除', a.source === 'local' && a.platform === 'codex' ? '只取消登记，不动 ~/.codex 里你自己的登录' : '删掉这个号的登录文件和记录', 'danger')}
     </span></div>`;
 }
@@ -1832,16 +1830,14 @@ function acctPoolHtml() {
       ${list.length ? list.map(acctRow).join('') : `<div class="hint">还没有 ${title} 号：先「登记本机登录」，再加别的号</div>`}
       <div class="ac-adds">${adds}</div></div>`;
   };
-  return `<div class="defaults card-lite acct-pool" id="acctPool"><div class="df-h">${icon('wallet', 15)}<b>账号池</b><span class="hint-inline">开新会话时自动挑「状态正常、没禁用、额度剩得最多」的号，也可以在对话 ⚙ 或开工卡上指定；会话中途不换号。号由你自己提供，多号轮换有违反服务条款、被封号的风险</span></div>
+  return `<div class="defaults card-lite acct-pool" id="acctPool"><div class="df-h">${icon('wallet', 15)}<b>账号池</b><span class="hint-inline">Codex 开新会话时自动挑「状态正常、没禁用、额度剩得最多」的号，也可以在对话 ⚙ 或开工卡上指定；会话中途不换号。号由你自己提供，多号轮换有违反服务条款、被封号的风险</span></div>
     <div id="acctJob">${acctJobHtml()}</div>
     ${sec('codex', 'Codex', '每个号一个独立的 CODEX_HOME，几个执行者可以同时用不同的号；本机默认号和 ~/.codex 共用登录（不复制，避免 RT 轮换掉登录）',
       `<button class="btn small primary" data-acct-add="codex-device" title="打开 OpenAI 的设备登录页，输入一次性码（码在点了以后才生成，15 分钟有效）">${icon('plus', 13)}加号（设备码）</button>
        <button class="btn small" data-acct-add="codex-browser" title="在本机浏览器里打开 OpenAI 登录页（codex login）">${icon('plus', 13)}加号（本机浏览器）</button>
        <button class="btn small" data-acct-add="codex-local" title="把 ~/.codex 里你自己的登录登记成默认号（只登记，不复制）">登记本机登录</button>`)}
-    ${sec('gemini', 'Gemini（agy）', 'agy 全机只认钥匙串里的一个登录：开新会话要换号时，只在没有 agy 在跑时切，有就沿用当前号',
-      `<button class="btn small primary" data-acct-add="gemini-rt" title="粘贴 Antigravity 签发的 Refresh Token（例如从 Cockpit Tools 导出的）">${icon('plus', 13)}粘贴 RT 导入</button>
-       <button class="btn small" data-acct-add="gemini-login" title="用 Antigravity 的网页授权登录一个谷歌账号">${icon('plus', 13)}网页授权加号</button>
-       <button class="btn small" data-acct-add="gemini-local" title="把本机 agy 现在的登录（钥匙串）登记进来">导入本机 agy 登录</button>`)}
+    ${sec('gemini', 'Gemini（agy）', '只管本机 agy 当前登录的这一个号：后台用 RT 续期、查额度；不加第二个号、不切号（Google 在封第三方工具走 Antigravity 登录、多号轮换的号）。要换号就自己在终端运行 agy 重新登录，麻薯会自动跟上',
+      `<button class="btn small" data-acct-add="gemini-local" title="把本机 agy 现在的登录（钥匙串）登记进来；已经登记过的会换成现在这个号">登记 / 同步本机 agy 登录</button>`)}
   </div>`;
 }
 async function acctApi(body) {
@@ -1874,37 +1870,19 @@ async function acctStartJob(body, platform) {
   if (box) box.innerHTML = acctJobHtml();
   setTimeout(acctPoll, 800);
 }
-function acctRtModal() {
-  openModal(`<div class="ac-modal"><h3>粘贴 Gemini（Antigravity）的 RT</h3>
-    <p class="hint">RT 只发给本机的麻薯服务，存进 <code>state/accounts/gemini/&lt;号&gt;/cred.json</code>（0600），页面和日志里只显示前 4 位。必须是 Antigravity 签发的 RT（Cockpit Tools 导出的就是）；Gemini CLI 的 <code>~/.gemini/oauth_creds.json</code> 里的大概率不行。</p>
-    <input type="password" id="acRt" placeholder="1//0…" autocomplete="off" spellcheck="false">
-    <div class="df-acts"><button class="btn primary" data-acct-rtgo>${icon('check', 14)}校验并导入</button><button class="btn" data-close>取消</button>
-      <span class="hint-inline">会先用它换一次 access_token、取邮箱、查额度</span></div></div>`);
-  setTimeout(() => $('#acRt')?.focus(), 50);
-}
 document.addEventListener('click', async (ev) => {
   const add = ev.target.closest('[data-acct-add]'), act = ev.target.closest('[data-acct-act]');
-  const go = ev.target.closest('[data-acct-rtgo]'), jc = ev.target.closest('[data-acct-jobcancel]'), jx = ev.target.closest('[data-acct-jobclose]');
-  if (!add && !act && !go && !jc && !jx) return;
-  const b = add || act || go || jc || jx;
+  const jc = ev.target.closest('[data-acct-jobcancel]'), jx = ev.target.closest('[data-acct-jobclose]');
+  if (!add && !act && !jc && !jx) return;
+  const b = add || act || jc || jx;
   if (jx) { acctJob = null; localStorage.removeItem('mashu.acctjob'); $('#acctJob').innerHTML = ''; return; }
   b.disabled = true;
   try {
     if (jc) { await acctApi({ action: 'cancel', job: acctJob && acctJob.id }); return; }
-    if (go) {
-      const rt = ($('#acRt').value || '').trim();
-      if (!rt) return toast('先粘贴 RT');
-      b.textContent = '校验中…';
-      await acctApi({ action: 'add-gemini-rt', rt });
-      $('#acRt').value = '';
-      closeModal(); await acctRefresh(); return;
-    }
     if (add) {
       const k = add.dataset.acctAdd;
-      if (k === 'gemini-rt') return acctRtModal();
       if (k === 'codex-local' || k === 'gemini-local') { await acctApi({ action: 'import-local', platform: k.split('-')[0] }); await acctRefresh(); return; }
       if (k === 'codex-device' || k === 'codex-browser') return await acctStartJob({ action: 'add-codex', device: k === 'codex-device' }, 'codex');
-      if (k === 'gemini-login') return await acctStartJob({ action: 'add-gemini-login' }, 'gemini');
     }
     if (act) {
       const a = act.dataset.acctAct, id = act.dataset.acct;
