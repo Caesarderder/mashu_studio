@@ -332,7 +332,7 @@ td.num { font-family: var(--mono); font-size: 12px; text-align: right; }
 .seg button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 h2 { font-family: var(--serif); font-size: 20px; font-weight: 600; margin: 0 0 12px; }
 .view h3 { font-family: var(--serif); font-size: 15px; font-weight: 600; margin: 18px 0 10px; }
-.toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--main); padding: 9px 16px; border-radius: 10px; opacity: 0; transition: .25s; z-index: 60; pointer-events: none; }
+.toast { position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--main); padding: 9px 16px; border-radius: 10px; opacity: 0; transition: .25s; z-index: 60; pointer-events: none; }
 .toast.show { opacity: 1; transform: translateX(-50%); }
 
 /* ---------- 资料库 ---------- */
@@ -659,7 +659,7 @@ th { background: var(--card-2); }
 .modal-box { box-shadow: var(--shadow-lg); animation: pop .22s var(--ease); }
 @keyframes pop { from { opacity: 0; transform: translateY(8px) scale(.98); } }
 .toast { border-radius: 12px; box-shadow: var(--shadow-lg); display: flex; gap: 10px; align-items: center; padding: 10px 16px; }
-.toast.action { pointer-events: auto; }
+.toast.action.show { pointer-events: auto; }   /* 只在显示时可点；淡出后不能再挡住下面的输入框 */
 .toast button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 3px 10px; font-size: 12.5px; }
 
 /* Cmd+K 命令面板 */
