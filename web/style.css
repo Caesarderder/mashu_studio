@@ -1441,7 +1441,26 @@ details.sd-sec summary { cursor: pointer; }
 .df-r.all { color: var(--accent); font-weight: 600; }
 .df-acts { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; }
 
-/* 账号池（#4）：会话监控里的「账号池」卡片 */
+/* 账号池（#4）：顶部「账号池」标签页 */
+#acctPage { max-width: 1180px; }
+.vd-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 14px; margin: 10px 0 14px; }
+.vd-card { border: 1px solid var(--line); border-radius: 12px; background: var(--card); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.vd-h { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+.vd-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.vd-q { display: flex; flex-direction: column; gap: 4px; }
+.vd-qr { display: grid; grid-template-columns: 150px minmax(80px, 1fr) 70px auto; gap: 8px; align-items: center; font-size: 12.5px; }
+.vd-qr > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.vd-bar { display: block; height: 6px; border-radius: 3px; background: var(--hover, rgba(127,127,127,.12)); overflow: hidden; }
+.vd-bar > i { display: block; height: 100%; background: var(--green); }
+.vd-bar.mid > i { background: var(--amber); } .vd-bar.hi > i { background: var(--red); }
+.vd-qr b.mid { color: var(--amber); } .vd-qr b.hi { color: var(--red); }
+.vd-unk { grid-column: 2 / -1; }
+#vd-codex .ac-q { visibility: hidden; }
+.vd-models summary { cursor: pointer; font-size: 12.5px; color: var(--muted); margin: 4px 0; }
+.vd-rules { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.8; color: var(--muted); }
+.vd-card .ac-row { grid-template-columns: 46px minmax(140px, 1.4fr) 64px minmax(110px, 1fr) auto; }
+.vd-card .ac-row .ac-t { display: none; }
+.vd-card .ac-row.one { grid-template-columns: 46px 1fr auto; }
 .acct-pool .ac-sec { display: flex; flex-direction: column; gap: 4px; padding-top: 6px; border-top: 1px dashed var(--line); }
 .ac-sh { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 13px; }
 .ac-row { display: grid; grid-template-columns: 46px minmax(160px, 1.4fr) 72px minmax(130px, 1fr) minmax(120px, .9fr) auto; gap: 8px; align-items: center;

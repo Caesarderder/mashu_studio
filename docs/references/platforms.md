@@ -91,9 +91,9 @@ related:
 
 ## 账号池（#4 4-account-pool）
 
-麻薯自己管多个 Codex 账号：加号、续期、按号额度、开会话自动挑号或手动指定。Gemini（agy）只管本机当前登录的**一个号**：续期 + 额度。Claude、OpenCode 不在范围内。
+麻薯自己管多个 Codex 账号：加号、续期、按号额度、开会话自动挑号或手动指定。Gemini（agy）只管本机当前登录的**一个号**：续期 + 额度。Claude、OpenCode 不在范围内（「账号池」标签只显示它们的登录和额度 / 花费）。代码：`mashu/accounts.py`（纯逻辑，网络走可替换的 `HTTP`）+ `studio.py` 的「账号池」一节；网页在顶部「账号池」标签（各家账号、额度、加号 / 导入、全部体检）；命令 `mashu account …`。
 
-> **Gemini 为什么不做多号 / 切号**（用户 2026-11-26 定，#156 / #157）：Google 的 Antigravity 条款第 6 条把「用第三方软件、工具接入」算违约，可停用 Antigravity / Gemini CLI 账号；2026-02 起一直在封走第三方工具（OpenClaw、OpenCode、CLIProxyAPI 等）用 Antigravity 登录的号，11 月又有一波（403 `TOS_VIOLATION`，有报告整个 Google 账号被停、申诉只有一次机会），第三方整理还点名「多账号自动轮换」「把 agy -p 包在第三方 agent 里」。所以 Gemini 的加第二个号、自动挑号、全局切号入口都关了（`account_action` 直接拒绝，网页 / 命令行没有入口；`accounts.Gemini` 里的导入 RT、网页授权、写钥匙串的代码留着但调不到）。要换 Gemini 号：用户自己在终端运行 agy 登录，麻薯体检时发现钥匙串换了号就跟上（`gemini_sync_local`，旧号记录删掉）。要让第三方工具用 Gemini，走 AI Studio / Vertex 的 API key。代码：`mashu/accounts.py`（纯逻辑，网络走可替换的 `HTTP`）+ `studio.py` 的「账号池」一节；网页在「会话监控 → 账号池」；命令 `mashu account …`。
+> **Gemini 为什么不做多号 / 切号**（用户 2026-11-26 定，#156 / #157）：Google 的 Antigravity 条款第 6 条把「用第三方软件、工具接入」算违约，可停用 Antigravity / Gemini CLI 账号；2026-02 起一直在封走第三方工具（OpenClaw、OpenCode、CLIProxyAPI 等）用 Antigravity 登录的号，11 月又有一波（403 `TOS_VIOLATION`，有报告整个 Google 账号被停、申诉只有一次机会），第三方整理还点名「多账号自动轮换」「把 agy -p 包在第三方 agent 里」。所以 Gemini 的加第二个号、自动挑号、全局切号入口都关了（`account_action` 直接拒绝，网页 / 命令行没有入口；`accounts.Gemini` 里的导入 RT、网页授权、写钥匙串的代码留着但调不到）。要换 Gemini 号：用户自己在终端运行 agy 登录，麻薯体检时发现钥匙串换了号就跟上（`gemini_sync_local`，旧号记录删掉）。要让第三方工具用 Gemini，走 AI Studio / Vertex 的 API key。
 
 ### 存放（`state/accounts/`，目录 0700、文件 0600）
 
@@ -110,9 +110,9 @@ related:
 
 ### 加号
 
-| | 命令行 | 网页（会话监控 → 账号池） |
+| | 命令行 | 网页（「账号池」标签） |
 | --- | --- | --- |
-| Codex | `mashu account add codex [--device]`（前台跑 `CODEX_HOME=<号目录> codex login`） | 「加号（设备码）」显示 `https://auth.openai.com/codex/device` + 一次性码（点了才生成，15 分钟有效）；「加号（本机浏览器）」在本机浏览器打开登录页。后台任务读 `codex login` 的输出，完成后自动登记 |
+| Codex | `mashu account add codex [--device]`（前台跑 `CODEX_HOME=<号目录> codex login`） | 「账号池」标签：「加号（设备码）」显示 `https://auth.openai.com/codex/device` + 一次性码（点了才生成，15 分钟有效）；「加号（本机浏览器）」在本机浏览器打开登录页。后台任务读 `codex login` 的输出，完成后自动登记 |
 | Gemini | 不能加号（#157） | 只有「登记 / 同步本机 agy 登录」 |
 | 本机 | `mashu account import-local codex|gemini` | 「登记本机登录」/「登记 / 同步本机 agy 登录」 |
 

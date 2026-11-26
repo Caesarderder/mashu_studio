@@ -1931,6 +1931,24 @@ def cli_accounts(platform=None):
     return out
 
 
+def vendor_info():
+    """账号池页的「各家」：Claude 用本机 claude 的登录（只读 ~/.claude.json 里的账号信息，不含令牌），Codex / Gemini 看账号池，
+    OpenCode 按量付费。缓存 5 分钟。"""
+    hit = _ACCT_Q.get('vendors')
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    out = {}
+    try:
+        o = json.loads((Path.home() / '.claude.json').read_text()).get('oauthAccount') or {}
+        out['claude'] = dict(email=o.get('emailAddress') or '', org=o.get('organizationName') or '', org_type=o.get('organizationType') or '',
+                             tier=o.get('organizationRateLimitTier') or '', billing=o.get('billingType') or '')
+    except (OSError, ValueError, AttributeError):
+        out['claude'] = {}
+    out['opencode'] = dict(installed=bool(shutil.which(cfg('opencode') or 'opencode')))
+    _ACCT_Q['vendors'] = (time.time(), out)
+    return out
+
+
 def choose_account(conn, c, prov):
     """新会话用池里哪个号：对话里指定的 > 功能开工时定的（exec.account）> 自动（额度剩得最多）。
     返回 (号 或 None, 原因)；池里这个平台没有号就是 (None, '')，按以前的单号行为开会话。"""
@@ -2257,6 +2275,9 @@ def account_action(action, data=None):
         raise ValueError(f'没有这个号：{aid}')
     if action == 'list':
         return dict(accounts=cli_accounts())
+    if action == 'check-all':
+        res = accounts_check(force=True)
+        return dict(result='；'.join(f'{x}：{r}' for x, r in res) or '账号池是空的')
     if action in ('add-gemini-rt', 'add-gemini-login', 'activate') or (action == 'relogin' and a and a['platform'] == 'gemini'):
         raise ValueError(GEMINI_SINGLE)
     if action == 'import-local':
@@ -6704,7 +6725,7 @@ def status_data(conn):
         decisions_pending=one(conn, 'SELECT COUNT(*) n FROM decisions WHERE status="待追认"')['n'],
         self_iterate_pending=selfiter_call('pending_count', conn, default=0),
         tmux=session_name(), stage_names=STAGES, approval_ttl_hours=cfg('approval_ttl_hours'),
-        live=live_replies(conn), limits=read_limits(), cli_accounts=cli_accounts(),
+        live=live_replies(conn), limits=read_limits(), cli_accounts=cli_accounts(), vendors=vendor_info(),
         prefs={r['k'][5:]: json.loads(r['v'] or '{}') for r in rows(conn, 'SELECT k, v FROM meta WHERE k LIKE "pref:%"')},
         pref_defaults=dict(models=cfg('models') or {}, efforts=cfg('efforts') or {}, codes=cfg('code_modes') or {},
                            providers=cfg('providers') or {}, gmodels=cfg('gemini_models') or {},

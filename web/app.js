@@ -325,6 +325,7 @@ function setView(v, noHash) {
   if (v === 'mail') renderMail();
   if (v === 'board') renderBoard();
   if (v === 'wall') renderWall();
+  if (v === 'accounts') renderAccounts();
   if (v === 'decisions') renderDecisions();
   if (v === 'budget') renderBudget();
   if (v === 'library') renderLibrary();
@@ -341,6 +342,7 @@ function renderTabs() {
   tab('mail', 'mail', '邮箱', badge(mailPending(), 'gold'));
   tab('board', 'board', '看板');
   tab('wall', 'monitor', '会话监控');
+  tab('accounts', 'wallet', '账号池');
   tab('decisions', 'notebook', '决策记录', badge(d, 'dim'));
   tab('library', 'library', '资料库');
   tab('budget', 'wallet', '用量');
@@ -1773,7 +1775,7 @@ document.addEventListener('click', async (ev) => {
 });
 // ---------- 账号池（#4）：Codex / Gemini 多账号。令牌只在「粘贴 RT」时发给本机服务，页面上不显示 ----------
 let acctJob = loadJSON('mashu.acctjob', null);
-let acctPoolLast = '';       // 正在进行的网页登录：{ id, platform }
+       // 正在进行的网页登录：{ id, platform }
 function cliAccts(prov) { return (state.cli_accounts || []).filter((a) => !prov || a.platform === prov); }
 function acctName(a) { return a ? (a.label || a.email || a.id) : ''; }
 function acctQuota(a) {
@@ -1823,22 +1825,59 @@ function acctJobHtml() {
     ${done || bad ? '<button class="btn small" data-acct-jobclose>知道了</button>' : '<button class="btn small" data-acct-jobcancel>取消</button>'}
     ${j.output && !done && !j.url ? `<pre class="ac-out">${esc(j.output.slice(-600))}</pre>` : ''}</div>`;
 }
-function acctPoolHtml() {
-  const sec = (prov, title, hint, adds) => {
-    const list = cliAccts(prov);
-    return `<div class="ac-sec"><div class="ac-sh"><b>${title}</b><span class="hint-inline">${hint}</span></div>
-      ${list.length ? list.map(acctRow).join('') : `<div class="hint">${prov === 'gemini' ? '还没登记：点「登记 / 同步本机 agy 登录」' : `还没有 ${title} 号：先「登记本机登录」，再加别的号`}</div>`}
-      <div class="ac-adds">${adds}</div></div>`;
-  };
-  return `<div class="defaults card-lite acct-pool" id="acctPool"><div class="df-h">${icon('wallet', 15)}<b>账号池</b><span class="hint-inline">Codex 开新会话时自动挑「状态正常、没禁用、额度剩得最多」的号，也可以在对话 ⚙ 或开工卡上指定；会话中途不换号。号由你自己提供，多号轮换有违反服务条款、被封号的风险</span></div>
+// 账号池页（顶部「账号池」标签）：各家的账号、额度、加号 / 导入、体检和选号规则
+function vendCard(id, title, sub, body, acts = '') {
+  return `<section class="vd-card" id="vd-${id}"><div class="vd-h"><b>${title}</b>${sub ? `<span class="hint-inline">${sub}</span>` : ''}</div>${body}${acts ? `<div class="ac-adds">${acts}</div>` : ''}</section>`;
+}
+function quotaBars(rows) {
+  return `<div class="vd-q">${rows.map(([label, pctUsed, tip]) => {
+    if (pctUsed == null) return `<div class="vd-qr"><span>${esc(label)}</span><span class="q-dim vd-unk">${esc(tip || '未知')}</span></div>`;
+    const p = Math.max(0, Math.min(100, Math.round(pctUsed))), cls = p >= 90 ? 'hi' : p >= 70 ? 'mid' : '';
+    return `<div class="vd-qr" title="${esc(tip || '')}"><span>${esc(label)}</span><i class="vd-bar ${cls}"><i style="width:${p}%"></i></i><b class="${cls}">已用 ${p}%</b><span class="q-dim">${esc(tip || '')}</span></div>`;
+  }).join('')}</div>`;
+}
+function acctPageHtml() {
+  const L = state.limits || {}, V = state.vendors || {}, cl = L.claude || {}, oc = L.opencode || {};
+  const ce = V.claude || {};
+  const rst = (w) => (w && w.resets_at ? resetText(w.resets_at) : '');
+  const claude = vendCard('claude', 'Claude', '用本机 claude 的登录（Claude 订阅）；麻薯不管 Claude 账号，要换号在终端里运行 claude 再 /login',
+    `<div class="ac-row one"><span class="ac-id">本机</span><span class="ac-name">${esc(ce.email || '（没读到登录信息）')}${ce.org_type ? ` <i class="ac-plan">${esc(ce.org_type.replace(/^claude_/, ''))}</i>` : ''}</span>
+      <span class="ac-st acs-ok">${ce.email ? '已登录' : ''}</span></div>
+     ${quotaBars([['5 小时', cl.five_hour ? cl.five_hour.used_percentage : null, cl.five_hour ? rst(cl.five_hour) : '等受管会话的状态栏报上来'],
+                  ['本周', cl.seven_day ? cl.seven_day.used_percentage : null, cl.seven_day ? rst(cl.seven_day) : '等受管会话的状态栏报上来']])}`);
+  const cx = cliAccts('codex');
+  const codex = vendCard('codex', 'Codex', '每个号一个独立的 CODEX_HOME，几个执行者可以同时用不同的号；本机号和 ~/.codex 共用登录（不复制，避免 RT 轮换掉登录）',
+    (cx.length ? cx.map(acctRow).join('') : '<div class="hint">还没有 Codex 号：先「登记本机登录」，再加别的号</div>')
+    + cx.filter((a) => a.quota).map((a) => `<div class="vd-sub">${esc(acctName(a))}</div>` + quotaBars([
+      ['5 小时', a.quota.five_hour ? a.quota.five_hour.used_percentage : null, rst(a.quota.five_hour)],
+      ['本周', a.quota.seven_day ? a.quota.seven_day.used_percentage : null, rst(a.quota.seven_day)]])).join(''),
+    `<button class="btn small primary" data-acct-add="codex-device" title="打开 OpenAI 的设备登录页，输入一次性码（码在点了以后才生成，15 分钟有效）">${icon('plus', 13)}加号（设备码）</button>
+     <button class="btn small" data-acct-add="codex-browser" title="在本机浏览器里打开 OpenAI 登录页（codex login）">${icon('plus', 13)}加号（本机浏览器）</button>
+     <button class="btn small" data-acct-add="codex-local" title="把 ~/.codex 里你自己的登录登记成默认号（只登记，不复制）">登记本机登录</button>`);
+  const gm = cliAccts('gemini'), g = gm[0], gq = (g && g.quota) || {};
+  const gemini = vendCard('gemini', 'Gemini（agy）', '只管本机 agy 当前登录的这一个号：后台用 RT 续期、查额度；不加第二个号、不切号（Google 在封第三方工具走 Antigravity 登录、多号轮换的号）。要换号就自己在终端运行 agy 重新登录，麻薯会自动跟上',
+    (g ? acctRow(g) : '<div class="hint">还没登记：点「登记 / 同步本机 agy 登录」</div>')
+    + ((gq.models || []).length ? `<details class="vd-models"><summary>各模型剩余额度（${gq.models.length} 个，最低的是 ${esc(gq.low_model || '')}）</summary>${quotaBars(gq.models.map((m) => [m.name, (1 - m.remaining) * 100, m.reset ? resetText(m.reset) : '']))}</details>` : ''),
+    `<button class="btn small" data-acct-add="gemini-local" title="把本机 agy 现在的登录（钥匙串）登记进来；已经登记过的会换成现在这个号">登记 / 同步本机 agy 登录</button>`);
+  const opencode = vendCard('opencode', 'OpenCode', '按量付费，没有账号额度；提供方和密钥在 OpenCode 自己的配置里',
+    oc.today != null || oc.week != null ? `<div class="vd-q"><div class="vd-qr"><span>今日花费</span><b class="vd-unk">$${Number(oc.today || 0).toFixed(2)}</b></div><div class="vd-qr"><span>本周花费</span><b class="vd-unk">$${Number(oc.week || 0).toFixed(2)}</b></div></div>`
+      : `<div class="hint">${V.opencode && V.opencode.installed === false ? '没装 OpenCode' : '还没有花费数据'}</div>`);
+  const rules = vendCard('rules', '选号与体检', '',
+    `<ul class="vd-rules"><li><b>Codex 选号</b>：对话 ⚙ 里指定的号 &gt; 开工卡上定的号 &gt; 自动（状态正常、没禁用、额度剩得最多；一样多时默认号优先）。只在新会话开工时选，会话中途不换号。</li>
+      <li><b>体检</b>：后台每 10 分钟（Gemini）/ 30 分钟（Codex）一次：Gemini 快过期前用 RT 续期并查额度；Codex 读登录状态，麻薯自己持有的号超过 7 天没续期就续一次（本机号让 Codex 自己续）。</li>
+      <li><b>令牌</b>：只存在 <code>state/accounts/</code>（0600）和各自的登录文件里，页面和日志里不显示。删掉 <code>state/accounts/</code> 就回到单号。</li>
+      <li><b>风险</b>：号由你自己提供；多号轮换可能违反服务条款、有封号风险（Gemini 因此只留单号）。</li></ul>`,
+    `<button class="btn small" data-acct-checkall title="马上给所有号体检一次（续期 + 查额度）">${icon('refresh', 13)}全部体检</button>`);
+  return `<div id="acctPage"><h2>账号池</h2><p class="hint">各家 CLI 用的账号和额度。Codex 可以放多个号轮着用；Gemini、Claude 用本机当前的登录；OpenCode 按量付费。</p>
     <div id="acctJob">${acctJobHtml()}</div>
-    ${sec('codex', 'Codex', '每个号一个独立的 CODEX_HOME，几个执行者可以同时用不同的号；本机默认号和 ~/.codex 共用登录（不复制，避免 RT 轮换掉登录）',
-      `<button class="btn small primary" data-acct-add="codex-device" title="打开 OpenAI 的设备登录页，输入一次性码（码在点了以后才生成，15 分钟有效）">${icon('plus', 13)}加号（设备码）</button>
-       <button class="btn small" data-acct-add="codex-browser" title="在本机浏览器里打开 OpenAI 登录页（codex login）">${icon('plus', 13)}加号（本机浏览器）</button>
-       <button class="btn small" data-acct-add="codex-local" title="把 ~/.codex 里你自己的登录登记成默认号（只登记，不复制）">登记本机登录</button>`)}
-    ${sec('gemini', 'Gemini（agy）', '只管本机 agy 当前登录的这一个号：后台用 RT 续期、查额度；不加第二个号、不切号（Google 在封第三方工具走 Antigravity 登录、多号轮换的号）。要换号就自己在终端运行 agy 重新登录，麻薯会自动跟上',
-      `<button class="btn small" data-acct-add="gemini-local" title="把本机 agy 现在的登录（钥匙串）登记进来；已经登记过的会换成现在这个号">登记 / 同步本机 agy 登录</button>`)}
-  </div>`;
+    <div class="vd-grid">${claude}${codex}${gemini}${opencode}</div>${rules}</div>`;
+}
+let acctPageLast = '';
+function renderAccounts() {
+  const el = $('#view-accounts');
+  if (!el) return;
+  acctPageLast = acctPageHtml();
+  el.innerHTML = acctPageLast;
 }
 async function acctApi(body) {
   const d = await api('/api/accounts', body);
@@ -1847,8 +1886,7 @@ async function acctApi(body) {
 }
 async function acctRefresh() {
   await refresh();
-  const el = $('#acctPool');
-  if (el) el.outerHTML = acctPoolHtml();
+  if (view === 'accounts') renderAccounts();
 }
 async function acctPoll() {
   if (!acctJob) return;
@@ -1872,13 +1910,14 @@ async function acctStartJob(body, platform) {
 }
 document.addEventListener('click', async (ev) => {
   const add = ev.target.closest('[data-acct-add]'), act = ev.target.closest('[data-acct-act]');
-  const jc = ev.target.closest('[data-acct-jobcancel]'), jx = ev.target.closest('[data-acct-jobclose]');
-  if (!add && !act && !jc && !jx) return;
-  const b = add || act || jc || jx;
+  const jc = ev.target.closest('[data-acct-jobcancel]'), jx = ev.target.closest('[data-acct-jobclose]'), ca = ev.target.closest('[data-acct-checkall]');
+  if (!add && !act && !jc && !jx && !ca) return;
+  const b = add || act || jc || jx || ca;
   if (jx) { acctJob = null; localStorage.removeItem('mashu.acctjob'); $('#acctJob').innerHTML = ''; return; }
   b.disabled = true;
   try {
     if (jc) { await acctApi({ action: 'cancel', job: acctJob && acctJob.id }); return; }
+    if (ca) { b.textContent = '体检中…'; await acctApi({ action: 'check-all' }); await acctRefresh(); return; }
     if (add) {
       const k = add.dataset.acctAdd;
       if (k === 'codex-local' || k === 'gemini-local') { await acctApi({ action: 'import-local', platform: k.split('-')[0] }); await acctRefresh(); return; }
@@ -1902,13 +1941,12 @@ function acctOpts(prov, cur) {
 function renderWall() {
   const el = $('#view-wall');
   const cams = state.cameras.filter((c) => c.state !== 'queued');
-  el.innerHTML = `<h2>会话监控</h2>${defaultsHtml()}${acctPoolHtml()}
+  el.innerHTML = `<h2>会话监控</h2>${defaultsHtml()}
     <p class="hint">所有在运行会话的实时终端，2 秒刷新。要接管：终端里 <code>tmux attach -t ${esc(state.tmux)}</code>，麻薯在 <code>desk</code> 窗口，每个项目一个 <code>film-&lt;id&gt;</code> 窗口（Ctrl-b w 选窗口，Ctrl-b z 放大窗格，Ctrl-b d 退出不停止）。</p>
     <div class="wall">${cams.map((c) => `<div class="tile"><div class="th" data-zoom="${c.id}">
       ${c.role === 'assistant' ? mashuAv('av sm', camLight(c)) : letterAv(c.name, 'av sm', camLight(c))}
       <span class="meta">${esc(c.title)}</span><span class="tag">${pct(c.context_pct)}</span></div>
       <pre class="screen" id="scr-${c.id}"></pre></div>`).join('') || '<div class="empty">没有在运行的会话</div>'}</div>`;
-  acctPoolLast = acctPoolHtml();
   renderWall.ready = !!state.platforms;
   refreshScreens();
 }
@@ -2603,7 +2641,7 @@ document.documentElement.style.setProperty('--pw', `${panelW}px`);
 })();
 
 // 顶部只留用户常看的几页（用户 2026-11-26：看板、决策记录、资料库、用量不显示）；这几页的视图代码还在，聊天里的文件链接、右栏「去看看」照样能打开
-const VIEWS = [['chat', 'chat', '聊天'], ['mail', 'mail', '邮箱'], ['wall', 'monitor', '会话监控'], ['selfiter', 'refresh', '自迭代']];
+const VIEWS = [['chat', 'chat', '聊天'], ['mail', 'mail', '邮箱'], ['wall', 'monitor', '会话监控'], ['accounts', 'wallet', '账号池'], ['selfiter', 'refresh', '自迭代']];
 let pal = { items: [], sel: 0 };
 function paletteItems() {
   const out = [];
@@ -2854,9 +2892,9 @@ async function refresh() {
       live = s.live || {};
       trackLive();
       if (view === 'wall' && !renderWall.ready && state.platforms) renderWall();   // 第一次画时状态还没到（平台表、账号池是空的）：到了重画一次
-      if (view === 'wall') {         // 账号池卡片跟着状态更新（额度、体检结果）；正在点按钮时不重画
-        const ap = $('#acctPool'), h = acctPoolHtml();
-        if (ap && h !== acctPoolLast && !ap.contains(document.activeElement)) { ap.outerHTML = h; acctPoolLast = h; }
+      if (view === 'accounts') {     // 账号池页跟着状态更新（额度、体检结果）；正在点按钮 / 展开时不重画
+        const ap = $('#view-accounts'), h = acctPageHtml();
+        if (ap && h !== acctPageLast && !ap.contains(document.activeElement) && !ap.querySelector('details[open]')) { ap.innerHTML = h; acctPageLast = h; }
       }
       if (m.messages.length) { messages = messages.concat(m.messages); lastId = messages[messages.length - 1].id; }
       const newMsgs = m.messages;
