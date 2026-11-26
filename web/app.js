@@ -1737,7 +1737,7 @@ function defaultsHtml() {
   const oc = platOf('opencode'), cx = platOf('codex');
   const nOver = Object.keys(state.prefs || {}).filter((k) => Object.keys(state.prefs[k] || {}).length).length;
   return `<div class="defaults card-lite"><div class="df-h">${icon('gear', 15)}<b>默认平台、模型与思考程度</b><span class="hint-inline">各角色新开或重开的会话用这里的设置；对话里单独选过的优先</span></div>
-    <div class="df-scroll"><div class="df-grid"><span></span><span class="df-th">平台</span>${plats().map((x) => `<span class="df-th" title="${esc(x.ok ? '' : x.reason)}">${esc(x.label)} 模型${x.ok ? '' : '（不可用）'}</span>`).join('')}<span class="df-th">思考程度</span><span class="df-th" title="只对 Claude 会话有效">Code Mode</span>
+    <div class="df-scroll"><div class="df-grid" style="grid-template-columns: auto repeat(${MK.length + 3}, minmax(92px, 1fr))"><span></span><span class="df-th">平台</span>${plats().map((x) => `<span class="df-th" title="${esc(x.ok ? '' : x.reason)}">${esc(x.label)} 模型${x.ok ? '' : '（不可用）'}</span>`).join('')}<span class="df-th">思考程度</span><span class="df-th" title="只对 Claude 会话有效">Code Mode</span>
       <span class="df-r all">全部统一</span>${psel('*', '')}${MK.map((k) => sel(k, '*', '')).join('')}${sel('efforts', '*', '')}${csel('*', '')}
       ${Object.keys(ROLE_CN).map((r) => `<span class="df-r">${ROLE_CN[r]}</span>${psel(r, P[r])}${MK.map((k) => sel(k, r, (d[k] || {})[r])).join('')}${sel('efforts', r, E[r])}${csel(r, C[r])}`).join('')}</div></div>
     <div class="hint">平台只对新开的会话生效，恢复会话沿用原来那家；灰掉的平台现在不能用（悬停看原因：没装，或版本没做过安全拦截实测）。Gemini 用本机的 Antigravity CLI（agy），要先在终端运行一次 <code>agy</code> 用谷歌账号登录；登录后点
