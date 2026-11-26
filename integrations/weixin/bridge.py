@@ -25,7 +25,7 @@ STUDIO_URL = 'http://127.0.0.1:' + os.environ.get('MASHU_PORT', '8770')
 ACCOUNT = json.loads((HOME / 'account.json').read_text())
 BASE = (ACCOUNT.get('baseurl') or 'https://ilinkai.weixin.qq.com').rstrip('/')
 OWNER = ACCOUNT['ilink_user_id']
-TOKEN_FILE = STUDIO_HOME / 'token'
+CONFIG_FILE = STUDIO_HOME / 'studio.json'
 DB = HOME / 'bridge.db'
 INFO = {'channel_version': '2.4.10', 'bot_agent': 'Mashu/1.0'}
 INTERVAL = 3
@@ -87,14 +87,19 @@ def weixin(endpoint, data, timeout=20):
     return result
 
 
+def load_web_token():
+    data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+    return str((data.get('web') or {}).get('token') or '').strip()
+
+
 def mashu(path, data=None):
-    token = TOKEN_FILE.read_text().strip()
+    token = load_web_token()
     return request(STUDIO_URL + path, data,
                    {'X-Mashu-Token': token, 'Content-Type': 'application/json'}, 15)
 
 
 def read_blob(path):
-    token = TOKEN_FILE.read_text().strip()
+    token = load_web_token()
     url = STUDIO_URL + '/api/blob?' + urllib.parse.urlencode({'path': path})
     req = urllib.request.Request(url, headers={'X-Mashu-Token': token})
     with urllib.request.urlopen(req, timeout=30) as response:

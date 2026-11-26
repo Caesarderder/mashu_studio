@@ -21,6 +21,7 @@ import traceback
 from urllib.parse import parse_qs, unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config_file as cfgfile  # noqa: E402
 import studio  # noqa: E402
 import mail  # noqa: E402
 
@@ -43,11 +44,8 @@ MSG_COLS = 'id, ts, sender, camera_id, camera_name, channel, film_id, seq_key, t
 
 def load_token():
     studio.HOME.mkdir(parents=True, exist_ok=True)
-    f = studio.HOME / 'token'
-    if not f.exists():
-        f.write_text(secrets.token_urlsafe(24))
-        f.chmod(0o600)
-    return f.read_text().strip()
+    studio.ensure_migrated()
+    return cfgfile.ensure_web_token(studio.HOME / 'studio.json')
 
 
 # ---------- 终端画面：ANSI → HTML ----------
@@ -366,6 +364,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({'error': str(exc)}, 400)
             except Exception as exc:
                 studio.log_event(studio.db(), 'error', level='error', where='POST /api/accounts',
+                                 err=studio.acct.redact(f'{type(exc).__name__}: {exc}')[:500])
+                return self.send_json({'error': studio.acct.redact(f'{type(exc).__name__}: {exc}')}, 500)
+        if url.path in ('/api/config/export', '/api/config/import'):
+            try:
+                data = self.body() or {}
+                with self.lock:
+                    if url.path == '/api/config/export':
+                        ws = bool(data.get('with_secrets'))
+                        pw = data.get('passphrase') or ''
+                        bundle = cfgfile.build_export_bundle(studio.HOME, with_secrets=ws, passphrase=pw or None)
+                        fname = f'mashu-config-{"secrets" if ws else "public"}-{studio.today()}.json'
+                        return self.send_json({'bundle': bundle, 'filename': fname, 'with_secrets': ws,
+                                               'warning': cfgfile.RT_ROTATION_WARNING if ws else ''})
+                    bundle = data.get('bundle')
+                    if bundle is None:
+                        raise ValueError('缺少要导入的配置内容')
+                    pw = data.get('passphrase') or None
+                    if data.get('dry_run') or not data.get('confirm'):
+                        return self.send_json({'preview': cfgfile.preview_import(studio.HOME, bundle, passphrase=pw), 'applied': False})
+                    res = cfgfile.apply_import(studio.HOME, bundle, passphrase=pw)
+                    studio._cfg_cache['mtime'] = None
+                    studio._ACCT_Q.clear()
+                    studio._LIMITS_CACHE['at'] = 0
+                    cnt = res['preview']['counts']
+                    studio.audit(studio.db(), 'executive', 'config-import', None, None,
+                                 f'导入主配置（新增 {cnt["add"]}，更新 {cnt["update"]}，跳过 {cnt["skip"]}）')
+                    return self.send_json(res)
+            except ValueError as exc:
+                return self.send_json({'error': studio.acct.redact(str(exc))}, 400)
+            except Exception as exc:
+                studio.log_event(studio.db(), 'error', level='error', where=f'POST {url.path}',
                                  err=studio.acct.redact(f'{type(exc).__name__}: {exc}')[:500])
                 return self.send_json({'error': studio.acct.redact(f'{type(exc).__name__}: {exc}')}, 500)
         try:

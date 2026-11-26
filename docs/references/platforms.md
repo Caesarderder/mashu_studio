@@ -9,10 +9,12 @@ source_of_truth:
   - mashu/studio.py
   - mashu/platforms.py
   - mashu/accounts.py
+  - mashu/config_file.py
   - integrations/opencode/mashu.js
 validated_by:
   - tests/test_platforms.py
   - tests/test_accounts.py
+  - tests/test_config_file.py
   - manual-real-session
 tags:
   - domain:mashu
@@ -95,14 +97,13 @@ related:
 
 > **Gemini 为什么不做多号 / 切号**（用户 2026-11-26 定，#156 / #157）：Google 的 Antigravity 条款第 6 条把「用第三方软件、工具接入」算违约，可停用 Antigravity / Gemini CLI 账号；2026-02 起一直在封走第三方工具（OpenClaw、OpenCode、CLIProxyAPI 等）用 Antigravity 登录的号，11 月又有一波（403 `TOS_VIOLATION`，有报告整个 Google 账号被停、申诉只有一次机会），第三方整理还点名「多账号自动轮换」「把 agy -p 包在第三方 agent 里」。所以 Gemini 的加第二个号、自动挑号、全局切号入口都关了（`account_action` 直接拒绝，网页 / 命令行没有入口；`accounts.Gemini` 里的导入 RT、网页授权、写钥匙串的代码留着但调不到）。要换 Gemini 号：用户自己在终端运行 agy 登录，麻薯体检时发现钥匙串换了号就跟上（`gemini_sync_local`，旧号记录删掉）。要让第三方工具用 Gemini，走 AI Studio / Vertex 的 API key。
 
-### 存放（`state/accounts/`，目录 0700、文件 0600）
+### 存放（#7 合并进主文件 `state/studio.json`，目录 0700、文件 0600）
 
 | 路径 | 内容 |
 | --- | --- |
-| `index.json` | 元数据：号 ID（`cx-N` / `gm-N`）、平台、邮箱、套餐、来源（`local` 本机 / `login` 登录 / `rt` 导入）、状态（正常 / 等登录 / 未登录 / 续期失败 / 已撤销）、禁用、最近额度、各平台默认号。**不含令牌** |
-| `codex/<号>/` | 这个号的完整 CODEX_HOME：config.toml 和 hooks 与 `state/codex-home` 同样生成（`build_codex_home(link_auth=False)`），`auth.json` 是这个号自己的 |
-| `gemini/<号>/cred.json` | RT、access_token、过期时间、邮箱、签发它的 OAuth 客户端 |
-| `gemini/clients.json` | 从 agy 二进制里扫出来的 Google OAuth 桌面客户端（按二进制路径 + 修改时间缓存，记住上次能用的那组） |
+| `state/studio.json` | 唯一主配置文件（0600，文件锁原子写）：`settings`、`defaults`、`accounts`（账号元数据 + Gemini RT/AT + 非本机 Codex `auth.json` + Gemini OAuth 客户端缓存）、`providers`、`web.token` |
+| `state/accounts/codex/<号>/` | 运行时 `CODEX_HOME`：`config.toml` 和 hooks 与 `state/codex-home` 同样生成；`auth.json` 开会话前由主文件生成，续期后的新 RT 同步回主文件 |
+| `state/backup/` | 迁移前旧文件（`token`、`accounts/index.json`、`accounts/gemini/*/cred.json`、`clients.json`）与导入前 `studio.json` 的备份 |
 
 - 本机默认号：Codex 的「本机」号**不复制**，就是 `state/codex-home`（`auth.json` 软链接到 `~/.codex/auth.json`），由 Codex 自己续期；Gemini 的「本机」号是钥匙串里那个 RT 的副本（Google 的 RT 续期不换新，两边都能用）。
 - 第一次往池里加号时，先把本机当前登录登记进来（`ensure_local_account`），不然自动选号用不到它。
@@ -141,11 +142,56 @@ related:
 
 ### 回滚
 
-删掉 `state/accounts/` 就回到以前的单号行为：Codex 会话用 `state/codex-home`（软链接 `~/.codex/auth.json` 不变），Gemini 用钥匙串里当前的登录（麻薯从不改钥匙串）。在用池里号的 Codex 会话恢复时找不到原号目录，会退回 `state/codex-home`。
+- 仅停用账号池：在主文件里清空 `accounts.items` 或用 `mashu account remove` 删除号后，Codex 会话退回 `state/codex-home`（软链接 `~/.codex/auth.json` 不变），Gemini 用钥匙串里当前的登录。
+- 整套主配置改动回滚见下节「主配置文件与导出导入」的回滚说明。
 
 ### 风险
 
 多号轮换躲额度可能违反 OpenAI / Google 的服务条款，有封号风险，号由用户自己提供、自己承担。Antigravity 的 OAuth 客户端是从 agy 二进制里扫出来的公开桌面客户端，Google 改了会跟着 agy 升级自动重扫；扫不到能用的就退回「先用 agy 自己登录，再导入本机」。
+
+## 主配置文件与导出导入（#7 7-one-config-file）
+
+### 1. 主文件结构（`state/studio.json`，0600）
+
+- `settings`：全局设置（并发槽、扫描根目录、端口、价格 `prices`、平台版本 `platform_versions` 等 `DEFAULTS` 键）。
+- `defaults`：各角色默认平台 / 模型 / 思考程度 / Code Mode（`providers`、`models`、`gemini_models`、`codex_models`、`opencode_models`、`efforts`、`code_modes`）。
+- `accounts`：账号池默认号（`defaults`）、账号清单及凭据（`items`：Gemini 的 RT/AT/过期时间，非本机 Codex 的 `auth.json` 内容；本机 Codex 号只记 `auth_ref: "local_cli"`，不复制 RT）、Gemini OAuth 客户端缓存（`gemini_clients`）。
+- `providers`：本机 CLI 引用标记与自定义 provider API key。
+- `web`：网页接口口令 `token`（原 `state/token`）。
+- **并发安全**：所有写入经过 `config_file.config_lock`（线程 `RLock` + 进程 `fcntl.flock`）和 `write_private`（同目录临时文件 `0600` + `fsync` + `os.replace`）。
+- **首次迁移**：`server.py` 启动、`mashu init`、访问账号池或 `mashu config migrate` 时自动执行（幂等）：把旧扁平 `studio.json`、`state/token`、`state/accounts/index.json`、`state/accounts/gemini/*/cred.json`、`clients.json` 合并进 `state/studio.json`，旧文件备份到 `state/backup/one-config-*` 后移除，代码不再读旧文件。
+
+### 2. 哪些东西不在主文件里
+
+- **本机 CLI 自己的登录存储**不搬家，主文件只记「来源：本机 CLI」：`~/.codex/auth.json`、macOS 钥匙串里的 Claude Code（`Claude Code-credentials`）和 agy（`gemini` / `antigravity`）、OpenCode 的 `~/.local/share/opencode/auth.json`。只在「带密钥导出」时把它们打进加密包，导入时再写回对应位置。
+- **运行时状态**留在 `state/studio.db`：每个对话 / 功能单独选的平台 / 模型 / 思考 / 账号（`meta` 表 `pref:*`）、项目与功能列表、消息、上报、用量统计。
+
+### 3. 导出与导入
+
+- **命令行**（口令走交互输入，不进命令行参数和日志）：
+  - 不带密钥导出（默认，可发同事）：`mashu config export --out config-public.json` — key / token / RT / 网页口令全部替换为「已省略」，账号仅保留平台、标签、邮箱。
+  - 带密钥导出（换电脑用）：`mashu config export --out config-secret.json --with-secrets` — 交互输入口令，整包加密（`0600`）。
+  - 导入预览（不写入）：`mashu config import config.json --dry-run`
+  - 导入写入：`mashu config import config.json`（显示差异后确认；写入前自动备份当前 `state/studio.json` 到 `state/backup/pre-import-*`；「已省略」项不覆盖本机已有值）。
+- **网页**：顶部「会话监控」页右上角提供「导出配置」（勾选「带密钥」）和「导入配置」（选文件后先预览差异再确认）。
+- **RT 轮换与防冲突**：Codex / Gemini 的 refresh_token 会轮换，带密钥导入新电脑后，旧电脑上的同号要停用，否则两边会互相顶掉登录；因此导入的账号默认标为「已禁用」，在新电脑确认旧电脑已停用后再手动启用。
+- **加密格式与离线解密**：纯 Python 标准库实现（`PBKDF2-HMAC-SHA256` 200,000 轮派生 64 字节密钥，前 32 字节用于 `SHA256-CTR` 解密 zlib 压缩明文，后 32 字节用于 `HMAC-SHA256` 校验 `b'mashu-cfg-v1' + salt + nonce + ciphertext`）。任意装有 Python 3 的电脑即可不依赖第三方库解密查看：
+  ```python
+  import base64, getpass, hashlib, hmac, json, sys, zlib
+  b = json.load(open(sys.argv[1]))
+  pw = getpass.getpass('口令: ').encode()
+  dk = hashlib.pbkdf2_hmac('sha256', pw, base64.b64decode(b['salt']), b['iterations'], 64)
+  salt, nonce, tag, ct = (base64.b64decode(b[k]) for k in ('salt', 'nonce', 'tag', 'ciphertext'))
+  assert hmac.compare_digest(tag, hmac.new(dk[32:], b'mashu-cfg-v1' + salt + nonce + ct, 'sha256').digest())
+  ks = b''.join(hashlib.sha256(dk[:32] + nonce + i.to_bytes(8, 'big')).digest() for i in range((len(ct) + 31) // 32))
+  print(zlib.decompress(bytes(x ^ y for x, y in zip(ct, ks))).decode())
+  ```
+
+### 4. 回滚办法
+
+1. 代码回滚：`git revert <提交号>`（或在分支上回退 `config_file.py`、`accounts.py`、`studio.py`、`server.py`、`web/` 等改动）。
+2. 数据恢复：从 `state/backup/one-config-<时间>/` 把备份的 `studio.json`、`token`、`accounts/index.json`、`accounts/gemini/*/cred.json`、`accounts/gemini/clients.json` 拷回 `state/` 对应路径（保持 `0600` 权限）；若只是刚做完一次误导入，从 `state/backup/pre-import-<时间>/studio.json` 覆盖回 `state/studio.json`。
+3. 点击网页右上角「重启服务」使服务端进程加载回滚后的代码与配置。
 
 ## 验证记录（2026-11-24）
 

@@ -1,18 +1,13 @@
 """账号池：麻薯自己管多个 Codex、Gemini（agy）账号——加号、续期、按号额度、选号、Gemini 全局切号。
 
 不依赖 studio.py（studio 调这里），方便单测；网络请求都走 http()，单测里换成假的。
-存放（state/ 已在 .gitignore；目录 0700、文件 0600）：
-  <root>/index.json            元数据（不含令牌）：号 ID、平台、邮箱、套餐、来源、状态、禁用、额度、默认号
-  <root>/codex/<号>/           这个号的 CODEX_HOME（自己的 auth.json；本机默认号不在这里，用 state/codex-home 软链接到 ~/.codex）
-  <root>/gemini/<号>/cred.json 这个号的 RT、access_token、过期时间、邮箱
-  <root>/gemini/clients.json   从 agy 二进制里认出来的 OAuth 客户端（缓存，按二进制路径 + 修改时间）
-令牌原文只在 auth.json / cred.json / 钥匙串里；返回给网页和日志的一律经过 mask() / redact()。
+账号清单、凭据（Gemini RT / AT、非本机 Codex auth）、OAuth 客户端缓存统一存在主配置文件 studio.json（0600，加锁原子写）：
+  <root>/codex/<号>/           这个号的 CODEX_HOME（运行前由主文件生成 auth.json；本机默认号用 state/codex-home 软链接到 ~/.codex）
+令牌原文只在 studio.json / 运行时 auth.json / 钥匙串里；返回给网页和日志的一律经过 mask() / redact()。
 说明见 docs/references/platforms.md「账号池」。
 """
-from contextlib import contextmanager
 from datetime import datetime, timezone
 import base64
-import fcntl
 import hashlib
 import json
 import os
@@ -24,6 +19,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import config_file as cfgfile
 
 PLATFORMS = ('codex', 'gemini')
 PREFIX = dict(codex='cx', gemini='gm')
@@ -75,52 +72,10 @@ def rt_hash(rt):
 
 # ---------- 文件 ----------
 
-def write_private(path, text):
-    """原子写 0600 文件：同目录临时文件写完 fsync 再 rename，目录不存在就建（0700）。"""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(f'.{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp')
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, 'w') as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    return path
-
-
-def write_json(path, data):
-    return write_private(path, json.dumps(data, ensure_ascii=False, indent=2) + '\n')
-
-
-def read_json(path, default=None):
-    try:
-        v = json.loads(Path(path).read_text())
-    except (OSError, ValueError):
-        return default
-    return v
-
-
-@contextmanager
-def file_lock(path):
-    """进程间互斥（fcntl.flock）：续期、写 index.json、写钥匙串都在锁里做。"""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+write_private = cfgfile.write_private
+write_json = cfgfile.write_json
+read_json = cfgfile.read_json
+file_lock = cfgfile.file_lock
 
 
 # ---------- 网络（单测换掉 HTTP）----------
@@ -165,33 +120,28 @@ def _err_code(body):
     return ''
 
 
-# ---------- 账号库 ----------
+# ---------- 账号库（统一存主配置文件 studio.json）----------
 
 class Pool:
-    def __init__(self, root):
+    def __init__(self, root, config_path=None):
         self.root = Path(root)
-
-    @property
-    def index_path(self):
-        return self.root / 'index.json'
+        self.config_path = Path(config_path) if config_path else self.root.parent / 'studio.json'
 
     def exists(self):
-        return self.index_path.exists()
+        return bool(self._read().get('accounts'))
 
-    def lock(self, name='index'):
-        return file_lock(self.root / f'.{name}.lock')
+    def lock(self, name='studio'):
+        return cfgfile.config_lock(self.config_path)
+
+    def _read_cfg(self):
+        return cfgfile.read_config(self.config_path)
 
     def _read(self):
-        d = read_json(self.index_path, {})
-        d = d if isinstance(d, dict) else {}
-        d.setdefault('accounts', [])
-        d.setdefault('defaults', {})
-        return d
+        acc = self._read_cfg().get('accounts') or {}
+        return dict(accounts=list(acc.get('items') or []), defaults=dict(acc.get('defaults') or {}))
 
-    def _write(self, d):
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
-        write_json(self.index_path, d)
+    def _write_cfg(self, cfg):
+        cfgfile.write_config(self.config_path, cfg)
 
     def list(self, platform=None):
         return [a for a in self._read()['accounts'] if not platform or a.get('platform') == platform]
@@ -217,14 +167,17 @@ class Pool:
         if platform not in PLATFORMS:
             raise AccountError(f'只支持 {" / ".join(PLATFORMS)}：{platform}')
         with self.lock():
-            d = self._read()
-            nums = [int(m.group(1)) for a in d['accounts'] for m in [re.fullmatch(rf'{PREFIX[platform]}-(\d+)', a.get('id', ''))] if m]
+            cfg = self._read_cfg()
+            items = cfg['accounts']['items']
+            nums = [int(m.group(1)) for a in items for m in [re.fullmatch(rf'{PREFIX[platform]}-(\d+)', a.get('id', ''))] if m]
             aid = f'{PREFIX[platform]}-{max(nums + [0]) + 1}'
             a = dict(id=aid, platform=platform, label='', email='', plan='', source='', status='pending', disabled=False,
                      created=time.time(), last_refresh=None, last_check=None, error='', quota=None)
             a.update({k: v for k, v in meta.items() if k != 'id'})
-            d['accounts'].append(a)
-            self._write(d)
+            items.append(a)
+            self._write_cfg(cfg)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.root, 0o700)
         for p in (self.root / platform, self.root / platform / aid):
             p.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(p, 0o700)
@@ -232,28 +185,96 @@ class Pool:
 
     def update(self, aid, **kw):
         with self.lock():
-            d = self._read()
-            for a in d['accounts']:
+            cfg = self._read_cfg()
+            for a in cfg['accounts']['items']:
                 if a.get('id') == aid:
                     if 'error' in kw:
                         kw['error'] = redact(kw['error'])[:300]
                     a.update(kw)
-                    self._write(d)
+                    self._write_cfg(cfg)
                     return dict(a)
         raise AccountError(f'没有这个号：{aid}')
+
+    def get_credentials(self, aid):
+        a = self.get(aid)
+        return dict(a.get('credentials') or {}) if a else {}
+
+    def set_credentials(self, aid, cred):
+        with self.lock():
+            cfg = self._read_cfg()
+            for a in cfg['accounts']['items']:
+                if a.get('id') == aid:
+                    a['credentials'] = dict(cred or {})
+                    self._write_cfg(cfg)
+                    return dict(a)
+        raise AccountError(f'没有这个号：{aid}')
+
+    def gemini_clients(self):
+        return dict(self._read_cfg()['accounts'].get('gemini_clients') or {})
+
+    def set_gemini_clients(self, cache):
+        with self.lock():
+            cfg = self._read_cfg()
+            cfg['accounts']['gemini_clients'] = dict(cache or {})
+            self._write_cfg(cfg)
+
+    def sync_codex_from_home(self, aid, home):
+        """把 Codex 运行时 auth.json 同步回主文件（Codex 续期写了新 RT 或刚登录完时调用）。"""
+        ap = Path(home) / 'auth.json'
+        if ap.is_symlink() or not ap.exists():
+            return False
+        d = read_json(ap)
+        if not isinstance(d, dict):
+            return False
+        t = d.get('tokens') if isinstance(d.get('tokens'), dict) else {}
+        if not t.get('refresh_token') and not d.get('OPENAI_API_KEY'):
+            return False
+        cur = self.get_credentials(aid)
+        if cur != d:
+            self.set_credentials(aid, d)
+            return True
+        return False
+
+    def sync_codex_to_home(self, aid, home):
+        """开会话 / 体检前：主文件是来源，确保非本机 Codex 号目录里有 auth.json；若磁盘 auth.json 更新（Codex 刚续期）则先回写主文件。"""
+        a = self.get(aid)
+        if not a or a.get('platform') != 'codex' or a.get('source') == 'local':
+            return False
+        home = Path(home)
+        ap = home / 'auth.json'
+        cred = dict(a.get('credentials') or {})
+        disk = None if (ap.is_symlink() or not ap.exists()) else read_json(ap)
+        disk_ok = isinstance(disk, dict) and bool((disk.get('tokens') or {}).get('refresh_token') or disk.get('OPENAI_API_KEY'))
+        cred_ok = bool((cred.get('tokens') or {}).get('refresh_token') or cred.get('OPENAI_API_KEY'))
+        if disk_ok and not cred_ok:
+            self.set_credentials(aid, disk)
+            return True
+        if disk_ok and cred_ok:
+            disk_ts = _iso_ts(disk.get('last_refresh')) or 0
+            cred_ts = _iso_ts(cred.get('last_refresh')) or 0
+            if disk_ts > cred_ts:
+                self.set_credentials(aid, disk)
+                return True
+        if cred_ok and disk != cred:
+            if ap.is_symlink():
+                ap.unlink()
+            write_json(ap, cred)
+            return True
+        return False
 
     def remove(self, aid):
         """删号：删元数据和它的目录。本机默认号（source=local）的 Codex 目录是 state/codex-home，不在池里，不动。"""
         import shutil
         with self.lock():
-            d = self._read()
-            a = next((x for x in d['accounts'] if x.get('id') == aid), None)
+            cfg = self._read_cfg()
+            items = cfg['accounts']['items']
+            a = next((x for x in items if x.get('id') == aid), None)
             if not a:
                 raise AccountError(f'没有这个号：{aid}')
-            d['accounts'] = [x for x in d['accounts'] if x.get('id') != aid]
-            if d['defaults'].get(a['platform']) == aid:
-                d['defaults'].pop(a['platform'], None)
-            self._write(d)
+            cfg['accounts']['items'] = [x for x in items if x.get('id') != aid]
+            if cfg['accounts']['defaults'].get(a['platform']) == aid:
+                cfg['accounts']['defaults'].pop(a['platform'], None)
+            self._write_cfg(cfg)
         p = self.root / a['platform'] / aid
         if p.is_dir() and not p.is_symlink() and p.resolve().is_relative_to(self.root.resolve()):
             shutil.rmtree(p)
@@ -261,14 +282,15 @@ class Pool:
 
     def set_default(self, platform, aid):
         with self.lock():
-            d = self._read()
-            if aid and not any(a['id'] == aid and a['platform'] == platform for a in d['accounts']):
+            cfg = self._read_cfg()
+            items = cfg['accounts']['items']
+            if aid and not any(a['id'] == aid and a['platform'] == platform for a in items):
                 raise AccountError(f'{platform} 里没有这个号：{aid}')
             if aid:
-                d['defaults'][platform] = aid
+                cfg['accounts']['defaults'][platform] = aid
             else:
-                d['defaults'].pop(platform, None)
-            self._write(d)
+                cfg['accounts']['defaults'].pop(platform, None)
+            self._write_cfg(cfg)
 
     def view(self, platform=None):
         """给网页 / 命令行看的（不含令牌）。"""
@@ -442,11 +464,10 @@ class Gemini:
 
     # --- OAuth 客户端 ---
     def clients(self):
-        """候选客户端 [(id, secret)]：上次能用的排第一。从 agy 二进制里扫（缓存到 gemini/clients.json，二进制变了重扫）。"""
-        cache_p = self.pool.root / 'gemini' / 'clients.json'
+        """候选客户端 [(id, secret)]：上次能用的排第一。从 agy 二进制里扫（缓存在主文件，二进制变了重扫）。"""
         b = agy_binary(self.agy_exe)
         sig = f'{b}:{b.stat().st_mtime if b else 0}' if b else ''
-        cache = read_json(cache_p, {}) or {}
+        cache = self.pool.gemini_clients()
         if not b and cache.get('pairs'):
             pairs = cache['pairs']
         elif cache.get('sig') == sig and cache.get('pairs'):
@@ -454,7 +475,7 @@ class Gemini:
         else:
             ids, secs = scan_clients(b) if b else ([], [])
             pairs = [[i, s] for i in ids for s in secs]
-            write_json(cache_p, dict(sig=sig, pairs=pairs, good=cache.get('good')))
+            self.pool.set_gemini_clients(dict(sig=sig, pairs=pairs, good=cache.get('good')))
             cache['pairs'] = pairs
         good = cache.get('good')
         pairs = sorted(pairs, key=lambda p: p != good)
@@ -463,11 +484,10 @@ class Gemini:
         return [tuple(p) for p in pairs]
 
     def _remember_client(self, pair):
-        cache_p = self.pool.root / 'gemini' / 'clients.json'
-        cache = read_json(cache_p, {}) or {}
+        cache = self.pool.gemini_clients()
         if cache.get('good') != list(pair):
             cache['good'] = list(pair)
-            write_json(cache_p, cache)
+            self.pool.set_gemini_clients(cache)
 
     def refresh_token(self, rt):
         """RT 换 access_token：依次试候选客户端（invalid_client / unauthorized_client 换下一个）。
@@ -499,15 +519,12 @@ class Gemini:
             raise AccountError(f'查 Gemini 额度失败：HTTP {code} {redact(_err_code(body))}')
         return parse_quota(body)
 
-    # --- 凭据 ---
-    def cred_path(self, aid):
-        return self.pool.root / 'gemini' / aid / 'cred.json'
-
+    # --- 凭据（统一存在主文件 studio.json 里）---
     def cred(self, aid):
-        return read_json(self.cred_path(aid), {}) or {}
+        return self.pool.get_credentials(aid)
 
     def ensure_token(self, aid, margin=300):
-        """这个号的 access_token：离过期不到 margin 秒就用 RT 续期（加锁，原子写）；Google 回了新 RT 就换上。
+        """这个号的 access_token：离过期不到 margin 秒就用 RT 续期（加锁，原子写回主文件）；Google 回了新 RT 就换上。
         invalid_grant → 状态「已撤销」并抛 Revoked；其它失败 → 「续期失败」。返回 access_token。"""
         with file_lock(self.pool.root / 'gemini' / f'.{aid}.lock'):
             c = self.cred(aid)
@@ -525,7 +542,7 @@ class Gemini:
                 self.pool.update(aid, status='refresh_failed', error=str(exc), last_check=time.time())
                 raise
             c.update(access_token=t['access_token'], expiry=t['expiry'], refresh_token=t['refresh_token'], client_id=t['client_id'])
-            write_json(self.cred_path(aid), c)
+            self.pool.set_credentials(aid, c)
             self.pool.update(aid, status='ok', error='', last_refresh=time.time(), last_check=time.time())
             return c['access_token']
 
@@ -550,7 +567,7 @@ class Gemini:
         a = same or self.pool.add('gemini', source=source, email=email, label=email or 'Gemini 号', status='pending')
         cred = dict(refresh_token=t['refresh_token'], access_token=t['access_token'], expiry=t['expiry'], client_id=t['client_id'],
                     email=email, added=time.time())
-        write_json(self.cred_path(a['id']), cred)
+        self.pool.set_credentials(a['id'], cred)
         upd = dict(status='ok', error='', email=email, label=email or a.get('label'), last_refresh=time.time(), last_check=time.time())
         if same and source == 'local':
             upd['source'] = 'local'

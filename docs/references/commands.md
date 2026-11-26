@@ -4,7 +4,7 @@ km_type: reference
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-24
+last_verified: 2026-11-26
 source_of_truth:
   - mashu/studio.py
   - mashu/server.py
@@ -51,6 +51,7 @@ related:
 | `mashu gemini-models [--refresh]` | Gemini（agy）可选模型；`--refresh` 跑 `agy models` 更新缓存 `state/gemini-models.json`（要先登录 agy；没登录时用内置兜底列表）。网页「会话监控 → 默认设置」里也有刷新按钮 |
 | `mashu platforms [--check]` | 各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型数；`--check` 再跑一遍安全拦截自检（不调模型）。Codex / OpenCode 的接法见 [平台说明](platforms.md) |
 | `mashu opencode-models [--refresh]` | OpenCode 可选模型（`provider/model`、支持的思考档位、窗口、是否免费）；`--refresh` 跑 `opencode models --verbose` 更新缓存 `state/opencode-models.json`。网页默认设置里也有刷新按钮 |
+| `mashu config export --out <文件> [--with-secrets]` / `import <文件> [--dry-run] [--yes]` / `migrate` | 主配置文件（`state/studio.json`）导出、差异预览导入与迁移；`--with-secrets` 交互输口令加密，默认省略密钥。详见 [平台说明](platforms.md) |
 | `mashu playbook list / show / check / commit / apply / restore` | 工作流管理；目标写 `film:<项目>`（项目默认工作流）、`template:<项目>/<id>`（项目专用模板，在 `<工程>/.mashu/playbooks/`）或 `template:<id>`（麻薯通用模板）。见 [项目资料制作规范](../workflows/project-assets.md) |
 | `mashu retro [项目]` / `mashu digest` / `mashu self-iterate …` | 复盘数据 / 简报数据 / 每日自迭代 |
 

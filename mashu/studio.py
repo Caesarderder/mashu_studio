@@ -35,6 +35,7 @@ import uuid
 
 sys.modules.setdefault('studio', sys.modules[__name__])   # 以脚本运行时，让 selfiter 里的 import studio 拿到同一个模块
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config_file as cfgfile  # noqa: E402   主配置文件、迁移、加密导出导入（#7）
 import platforms as plat  # noqa: E402   Codex / OpenCode 的纯函数部分
 import accounts as acct  # noqa: E402   账号池：Codex / Gemini 多账号（#4）
 
@@ -176,16 +177,21 @@ def cfg(key):
         return os.environ[env]
     path = HOME / 'studio.json'
     try:
-        mtime = path.stat().st_mtime
+        st = path.stat()
+        sig = (str(path), st.st_mtime_ns, st.st_size)
     except OSError:
-        mtime = None
-    if mtime != _cfg_cache['mtime']:
+        sig = (str(path), None, None)
+    if sig != _cfg_cache['mtime']:
         try:
-            _cfg_cache['data'] = json.loads(path.read_text()) if mtime else {}
+            _cfg_cache['data'] = json.loads(path.read_text()) if sig[1] is not None else {}
         except ValueError:
             _cfg_cache['data'] = {}
-        _cfg_cache['mtime'] = mtime
-    return _cfg_cache['data'].get(key, DEFAULTS[key])
+        _cfg_cache['mtime'] = sig
+    return cfgfile.get_setting(_cfg_cache['data'], key, DEFAULTS)
+
+
+def ensure_migrated():
+    return cfgfile.migrate_if_needed(HOME)
 
 
 def now_iso():
@@ -1874,7 +1880,8 @@ _ACCT_Q = {}
 
 
 def pool():
-    return acct.Pool(HOME / 'accounts')
+    ensure_migrated()
+    return acct.Pool(HOME / 'accounts', HOME / 'studio.json')
 
 
 def gemini_ops():
@@ -2018,6 +2025,8 @@ def accounts_check(force=False, only=None):
                 res.append((a['id'], f'{b["status"]}' + (f'，额度剩 {round(b["quota"]["remaining"] * 100)}%' if (b.get('quota') or {}).get('remaining') is not None else '')))
                 continue
             home = codex_acct_home(a)
+            if a.get('source') != 'local':
+                p.sync_codex_to_home(a['id'], home)
             info = acct.codex_auth_info((CODEX_USER_HOME if a.get('source') == 'local' else home) / 'auth.json')
             if not info.get('logged_in'):
                 p.update(a['id'], status='logged_out' if a.get('status') != 'pending' else 'pending', last_check=time.time(),
@@ -2033,6 +2042,7 @@ def accounts_check(force=False, only=None):
                     res.append((a['id'], '超过 7 天没续期，但有会话在用（Codex 自己会续），这次不动'))
                 else:
                     info = acct.codex_refresh(home)
+                    p.sync_codex_from_home(a['id'], home)
                     upd.update(last_refresh=info.get('last_refresh'), plan=info.get('plan') or upd['plan'], email=info.get('email') or upd['email'])
             p.update(a['id'], **upd)
             res.append((a['id'], 'ok'))
@@ -2152,10 +2162,11 @@ def codex_login_home(a):
 
 
 def codex_finish_login(aid):
-    """codex login 结束后：读这个号的 auth.json，登上了就标正常；和池里已有的号是同一个（邮箱 + 账户）就删掉新加的。"""
+    """codex login 结束后：读这个号的 auth.json，登上了就标正常并同步回主文件；和池里已有的号是同一个（邮箱 + 账户）就删掉新加的。"""
     p = pool()
     a = p.get(aid)
-    info = acct.codex_auth_info(codex_acct_home(a) / 'auth.json')
+    home = codex_acct_home(a)
+    info = acct.codex_auth_info(home / 'auth.json')
     if not info.get('logged_in'):
         p.update(aid, status='pending', error='还没登录成功')
         raise acct.AccountError('没登录成功（auth.json 里没有登录信息）')
@@ -2168,6 +2179,7 @@ def codex_finish_login(aid):
         if x.get('email') == info.get('email') and ref == info.get('account_id'):
             p.remove(aid)
             raise acct.AccountError(f'这个号（{info.get("email")}）已经在池里了：{x["id"]}')
+    p.sync_codex_from_home(aid, home)
     return p.update(aid, status='ok', error='', email=info.get('email'), plan=info.get('plan'), label=info.get('email') or aid,
                     last_refresh=info.get('last_refresh'), last_check=time.time(), account_ref=info.get('account_id'))
 
@@ -2633,6 +2645,8 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
     meta_set(conn, f'camacct:{c["id"]}', a['id'] if a else '')
     if a and not sid:
         log_event(conn, 'account-pick', c, provider='codex', account=a['id'], why=why)
+    if a and a.get('source') != 'local':
+        pool().sync_codex_to_home(a['id'], home_dir)
     home = plat.build_codex_home(home_dir, CODEX_USER_HOME, skills, extra=plat.codex_hooks_toml(shlex.quote(str(BIN / 'mashu'))),
                                  link_auth=home_dir == codex_home())
     auth = home / 'auth.json'
@@ -4986,44 +5000,45 @@ ROLES = ('assistant', 'producer', 'crew')
 
 
 def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, providers=None, gmodels=None, xmodels=None, omodels=None):
-    """网页「默认设置」：统一改各角色默认模型 / 思考程度（写 studio.json），clear=True 同时清掉各对话单独设的。
+    """网页「默认设置」：统一改各角色默认模型 / 思考程度（写 studio.json 的 defaults 节），clear=True 同时清掉各对话单独设的。
     空闲的会话马上在原窗格 --resume 重开生效，忙的这一轮做完由调度器切。"""
+    ensure_migrated()
     path = HOME / 'studio.json'
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        data = {}
-    for key, given, allowed in (('models', models, MODELS), ('efforts', efforts, EFFORTS), ('code_modes', codes, ('on', 'off')),
-                                ('providers', providers, PROVIDERS), ('gemini_models', gmodels, None),
-                                ('codex_models', xmodels, None), ('opencode_models', omodels, None)):
-        if given is None:
-            continue
-        cur = dict(data.get(key) or {})
-        for role, v in given.items():
-            if role not in ROLES:
-                raise ValueError(f'未知角色：{role}')
-            v = (v or '').strip()
-            mprov = {d: p for p, d in DEFAULT_MODELS.items()}.get(key)
-            ok = valid_model(mprov, v) if mprov else v in allowed
-            if v and not ok:
-                raise ValueError(f'不支持的{ {"models": "模型", "gemini_models": "Gemini 模型", "codex_models": "Codex 模型", "opencode_models": "OpenCode 模型", "efforts": "思考程度", "providers": "平台"}.get(key, "Code Mode 设置") }：{v}')
-            if key == 'providers' and v and not platform_status(v)['ok']:
-                raise ValueError(f'{PROV_LABEL[v]} 现在不能用：{platform_status(v)["reason"]}')
-            if v and not (key == 'code_modes' and v == 'off') and not (key == 'providers' and v == 'claude'):
-                cur[role] = v
-            else:
-                cur.pop(role, None)
-        data[key] = cur
-    tmp = path.with_suffix('.json.tmp')
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
-    tmp.replace(path)
+
+    def _apply(cfg_data):
+        defs = cfg_data.setdefault('defaults', {})
+        for key, given, allowed in (('models', models, MODELS), ('efforts', efforts, EFFORTS), ('code_modes', codes, ('on', 'off')),
+                                    ('providers', providers, PROVIDERS), ('gemini_models', gmodels, None),
+                                    ('codex_models', xmodels, None), ('opencode_models', omodels, None)):
+            if given is None:
+                continue
+            cur = dict(defs.get(key) or {})
+            for role, v in given.items():
+                if role not in ROLES:
+                    raise ValueError(f'未知角色：{role}')
+                v = (v or '').strip()
+                mprov = {d: p for p, d in DEFAULT_MODELS.items()}.get(key)
+                ok = valid_model(mprov, v) if mprov else v in allowed
+                if v and not ok:
+                    raise ValueError(f'不支持的{ {"models": "模型", "gemini_models": "Gemini 模型", "codex_models": "Codex 模型", "opencode_models": "OpenCode 模型", "efforts": "思考程度", "providers": "平台"}.get(key, "Code Mode 设置") }：{v}')
+                if key == 'providers' and v and not platform_status(v)['ok']:
+                    raise ValueError(f'{PROV_LABEL[v]} 现在不能用：{platform_status(v)["reason"]}')
+                if v and not (key == 'code_modes' and v == 'off') and not (key == 'providers' and v == 'claude'):
+                    cur[role] = v
+                else:
+                    cur.pop(role, None)
+            defs[key] = cur
+
+    saved = cfgfile.update_config(path, _apply)
+    _cfg_cache['mtime'] = None
+    defs = saved['defaults']
     cleared = 0
     if clear:
         cleared = conn.execute('DELETE FROM meta WHERE k LIKE "pref:%"').rowcount
         conn.commit()
-    audit(conn, 'executive', 'defaults', None, None, json.dumps(dict(models=data.get('models'), efforts=data.get('efforts'), codes=data.get('code_modes'),
-                                                                     providers=data.get('providers'), gemini_models=data.get('gemini_models'),
-                                                                     codex_models=data.get('codex_models'), opencode_models=data.get('opencode_models'),
+    audit(conn, 'executive', 'defaults', None, None, json.dumps(dict(models=defs.get('models'), efforts=defs.get('efforts'), codes=defs.get('code_modes'),
+                                                                     providers=defs.get('providers'), gemini_models=defs.get('gemini_models'),
+                                                                     codex_models=defs.get('codex_models'), opencode_models=defs.get('opencode_models'),
                                                                      cleared=cleared), ensure_ascii=False))
     apply_prefs(conn)
     busy = len(rows(conn, f'SELECT id FROM cameras WHERE state IN {LIVE} AND last_active>last_stop'))
@@ -7501,17 +7516,18 @@ def cmd_init(args):
         ok = ok and (bool(found) or not need)
     if sys.version_info < (3, 9):
         print('  ✗ 需要 python3 ≥ 3.9'); ok = False
-    HOME.mkdir(parents=True, exist_ok=True)
+    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    mig = ensure_migrated()
     conf = HOME / 'studio.json'
     if conf.exists():
-        print(f'  · 已有配置 {conf}（不覆盖）')
+        print(f'  · 已有主配置 {conf}' + (f'（已迁移：{", ".join(mig["files"])}）' if mig.get('migrated') else '（不覆盖）'))
     else:
         example = CODE / 'studio.json.example'
         data = json.loads(example.read_text()) if example.exists() else {}
         if args.scan_root:
             data['scan_roots'] = args.scan_root
-        conf.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
-        print(f'  ✓ 写入配置 {conf}（字段说明见 mashu/studio.py 的 DEFAULTS）')
+        cfgfile.write_config(conf, data)
+        print(f'  ✓ 写入主配置 {conf}（0600，字段说明见 mashu/studio.py 的 DEFAULTS）')
     db().close()
     print(f'  ✓ 数据目录 {HOME}')
     missing = [n for n in ('index.md', '用户.md', '方针.md', '在办.md', '复盘.md', '守则.md') if not (MEMORY / n).exists()]
@@ -7520,6 +7536,75 @@ def cmd_init(args):
     print(f'  {"✓ docs skill 已挂载" if host else "- 没找到 docs skill（studio.json 的 docs_skill），知识地图照常可读，只是不加载 skill"}')
     print('\n下一步：' + ('./start.sh 启动，然后在网页主对话里跟麻薯说话。想定制自己的麻薯：改 docs/memory/（用户、方针、守则）'
                         '和 mashu/prompts/，详见 README。' if ok else '先装好上面标 ✗ 的依赖，再跑一次 mashu init。'))
+
+
+def _prompt_passphrase(prompt, confirm=False):
+    if sys.stdin.isatty():
+        import getpass
+        p1 = getpass.getpass(prompt)
+        if confirm:
+            p2 = getpass.getpass('再输入一次确认：')
+            if p1 != p2:
+                raise ValueError('两次输入的口令不一致')
+        return p1
+    return sys.stdin.readline().rstrip('\r\n')
+
+
+def _fmt_import_preview(preview):
+    lines = [f'配置导入预览（{"加密包" if preview["encrypted"] else "明文包"} · {"含密钥" if preview["with_secrets"] else "不含密钥"}）：']
+    changes = preview.get('changes') or []
+    if not changes:
+        lines.append('  （和当前配置一致，没有需要改动的内容）')
+    else:
+        tag = {'add': '新增', 'update': '覆盖', 'skip': '跳过', 'write': '本机CLI'}
+        for c in changes:
+            lines.append(f'  [{tag.get(c["action"], c["action"])}] {c["summary"]}')
+    for w in preview.get('warnings') or []:
+        lines.append(f'  ⚠ {w}')
+    return '\n'.join(lines)
+
+
+def cmd_config(args):
+    """mashu config：导出 / 导入 / 迁移主配置文件 state/studio.json。口令只走交互输入，不进命令行参数和日志。"""
+    act = args.action
+    if act == 'migrate':
+        r = ensure_migrated()
+        if r.get('migrated'):
+            print(f'迁移完成：{", ".join(r["files"])}\n旧文件已备份到：{r["backup_dir"]}')
+        else:
+            print(f'已是最新主配置格式（{HOME / "studio.json"}），无需迁移')
+        return
+    if act == 'export':
+        if not args.out:
+            raise ValueError('请用 --out <文件路径> 指定导出位置')
+        pw = _prompt_passphrase('设置加密口令（不显示）：', confirm=True) if args.with_secrets else None
+        res = cfgfile.export_to_file(HOME, args.out, with_secrets=bool(args.with_secrets), passphrase=pw)
+        print(f'已导出到：{res["path"]}（{"加密 · 含密钥" if res["with_secrets"] else "明文 · 密钥已省略"}）')
+        if res.get('warning'):
+            print(f'⚠ {res["warning"]}')
+        return
+    if act == 'import':
+        if not args.file:
+            raise ValueError('请指定要导入的配置文件路径')
+        raw = cfgfile.read_json(args.file)
+        if not isinstance(raw, dict):
+            raise ValueError(f'读不到或格式不对：{args.file}')
+        pw = _prompt_passphrase('输入解密口令（不显示）：', confirm=False) if raw.get('encrypted') else None
+        preview = cfgfile.preview_import(HOME, raw, passphrase=pw)
+        print(_fmt_import_preview(preview))
+        if args.dry_run:
+            return
+        if not args.yes:
+            ans = (input('确认写入主配置？[y/N] ') if sys.stdin.isatty() else sys.stdin.readline()).strip().lower()
+            if ans not in ('y', 'yes', '是'):
+                print('已取消，未改动任何文件。')
+                return
+        res = cfgfile.apply_import(HOME, raw, passphrase=pw)
+        _cfg_cache['mtime'] = None
+        _ACCT_Q.clear()
+        _LIMITS_CACHE['at'] = 0
+        print(f'已导入主配置 {HOME / "studio.json"}' + (f'（写入前已备份到：{res["backup_path"]}）' if res.get('backup_path') else ''))
+        return
 
 
 def cmd_tick(args):
@@ -7614,6 +7699,13 @@ def main(argv=None):
     s.add_argument('--check', action='store_true')
     s = sub.add_parser('opencode-models', help='OpenCode 可选模型；--refresh 跑 opencode models --verbose 更新缓存')
     s.add_argument('--refresh', action='store_true')
+    s = sub.add_parser('config', help='主配置文件（state/studio.json）：export / import / migrate')
+    s.add_argument('action', choices=['export', 'import', 'migrate'])
+    s.add_argument('file', nargs='?', help='import：要导入的配置文件路径')
+    s.add_argument('--out', help='export：输出文件路径')
+    s.add_argument('--with-secrets', action='store_true', help='export：带上密钥并交互输入口令加密（默认省略密钥）')
+    s.add_argument('--dry-run', action='store_true', help='import：只预览差异，不写入')
+    s.add_argument('-y', '--yes', action='store_true', help='import：跳过确认直接写入')
     if not next(iter(sys.argv[1:] if argv is None else argv), '').startswith(('hook-', 'statusline')):
         selfiter_call('add_parser', sub)          # 每日自迭代（hooks 和状态栏调用频繁，不加载）
     args = p.parse_args(argv)
@@ -7629,7 +7721,7 @@ def main(argv=None):
         'statusline': cmd_statusline, 'hook-prompt': cmd_hook_prompt, 'hook-stop': cmd_hook_stop, 'hook-notify': cmd_hook_notify,
         'hook-pretool': cmd_hook_pretool, 'hook-session': cmd_hook_session,
         'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,
-        'opencode-models': cmd_opencode_models, 'init': cmd_init, 'account': cmd_account,
+        'opencode-models': cmd_opencode_models, 'init': cmd_init, 'account': cmd_account, 'config': cmd_config,
         'self-iterate': lambda a: __import__('selfiter').cmd(a)}[cmd]
     try:
         handler(args)

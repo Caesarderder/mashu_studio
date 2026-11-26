@@ -1508,3 +1508,24 @@ details.sd-sec summary { cursor: pointer; }
 .kick-exec { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 10px 0 2px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card-2); }
 .kick-exec .ke-l { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); margin-right: 2px; }
 .kick-exec select { height: 28px; padding: 0 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--text); font-size: 12.5px; font-weight: 600; max-width: 220px; }
+
+/* 主配置导出 / 导入（#7） */
+.wall-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.wall-head h2 { margin: 0; }
+.cfg-acts { display: flex; gap: 8px; flex-wrap: wrap; }
+.cfg-form { display: flex; flex-direction: column; gap: 10px; }
+.cfg-chk { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; cursor: pointer; }
+.cfg-chk input { margin-top: 3px; }
+.cfg-chk small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+.cfg-sec-box { display: flex; flex-direction: column; gap: 8px; }
+.cfg-warn { display: flex; align-items: flex-start; gap: 6px; padding: 8px 10px; border-radius: 8px; font-size: 12.5px; line-height: 1.5; background: color-mix(in srgb, #d99a2b 12%, transparent); border: 1px solid color-mix(in srgb, #d99a2b 35%, transparent); color: #b7791f; }
+.cfg-warn svg { flex: none; margin-top: 2px; }
+.cfg-m-acts { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+.cfg-diff { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--card-2); }
+.cfg-diff-sum { font-size: 12.5px; font-weight: 600; }
+.cfg-diff-list { max-height: 260px; overflow: auto; display: flex; flex-direction: column; gap: 5px; }
+.cfg-diff-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.cfg-diff-sec { font-family: var(--mono); font-size: 11px; color: var(--faint); min-width: 68px; }
+.tag.ok { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+.tag.warn { color: #b7791f; border-color: color-mix(in srgb, #d99a2b 45%, transparent); }
+.tag.dim { color: var(--faint); }

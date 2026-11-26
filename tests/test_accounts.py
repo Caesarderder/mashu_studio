@@ -112,9 +112,8 @@ class AcctBase(unittest.TestCase):
         self.addCleanup(setattr, acct, 'HTTP', saved)
         self.kc = FakeKeychain()
         self.g = acct.Gemini(self.pool, 'agy-not-installed', keychain=self.kc, token_file=self.tmp / 'no-token-file')
-        cache = self.pool.root / 'gemini' / 'clients.json'      # 假装从 agy 二进制里扫出来三组候选
-        acct.write_json(cache, dict(sig='', pairs=[['cid-bad.apps.googleusercontent.com', 'GOCSPX-bad'],
-                                                    [self.http.good_client, 'GOCSPX-bad'], [self.http.good_client, 'GOCSPX-good']]))
+        self.pool.set_gemini_clients(dict(sig='', pairs=[['cid-bad.apps.googleusercontent.com', 'GOCSPX-bad'],
+                                                          [self.http.good_client, 'GOCSPX-bad'], [self.http.good_client, 'GOCSPX-good']]))
 
 
 class TestPool(AcctBase):
@@ -124,7 +123,7 @@ class TestPool(AcctBase):
         g = self.pool.add('gemini', source='rt')
         self.assertEqual((a['id'], b['id'], g['id']), ('cx-1', 'cx-2', 'gm-1'))
         self.assertEqual(stat.S_IMODE(self.pool.root.stat().st_mode), 0o700)
-        self.assertEqual(stat.S_IMODE(self.pool.index_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.pool.config_path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.pool.root / 'codex' / 'cx-1').stat().st_mode), 0o700)
         self.pool.update('cx-2', status='ok', disabled=True)
         self.assertTrue(self.pool.get('cx-2')['disabled'])
@@ -137,7 +136,7 @@ class TestPool(AcctBase):
         self.assertFalse((self.pool.root / 'codex' / 'cx-2').exists())
         self.assertEqual(self.pool.default('codex')['id'], 'cx-1')
         self.assertEqual([x['id'] for x in self.pool.list()], ['cx-1', 'gm-1'])
-        p = acct.write_json(self.tmp / 'x' / 'cred.json', {'refresh_token': RT1})
+        p = acct.write_json(self.tmp / 'x' / 'secret.json', {'refresh_token': RT1})
         self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
         self.assertEqual(list(p.parent.glob('.*tmp')), [])          # 临时文件不留
 
@@ -170,7 +169,7 @@ class TestPool(AcctBase):
         a = self.pool.add('gemini')
         self.pool.update(a['id'], error=f'failed with {RT2}')
         self.assertNotIn(RT2, json.dumps(self.pool.view()))
-        self.assertNotIn(RT2, self.pool.index_path.read_text())
+        self.assertNotIn(RT2, self.pool.config_path.read_text())
 
 
 class TestPick(unittest.TestCase):
@@ -217,7 +216,7 @@ class TestGemini(AcctBase):
         self.assertEqual(len(a['quota']['models']), 2)          # 没有 displayName 的内部模型不算
         cred = self.g.cred('gm-1')
         self.assertEqual(cred['refresh_token'], RT1)
-        self.assertEqual(stat.S_IMODE(self.g.cred_path('gm-1').stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.pool.config_path.stat().st_mode), 0o600)
         # 三组候选客户端：不认的换下一个，认的记住、下次排第一
         tries = [c[2]['client_id'] + '/' + c[2]['client_secret'] for c in self.http.calls if c[1] == acct.GOOGLE_TOKEN_URL]
         self.assertEqual(tries[-1], f'{self.http.good_client}/GOCSPX-good')
@@ -225,11 +224,10 @@ class TestGemini(AcctBase):
         # 同一个邮箱再导入：更新原来那个号
         self.assertEqual(self.g.import_rt(RT1)['id'], 'gm-1')
         self.assertEqual(len(self.pool.list('gemini')), 1)
-        # 索引和接口里没有令牌原文
-        idx = self.pool.index_path.read_text()
-        self.assertNotIn(RT1, idx)
-        self.assertNotIn('ya29.', idx)
+        # view 接口里没有令牌原文，主文件里才有凭据
         self.assertNotIn(RT1, json.dumps(self.pool.view()))
+        self.assertNotIn('ya29.', json.dumps(self.pool.view()))
+        self.assertIn(RT1, self.pool.config_path.read_text())
 
     def test_ensure_token_margin_and_rotation(self):
         self.g.import_rt(RT1)
@@ -238,7 +236,7 @@ class TestGemini(AcctBase):
         self.assertEqual(len(self.http.calls), n)
         c = self.g.cred('gm-1')
         c['expiry'] = time.time() + 120             # 不到 5 分钟：续期；Google 回了新 RT 就换上
-        acct.write_json(self.g.cred_path('gm-1'), c)
+        self.pool.set_credentials('gm-1', c)
         self.http.rotate[RT1] = RT2
         at = self.g.ensure_token('gm-1')
         self.assertTrue(at.startswith('ya29.FAKE-access'))
@@ -249,7 +247,7 @@ class TestGemini(AcctBase):
         self.g.import_rt(RT1)
         c = self.g.cred('gm-1')
         c['expiry'] = 0
-        acct.write_json(self.g.cred_path('gm-1'), c)
+        self.pool.set_credentials('gm-1', c)
         self.http.revoked.add(RT1)
         with self.assertRaises(acct.Revoked):
             self.g.check('gm-1')
@@ -479,7 +477,7 @@ class TestStudioPool(PlatBase):
         """Gemini 只留单号（#157）：只跟着本机钥匙串的号续期、查额度；不能加第二个号、不能指定 / 自动挑号、不切号。"""
         kc = FakeKeychain({'token': {'refresh_token': RT1, 'access_token': 'ya29.old'}, 'auth_method': 'consumer'})
         g = acct.Gemini(self.p, 'agy-not-installed', keychain=kc, token_file=self.tmp / 'none')
-        acct.write_json(self.p.root / 'gemini' / 'clients.json', dict(sig='', pairs=[[self.http.good_client, 'GOCSPX-good']]))
+        self.p.set_gemini_clients(dict(sig='', pairs=[[self.http.good_client, 'GOCSPX-good']]))
         saved = studio.gemini_ops
         self.addCleanup(setattr, studio, 'gemini_ops', saved)
         studio.gemini_ops = lambda: g

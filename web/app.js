@@ -1941,7 +1941,11 @@ function acctOpts(prov, cur) {
 function renderWall() {
   const el = $('#view-wall');
   const cams = state.cameras.filter((c) => c.state !== 'queued');
-  el.innerHTML = `<h2>会话监控</h2>${defaultsHtml()}
+  el.innerHTML = `<div class="wall-head"><h2>会话监控</h2>
+    <div class="cfg-acts">
+      <button class="btn small" data-cfg-export title="导出 state/studio.json（可选是否带密钥）">${icon('arrow-d', 13)}导出配置</button>
+      <button class="btn small" data-cfg-import title="导入配置包（先显示差异，确认后备份并写入）">${icon('upload', 13)}导入配置</button>
+    </div></div>${defaultsHtml()}
     <p class="hint">所有在运行会话的实时终端，2 秒刷新。要接管：终端里 <code>tmux attach -t ${esc(state.tmux)}</code>，麻薯在 <code>desk</code> 窗口，每个项目一个 <code>film-&lt;id&gt;</code> 窗口（Ctrl-b w 选窗口，Ctrl-b z 放大窗格，Ctrl-b d 退出不停止）。</p>
     <div class="wall">${cams.map((c) => `<div class="tile"><div class="th" data-zoom="${c.id}">
       ${c.role === 'assistant' ? mashuAv('av sm', camLight(c)) : letterAv(c.name, 'av sm', camLight(c))}
@@ -1950,6 +1954,119 @@ function renderWall() {
   renderWall.ready = !!state.platforms;
   refreshScreens();
 }
+
+function openExportModal() {
+  openModal(`<h2>导出主配置</h2>
+    <p class="hint">将 <code>state/studio.json</code> 里的设置、角色默认、账号清单、provider 与网页口令打包导出。</p>
+    <div class="form cfg-form">
+      <label class="cfg-chk"><input type="checkbox" id="cfgExpSecrets">
+        <span><b>带密钥导出（口令加密）</b><small>包含账号凭据、API key、网页口令与本机 CLI 登录；不勾选则密钥一律替换成「已省略」，可直接发给同事。</small></span>
+      </label>
+      <div id="cfgExpSecretBox" hidden class="cfg-sec-box">
+        <input type="password" id="cfgExpPass1" placeholder="设置加密口令（不进日志）" autocomplete="new-password">
+        <input type="password" id="cfgExpPass2" placeholder="再输入一次确认口令" autocomplete="new-password">
+        <div class="cfg-warn">${icon('alert', 14)}<span>Codex / Gemini 的 refresh_token 会轮换，导入新电脑后旧电脑上这些号要停用，否则两边会互相顶掉登录；导入新电脑后账号默认标为「已禁用」。</span></div>
+      </div>
+      <div class="cfg-m-acts"><button class="btn" data-close>取消</button><button class="btn primary" id="cfgExpGo">${icon('arrow-d', 14)}导出并下载</button></div>
+    </div>`);
+  const chk = $('#cfgExpSecrets'), box = $('#cfgExpSecretBox');
+  chk.onchange = () => { box.hidden = !chk.checked; };
+  $('#cfgExpGo').onclick = async () => {
+    const ws = chk.checked, p1 = $('#cfgExpPass1').value, p2 = $('#cfgExpPass2').value;
+    if (ws) {
+      if (!p1) return toast('请输入加密口令');
+      if (p1 !== p2) return toast('两次输入的口令不一致');
+    }
+    const btn = $('#cfgExpGo');
+    btn.disabled = true;
+    try {
+      const d = await api('/api/config/export', { with_secrets: ws, passphrase: ws ? p1 : '' });
+      const blob = new Blob([JSON.stringify(d.bundle, null, 2) + '\n'], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = d.filename || 'mashu-config.json';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      closeModal();
+      toast(ws ? '已加密导出（导入新电脑后记得停用旧电脑上的同号）' : '已导出配置（密钥已省略）');
+    } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+  };
+}
+
+function openImportModal() {
+  openModal(`<h2>导入主配置</h2>
+    <p class="hint">先选择配置包并预览差异，确认后再备份当前 <code>state/studio.json</code> 并写入。「已省略」的项不会覆盖本机已有值。</p>
+    <div class="form cfg-form">
+      <input type="file" id="cfgImpFile" accept=".json,application/json">
+      <div id="cfgImpFileInfo" class="hint" hidden></div>
+      <div id="cfgImpPassBox" hidden><input type="password" id="cfgImpPass" placeholder="输入解密口令" autocomplete="current-password"></div>
+      <div id="cfgImpPreview" class="cfg-diff" hidden></div>
+      <div class="cfg-m-acts">
+        <button class="btn" data-close>取消</button>
+        <button class="btn" id="cfgImpCheck" disabled>预览差异</button>
+        <button class="btn primary" id="cfgImpApply" hidden>${icon('check', 14)}确认导入</button>
+      </div>
+    </div>`);
+  $('#modalBox').classList.add('wide');
+  let parsed = null;
+  const resetPreview = () => { $('#cfgImpPreview').hidden = true; $('#cfgImpPreview').innerHTML = ''; $('#cfgImpApply').hidden = true; };
+  $('#cfgImpPass').oninput = resetPreview;
+  $('#cfgImpFile').onchange = async (ev) => {
+    resetPreview();
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) { parsed = null; $('#cfgImpCheck').disabled = true; $('#cfgImpFileInfo').hidden = true; return; }
+    try {
+      parsed = JSON.parse(await f.text());
+    } catch {
+      parsed = null;
+      $('#cfgImpCheck').disabled = true;
+      return toast('不是合法的 JSON 文件');
+    }
+    const enc = !!(parsed && parsed.encrypted);
+    $('#cfgImpFileInfo').hidden = false;
+    $('#cfgImpFileInfo').textContent = `${f.name} · ${enc ? '加密配置包（需口令解密）' : '明文配置包'}`;
+    $('#cfgImpPassBox').hidden = !enc;
+    $('#cfgImpCheck').disabled = false;
+  };
+  $('#cfgImpCheck').onclick = async () => {
+    if (!parsed) return;
+    const pw = parsed.encrypted ? $('#cfgImpPass').value : '';
+    if (parsed.encrypted && !pw) return toast('请输入解密口令');
+    const btn = $('#cfgImpCheck');
+    btn.disabled = true;
+    try {
+      const d = await api('/api/config/import', { bundle: parsed, passphrase: pw, dry_run: true });
+      const p = d.preview || {}, ch = p.changes || [], c = p.counts || {};
+      const badge = { add: ['新增', 'ok'], update: ['覆盖', 'warn'], skip: ['跳过', 'dim'], write: ['本机CLI', 'warn'] };
+      const rows = ch.map((x) => {
+        const [lbl, cls] = badge[x.action] || [x.action, ''];
+        return `<div class="cfg-diff-row"><span class="tag ${cls}">${esc(lbl)}</span><span class="cfg-diff-sec">${esc(x.section)}</span><span>${esc(x.summary)}</span></div>`;
+      }).join('') || '<div class="hint">和当前配置一致，没有需要改动的内容。</div>';
+      const warns = (p.warnings || []).map((w) => `<div class="cfg-warn">${icon('alert', 14)}<span>${esc(w)}</span></div>`).join('');
+      $('#cfgImpPreview').innerHTML = `<div class="cfg-diff-sum">差异汇总：新增 ${c.add || 0} · 覆盖 ${c.update || 0} · 跳过 ${c.skip || 0}${c.write ? ` · 本机CLI ${c.write}` : ''}</div><div class="cfg-diff-list">${rows}</div>${warns}`;
+      $('#cfgImpPreview').hidden = false;
+      $('#cfgImpApply').hidden = false;
+    } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+  };
+  $('#cfgImpApply').onclick = async () => {
+    if (!parsed) return;
+    const pw = parsed.encrypted ? $('#cfgImpPass').value : '';
+    const btn = $('#cfgImpApply');
+    btn.disabled = true;
+    try {
+      const res = await api('/api/config/import', { bundle: parsed, passphrase: pw, confirm: true });
+      const c = (res.preview && res.preview.counts) || {};
+      closeModal();
+      toast(`已导入主配置（新增 ${c.add || 0}，覆盖 ${c.update || 0}，写入前已备份）`);
+      await refresh();
+      renderWall();
+    } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+  };
+}
+document.addEventListener('click', (ev) => {
+  if (ev.target.closest('[data-cfg-export]')) return openExportModal();
+  if (ev.target.closest('[data-cfg-import]')) return openImportModal();
+});
 async function refreshScreens() {
   clearTimeout(wallTimer);
   if (view !== 'wall' && !zoomCam) return;
