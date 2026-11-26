@@ -830,6 +830,9 @@ def session_view(conn, c):
                 env=json.loads(env) if env else {})
 
 
+_adapter_err_seen = {}
+
+
 def adapter_call(conn, f, hook, *args, default=None, raise_errors=False):
     """调用适配器钩子。没有适配器 / 没写这个钩子 → default；出错记 adapter-error，返回 default（raise_errors 时抛 AdapterError）。"""
     if not f:
@@ -841,7 +844,15 @@ def adapter_call(conn, f, hook, *args, default=None, raise_errors=False):
             return default
         return fn(AdapterCtx(conn, f), *args)
     except Exception as exc:
-        log_event(conn, 'adapter-error', level='error', film=f['id'], where=hook, err=f'{type(exc).__name__}: {exc}'[:500])
+        err = f'{type(exc).__name__}: {exc}'[:500]
+        log_event(conn, 'adapter-error', level='error', film=f['id'], where=hook, err=err)
+        k = (f['id'], hook, type(exc).__name__)
+        if time.time() - _adapter_err_seen.get(k, 0) > 3600:     # 同一错误每小时在项目频道提醒一次，别只静默记日志（自迭代 11-26 #27）
+            _adapter_err_seen[k] = time.time()
+            try:
+                notice(conn, f['id'], f'项目适配器 .mashu/adapter.py 出错（{hook}）：{err[:200]}。相关调度暂时按默认处理，请子脑修好')
+            except Exception:
+                pass
         if raise_errors:
             raise AdapterError(str(exc)) from exc
         return default
@@ -1026,6 +1037,17 @@ def apply_idle_action(conn, f, c0, act):
     if act['action'] == 'continue':
         end_camera(conn, c['id'], 'wrap', f'适配器：{note}' if note else '适配器：换会话')
         if active_crew(conn, f['id'], key):
+            return
+        # 交班空转保护：cysj #11 曾 30 分钟内连开 14 个 2 分钟的复审会话，每个修一点又交班，不收敛
+        n = one(conn, 'SELECT COUNT(*) AS n FROM cameras WHERE film_id=? AND seq_key IS ? AND role="crew" AND ended_reason LIKE "适配器：交班%" '
+                'AND started_at>? AND updated-started_at<600', f['id'], key, time.time() - 3600)['n']
+        if n >= 5:
+            why = f'1 小时内已交班 {n} 次、每次不到 10 分钟，不再自动开新会话'
+            notice(conn, channel, f'「{c["name"]}」{why}')
+            create_report(conn, 'tell', None, f['id'], key,
+                          f'{channel} {why}。请子脑看最近几次交班说明，决定拆单、让下一个会话一次性全库扫完同类问题，或标完成；决定后 mashu note {channel} "…" 唤起。',
+                          summary=f'{channel} 交班空转（{n} 次），等子脑决定怎么收敛', holder='producer')
+            log_event(conn, 'handoff-loop', c, level='warn', value=n)
             return
         name = pick_song(conn, f['id'], key)
         create_camera(conn, 'crew', f['id'], key, continue_prompt(f, key, act.get('prompt') or ''), name=name)
@@ -3215,6 +3237,8 @@ def answer_report(conn, rid, cam, text, exec_cfg=None):
             raise ValueError('只有开工审批能带执行配置')
         exec_cfg = check_exec(exec_cfg)
     check_holder(conn, r, cam)
+    if cam is None and re.fullmatch(r'\s*\d{6}\s*', text or '') and text.strip() not in (json.loads(r.get('options') or '[]') or []):
+        raise ValueError('这像是一次性验证码：请在要验证码的那个网页里输入，不要发在批复里（这条没有记为批复）')
     if json.loads(r.get('meta') or '{}').get('external'):
         return answer_external(conn, r, cam, text)
     level = actor_level(cam)
