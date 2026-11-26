@@ -3881,7 +3881,7 @@ def health_guard(conn):
                 _health_retry.pop(c['id'], None)
                 event(conn, c['film_id'], c['seq_key'], f'「{c["name"]}」恢复正常了')
             continue
-        stalled = now - seen[2]
+        stalled = now - max(seen[2], c['last_active'] or 0)   # 从这一轮开始算：长时间没聊、刚发新消息不算卡
         title = camera_title(conn, c)
         bill = BILLING_RE.search('\n'.join(lines[-12:]))
         if bill and stalled >= 45:
@@ -4753,7 +4753,7 @@ def live_replies(conn):
         entry = dict(role=c['role'], name=c['name'], crew_role=c['crew_role'], film_id=c['film_id'],
                      text=text, tool=tool, waiting=False,
                      health=c['health'] or '', health_note=c['health_note'] or '', health_at=c['health_at'],
-                     stalled_min=int((time.time() - seen[2]) // 60) if seen else 0)   # 按分钟取整，免得每秒推一次
+                     stalled_min=int((time.time() - max(seen[2], c['last_active'] or 0)) // 60) if seen else 0)   # 按分钟取整，免得每秒推一次
         if rtools:
             entry['tools'] = rtools
             entry['tools_total'] = ttotal
