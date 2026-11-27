@@ -6,6 +6,7 @@ studio.py 只有入口（tick 钩子、CLI、简报一行、status_data 字段�
 import datetime
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import subprocess
@@ -420,7 +421,57 @@ def sec_changes(conn, since):
     return '\n'.join(out)
 
 
-def collect_material(conn, hours=None):
+def claude_docs_usage(transcript, root):
+    seen = {}
+    for entry in studio.read_transcript(transcript):
+        if entry.get('type') != 'assistant' or entry.get('isSidechain'):
+            continue
+        content = (entry.get('message') or {}).get('content')
+        for tool in content if isinstance(content, list) else []:
+            if tool.get('type') == 'tool_use' and isinstance(tool.get('input'), dict):
+                studio.docs.update_usage(seen, tool.get('name', ''), tool['input'], root, entry.get('cwd') or root)
+    return seen
+
+
+def docs_sections(conn, since):
+    drift = [row for row in studio.skill_inventory(conn) if row['status'] not in ('来源', '一致')
+             or row['project'] is None and row['status'] == '一致' and not row['linked']]
+    lines = ['## caesar-docs 漂移', *(f'- {row["status"] if row["status"] != "一致" else "需改为软链接"} {row["path"]}'
+                                     for row in drift)]
+    if not drift:
+        lines.append('所有已登记安装位置一致。')
+    totals, sessions = {}, []
+    cameras = rows(conn, '''SELECT c.*, m.v AS docs_usage FROM cameras c
+                           LEFT JOIN meta m ON m.k='docs-usage:' || c.id
+                           WHERE c.started_at>? OR c.last_active>? ORDER BY c.id''', since, since)
+    for cam in cameras:
+        project, role = cam['film_id'] or '全局', studio.LEVEL_LABEL.get(cam['role'], cam['role'])
+        counts = totals.setdefault((project, role), [0, 0, 0, 0, 0, 0])
+        counts[0] += 1
+        seen = json.loads(cam['docs_usage'] or '{}')
+        if studio.cam_provider(conn, cam) == 'claude':
+            f = studio.f_of(conn, cam)
+            root = Path(f['path']).resolve() if f else studio.CODE
+            seen = claude_docs_usage(studio.transcript_file(conn, cam), root) or seen
+        if not seen:
+            sessions.append(f'- #{cam["id"]} {project} · {role} · 无 docs 工具记录')
+            continue
+        counts[1] += 1
+        read = seen.get('read') or []
+        first = bool(read and read[0].endswith('docs/indexes/docs.md'))
+        num, validated, edited = len(read), bool(seen.get('validated')), bool(seen.get('edited'))
+        for index, value in enumerate((first, num, validated, edited), 2):
+            counts[index] += value
+        sessions.append(f'- #{cam["id"]} {project} · {role} · 首读入口 {"是" if first else "否"} · {num} 篇 · '
+                        f'validate {"有" if validated else "无"} · docs 写入 {"有" if edited else "无"}')
+    lines += ['', '## docs 使用统计', '按项目与角色汇总可观察的直接阅读、校验和写入工具调用。']
+    lines += [f'- {project} · {role} · 会话 {total}（有记录 {observed}） · 首读入口 {first} · 阅读合计 {read} 篇 · '
+              f'validate {validated} · docs 写入 {edited}'
+              for (project, role), (total, observed, first, read, validated, edited) in sorted(totals.items())]
+    return '\n'.join(lines + sessions)
+
+
+def collect_material(conn, hours=None, governance=None):
     """最近 N 小时的素材 → (文字, 是否有活动)。节的顺序就是优先级，超长先砍后面的。"""
     ensure_tables(conn)
     hours = float(hours or cfg('self_iterate_hours'))
@@ -433,7 +484,8 @@ def collect_material(conn, hours=None):
             f'- 项目：' + ('，'.join(f'{f["title"]}[{f["id"]}]' for f in studio.films(conn)) or '无') +
             f'\n- 会话 {n_cam} 个，上报 {n_rep} 张，用户消息 {n_user} 条')
     # 往期建议、规则原文、已改过什么提前：超长时宁可砍细节，也不能让模型看不到现状而提重复建议
-    parts = [(head, 2000), (s1, 20000), (s2, 8000), (sec_features(conn, since), 8000), (s4, 6000),
+    parts = [(head, 2000), (governance if governance is not None else docs_sections(conn, since), 8000),
+             (s1, 20000), (s2, 8000), (sec_features(conn, since), 8000), (s4, 6000),
              (sec_past(conn), 5000), (sec_rules(conn), 18000), (sec_changes(conn, since), 4000),
              (sec_decisions(conn, since_iso), 3000), (sec_usage(conn, since), 2000), (sec_system(conn, since_iso), 3000), (sec_runtime(conn, since), 4000),
              ('## 8 复盘数据（近 7 天）\n' + studio.retro_text(conn, days=7), 5000), (sec_files(conn), 4000)]
@@ -573,6 +625,8 @@ def report_md(run, rep, items):
     out += ['', f'## 会话 review（{len(rep["sessions"])}）']
     out += [f'- {s["session"]}（{s["role"]} · {s["project"]}）效果 {s["effect"]}：目的 {s["purpose"]}；链路 {s["chain"]}；{s["comment"]}'
             for s in rep['sessions']]
+    if rep.get('docs_governance'):
+        out += ['', rep['docs_governance']]
     return '\n'.join(out) + '\n'
 
 
@@ -586,7 +640,8 @@ def store_report(conn, rid, rep):
                          (rid, run['day'], sec, x.get('area') or sec, x['target'], x['title'], x['evidence'], x['change'],
                           x.get('priority') or ''))
     conn.execute('UPDATE self_iterate_runs SET status="ok", ended_at=?, report=? WHERE id=?',
-                 (time.time(), json.dumps(dict(summary=rep['summary'], sessions=rep['sessions'], followups=rep.get('followups') or []),
+                 (time.time(), json.dumps(dict(summary=rep['summary'], sessions=rep['sessions'], followups=rep.get('followups') or [],
+                                               docs_governance=rep.get('docs_governance', '')),
                                           ensure_ascii=False), rid))
     conn.commit()
     items = rows(conn, 'SELECT * FROM self_iterate_items WHERE run_id=? ORDER BY id', rid)
@@ -610,7 +665,8 @@ def execute(rid):
         run = run_row(conn, rid)
         d = archive_dir(run)
         try:
-            text, active = collect_material(conn)
+            governance = docs_sections(conn, time.time() - float(cfg('self_iterate_hours')) * 3600)
+            text, active = collect_material(conn, governance=governance)
             (d / 'input.md').write_text(text)
             conn.execute('UPDATE self_iterate_runs SET input_chars=?, archive=? WHERE id=?', (len(text), str(d), rid))
             conn.commit()
@@ -635,6 +691,7 @@ def execute(rid):
                 rep = parse_report(res.get('result'))
             except ValueError as exc:
                 return fail(conn, rid, f'报告不是合法 JSON：{exc}')
+            rep['docs_governance'] = governance
             store_report(conn, rid, rep)
         except Exception as exc:
             traceback.print_exc()
@@ -703,6 +760,8 @@ def show_text(conn, day=''):
             out += ['', f'已采纳改动的效果（{len(fu)}）：'] + [f'  {x["item"]} {x["status"]}：{x["evidence"]}' for x in fu]
         out += ['', f'会话 review（{len(rep.get("sessions") or [])}）：']
         out += [f'  {s["session"]} {s["role"]} {s["effect"]}：{s["comment"]}' for s in rep.get('sessions') or []]
+        if rep.get('docs_governance'):
+            out += ['', rep['docs_governance']]
         out += ['', '采纳：mashu self-iterate adopt <编号…> --note "怎么落实"；不采纳：reject；已被别的改动解决：cover；不再成立：outdated；撤销：reset']
     return '\n'.join(out)
 

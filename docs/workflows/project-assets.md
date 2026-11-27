@@ -53,7 +53,7 @@ related:
 1. 建工作区目录、克隆仓库；工作区本身也要记事时 `git init`，用 `.gitignore` 排除各工程仓库。
 2. 先把克隆下来缺的东西补齐再判断「能不能跑」：依赖（`npm ci` 等）、不进 git 的工具链产物（如 Builda SDK：`./.builda-agent/builda check` 后 `builda sdk install`）。缺 SDK 时类型检查会报找不到模块，不是代码坏了。
 3. 留意会自己改跟踪文件的工具：`builda check` 会把项目里的 Builda CLI 升到最新版，克隆后立刻出现 `.builda-agent/` 改动。这类改动单独提交或请用户定，不混进功能提交；SDK 版本是锁定的，只在用户要求时升级。
-4. `mashu add-project <路径> --title …`，再补 `.mashu/README.md`、`rules.md`、`check.sh`（跑 docs 验证和工程自检，失败行带 ERROR）、`hotspots.txt`，跑一遍 `check.sh` 确认通过。
+4. `mashu add-project <路径> --title …`，再补 `.mashu/README.md`、`rules.md`、`check.sh`（工程自检，失败行带 ERROR）、`hotspots.txt`，跑一遍 `check.sh`。登记时会同步已存在的 caesar-docs 副本。带 check 的阶段另有基线校验，项目脚本可在 `MASHU_DOCS_MANAGED=1` 时跳过重复的 docs 校验。
 5. 用 caesar-docs 建或接上知识地图；多工程工作区用两级地图：工作区只放工程目录和跨工程约束，各工程保留自己的地图和六技能副本。
 6. `mashu decide` 记一笔，进度写进项目的 `producer-notes.md`。
 

@@ -41,6 +41,8 @@ import config_file as cfgfile  # noqa: E402   主配置文件、迁移、加密�
 import platforms as plat  # noqa: E402   Codex / OpenCode 的纯函数部分
 import live_parsers as lp  # noqa: E402   Gemini / Codex / OpenCode 实时会话解析（#8）
 import accounts as acct  # noqa: E402   账号池：Codex / Gemini 多账号（#4）
+import docs_governance as docs  # noqa: E402
+import skill_sync as skills_dist  # noqa: E402
 
 CODE = Path(__file__).resolve().parent.parent
 PROMPTS = Path(__file__).resolve().parent / 'prompts'
@@ -71,7 +73,7 @@ DEFAULTS = dict(
     context_force=0.9,            # 提醒后又跑过一轮仍 ≥ 此值：调度器强制交接
     handoff_grace_minutes=10,     # 提醒后超过这么久还没交接：调度器强制交接
     crew_linger_minutes=30,       # 功能全部完成后执行者先不收工，空闲这么久（或功能归档）再收工；期间的微调发回同一会话
-    docs_skill='skills/caesar-docs',   # 受管会话加载的 docs skill 目录（相对路径 = 相对本仓库；'' = 不加载）
+    docs_skill='skills/caesar-docs',   # 启用仓库里的唯一来源；保留旧配置字段，空值跳过受管挂载
     permission_mode='bypassPermissions',
     claude='claude',
     agy='agy',                    # Antigravity CLI（Gemini）的可执行文件；Gemini 会话用它开
@@ -546,6 +548,7 @@ def greenlight(conn, path, film_id=None, title=None):
                  (film_id, conf['title'], ftype, str(path), producer, now_iso()))
     conn.commit()
     ensure_film_docs(film(conn, film_id))
+    sync_project_skills(conn, film_id)
     notice(conn, film_id, f'{conf["title"]}登记项目：{path}。')
     return film(conn, film_id), True
 
@@ -1660,7 +1663,7 @@ def end_camera(conn, cid, reason, detail=None):
 # 每个角色只有一份交接：主脑 state/handoff/handoff.md，子脑 .mashu/handoff.md，执行者 <功能资料目录>/handoff.md。
 # 上下文到 context_handoff → 提醒；会话写 handoff.md + finish → 同名字、同窗格换新的 claude 会话；不交接就由调度器强制。
 
-HANDOFF_SECTIONS = ('现状', '下一步', '未决事项', '关键文件')
+HANDOFF_SECTIONS = ('现状', '下一步', '未决事项', '关键文件', '文档回写')
 HANDOFF_KEEP = 50
 
 
@@ -1742,7 +1745,8 @@ def write_handoff(conn, c, secs, auto=False, mirror=None):
             h = data.setdefault('handoff', {})
             if mirror is None:
                 mirror = {k: (secs.get(sec) or '').strip() for k, sec in
-                          (('progress', '现状'), ('next', '下一步'), ('confirm', '未决事项'), ('context', '关键文件'))}
+                          (('progress', '现状'), ('next', '下一步'), ('confirm', '未决事项'), ('context', '关键文件'), ('docs', '文档回写'))
+                          if (secs.get(sec) or '').strip() not in ('', '（无）') or k != 'docs'}
             h.update(mirror, updated_at=now_iso())
             save_state(f, c['seq_key'], data)
     return p
@@ -2246,10 +2250,7 @@ def gemini_sync_local():
 
 def codex_login_home(a):
     """给池里的 Codex 号建 CODEX_HOME（配置、hooks 和麻薯会话一样，auth.json 是这个号自己的）。"""
-    skills = {}
-    host = skill_host()
-    if host:
-        skills['caesar-docs'] = Path(os.path.realpath(host / '.claude' / 'skills' / 'caesar-docs'))
+    skills = {skills_dist.NAME: src} if (src := docs_skill_source()) else {}
     return plat.build_codex_home(codex_acct_home(a), CODEX_USER_HOME, skills, extra=plat.codex_hooks_toml(shlex.quote(str(BIN / 'mashu'))),
                                  link_auth=False)
 
@@ -2606,26 +2607,27 @@ def project_entry(f):
 
 
 def skill_host():
-    """受管会话专用的 skill 目录：--add-dir 它就能用 caesar-docs，不动 ~/.claude/skills。"""
-    raw = cfg('docs_skill') or ''
-    src = Path(os.path.expanduser(raw)) if raw else None
-    if src and not src.is_absolute():
-        src = CODE / src
-    src = src.resolve() if src else None
-    if not src or not (src / 'SKILL.md').exists():
-        return None
-    link = HOME / 'skill-host' / '.claude' / 'skills' / 'caesar-docs'
-    try:
-        link.parent.mkdir(parents=True, exist_ok=True)
-        if not link.is_symlink() or os.readlink(link) != str(src):
-            tmp = link.with_name('.caesar-docs.tmp')
-            if tmp.is_symlink() or tmp.exists():
-                tmp.unlink()
-            tmp.symlink_to(src)
-            os.replace(tmp, link)
-    except OSError:
-        return None
-    return HOME / 'skill-host'
+    """Claude 的本地插件目录。"""
+    source = docs_skill_source()
+    return skills_dist.claude_plugin(HOME, source) if source else None
+
+
+def docs_skill_source():
+    source = skills_dist.SOURCE
+    return source if cfg('docs_skill') and (source / 'SKILL.md').is_file() else None
+
+
+def skill_inventory(conn):
+    return skills_dist.inventory(HOME, Path.home(), codex_homes(), films(conn))
+
+
+def sync_project_skills(conn, project=None):
+    if not docs_skill_source():
+        return
+    projects = [f for f in films(conn) if project is None or f['id'] == project]
+    _, errors = skills_dist.sync(HOME, Path.home(), codex_homes(), projects, apply=True, managed_only=True)
+    for error in errors:
+        notice(conn, project or 'assistant', f'docs skill 同步提示：{error}')
 
 
 def brain_profile(role, f=None):
@@ -2720,9 +2722,6 @@ def agy_cmd(conn, c, cwd, sid, as_file, no_prompt):
     if c['role'] == 'crew':
         dirs.append(seq_dir(f_of(conn, c), c['seq_key']))
     dirs.append(KMAP)
-    host = skill_host()
-    if host:
-        dirs.append(host)
     cmd = [cfg('agy'), '--dangerously-skip-permissions', '--settings', str(agy_settings(c['id'], [cwd, *dirs]))]
     for d in dirs:
         cmd += ['--add-dir', str(d)]
@@ -2756,10 +2755,7 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
     - 系统提示：-c developer_instructions=…（启动、恢复都传）；
     - 会话 ID 不能预先指定：SessionStart / UserPromptSubmit hook 回写；恢复用 codex resume <ID>。
     返回 (命令, sid, 额外环境变量, 启动前的 shell 行)。"""
-    skills = {}
-    host = skill_host()
-    if host:
-        skills['caesar-docs'] = Path(os.path.realpath(host / '.claude' / 'skills' / 'caesar-docs'))
+    skills = {skills_dist.NAME: src} if (src := docs_skill_source()) else {}
     # 账号池：新会话按规则挑号（每个号一个 CODEX_HOME，会话之间互不影响）；恢复会话回到 rollout 所在的那个号目录，中途不换号
     a, why = (None, '')
     if sid:
@@ -2825,7 +2821,10 @@ def opencode_cmd(conn, c, cwd, sid, as_file, no_prompt):
             meta_set(conn, f'pending-prompt:{c["id"]}', c['prompt'] or '继续')
     elif not no_prompt:
         cmd += ['--prompt', as_file('prompt', c['prompt'] or '开工')]
-    env = dict(OPENCODE_CONFIG_DIR=str(opencode_config_dir()), MASHU_BIN=str(BIN / 'mashu'),
+    config = opencode_config_dir()
+    if source := docs_skill_source():
+        skills_dist.link_skill(config / 'skills' / skills_dist.NAME, source, HOME / 'backup')
+    env = dict(OPENCODE_CONFIG_DIR=str(config), MASHU_BIN=str(BIN / 'mashu'),
                MASHU_SYSTEM_FILE=str(HOME / 'launch' / f'{c["id"]}-system.txt'),
                XDG_STATE_HOME=str(opencode_state_home(pref['model'], conf.get('agent', {}).get('build', {}).get('variant'))),
                MASHU_USER_XDG_STATE_HOME=os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local' / 'state'))
@@ -2919,7 +2918,7 @@ def launch(conn, cid, pane=None, no_prompt=False):
         cmd += ['--add-dir', str(KMAP)]            # 麻薯的知识地图（手册、命令、流程、记忆）
         host = skill_host()
         if host:
-            cmd += ['--add-dir', str(host)]         # caesar-docs skill
+            cmd += ['--plugin-dir', str(host)]
         pref = session_pref(conn, c, 'claude')
         if pref['model']:
             cmd += ['--model', pref['model']]
@@ -3791,23 +3790,31 @@ def all_feature_commits(f, key):
     return shas
 
 
-def run_check(f, key, stage_no):
+def run_check(f, key, stage_no, repos=None, baselines=None):
     script = film_docs(f) / 'check.sh'
-    if not script.exists():
-        return dict(ok=True, unconfigured=True, tail='', path=None, code=0)
-    try:
-        r = subprocess.run(['bash', str(script)], cwd=f['path'], capture_output=True, text=True,
-                           timeout=cfg('check_timeout_minutes') * 60, env=dict(os.environ, MASHU_FEATURE=key))
-        out, code = (r.stdout or '') + (r.stderr or ''), r.returncode
-    except subprocess.TimeoutExpired:
-        out, code = '检查超时', 124
+    out, code = 'MASHU_CHECK_UNCONFIGURED', 0
+    if script.exists():
+        try:
+            r = subprocess.run(['bash', str(script)], cwd=f['path'], capture_output=True, text=True,
+                               timeout=cfg('check_timeout_minutes') * 60,
+                               env=dict(os.environ, MASHU_FEATURE=key, MASHU_DOCS_MANAGED='1'))
+            out, code = (r.stdout or '') + (r.stderr or ''), r.returncode
+        except subprocess.TimeoutExpired:
+            out, code = 'ERROR 检查超时', 124
+    if repos is None:
+        repos = docs.feature_repos(f['path'], set_dir(f, key), feature_tag(f, key))
+    if baselines is None:
+        baselines = {}
+    failed, docs_output = docs.check_maps(repos, baselines, docs.warn_only(f, film_docs(f)))
+    out += '\n' + docs_output
+    code = code or int(failed)
     lines = out.strip().splitlines()
     tdir = seq_dir(f, key) / 'tests'
     tdir.mkdir(parents=True, exist_ok=True)
     p = tdir / f'check-stage{stage_no}-{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}.md'
-    p.write_text(f'# 自动检查 · 阶段 {stage_no}\n\n- 命令：bash .mashu/check.sh\n- 退出码：{code}\n- 时间：{now_iso()}\n\n```\n'
+    p.write_text(f'# 自动检查 · 阶段 {stage_no}\n\n- 命令：bash .mashu/check.sh、caesar_docs.py validate\n- 退出码：{code}\n- 时间：{now_iso()}\n\n```\n'
                  + '\n'.join(lines[-200:]) + '\n```\n')
-    return dict(ok=code == 0, unconfigured='MASHU_CHECK_UNCONFIGURED' in out, tail='\n'.join(lines[-40:]),
+    return dict(ok=code == 0, docs_failed=failed, unconfigured='MASHU_CHECK_UNCONFIGURED' in out, tail='\n'.join(lines[-40:]),
                 path=str(p.relative_to(seq_dir(f, key))), code=code)
 
 
@@ -3822,6 +3829,13 @@ def finish_checks(conn, c):
         return True, '本阶段未标记完成：按交接处理，不做完成检查'
     notes, warns = [], []
     strict = cfg('strict_checks')
+    tag = feature_tag(f, key)
+    repos = docs.feature_repos(f['path'], set_dir(f, key), tag)
+    handoff_docs = (data.get('handoff') or {}).get('docs') or ''
+    complete = seq_done(data)
+    issues = docs.finish_issues(repos, tag, handoff_docs, complete)
+    if issues:
+        return False, '\n'.join(issues)
     if d.get('require_ac'):
         items = load_ac(f, key)
         bad = [i['id'] for i in items if not i.get('passes')]
@@ -3854,20 +3868,20 @@ def finish_checks(conn, c):
             conn.commit()
             notes.append('自动检查：已获豁免（用掉了）')
         else:
-            res = run_check(f, key, n)
+            res = run_check(f, key, n, repos, data.setdefault('docs_baseline', {}))
             st['check_result'] = dict(ok=res['ok'], unconfigured=res['unconfigured'], evidence=res['path'], at=now_iso())
             if res['unconfigured']:
-                notes.append('项目还没配置 .mashu/check.sh，这次没有自动检查')
-                notice(conn, f['id'], f'{seq_label(f, key)} 完成阶段 {n} 时没有自动检查：.mashu/check.sh 还没配置')
-            elif not res['ok']:
-                if strict:
+                notes.append('项目还没配置 .mashu/check.sh')
+                notice(conn, f['id'], f'{seq_label(f, key)} 阶段 {n} 跳过项目脚本：.mashu/check.sh 还没配置')
+            if not res['ok']:
+                if strict or res['docs_failed']:
                     st['status'] = '进行中'
                     save_state(f, key, data)
                     return False, (f'自动检查没通过（退出码 {res["code"]}，记录在 {res["path"]}）：\n{res["tail"]}\n'
                                    f'修好后 mashu feature set {n} 已完成 再 mashu finish。如果失败不是你的改动造成的（同目录还有其他功能），'
                                    'mashu ask 请子脑判断；子脑可以 mashu waive 豁免一次。')
                 warns.append(f'自动检查没通过（退出码 {res["code"]}，记录在 {res["path"]}）')
-            else:
+            elif not res['unconfigured'] or res['tail'].strip() != 'MASHU_CHECK_UNCONFIGURED':
                 notes.append(f'自动检查通过（{res["path"]}）')
     save_state(f, key, data)
     if warns:      # 不打回：交给子脑判断要不要返工
@@ -6754,7 +6768,7 @@ def codex_tool_calls(payload):
     if name in ('Bash', 'shell', 'exec_command', 'local_shell', 'unified_exec'):
         c = ti.get('command') if ti.get('command') is not None else ti.get('cmd')
         command = ' '.join(c) if isinstance(c, list) else str(c or '')
-        calls = [('Bash', {'command': command})]
+        calls = [('Bash', {'command': command, 'workdir': ti.get('workdir') or hook_cwd(payload)})]
         if 'apply_patch' in command and '*** Begin Patch' in command:
             calls.extend(('Write', {'file_path': path}) for path in plat.patch_files(command, ti.get('workdir') or hook_cwd(payload)))
         return calls
@@ -6775,6 +6789,16 @@ def opencode_tool_calls(payload):
     f = film(conn, c['film_id']) if c and c['film_id'] else None
     mcp = ((f or {}).get('safety') or {}).get('mcp_tools') or []
     return plat.opencode_tool(payload.get('tool'), payload.get('args'), hook_cwd(payload), mcp)
+
+
+def record_docs_usage(conn, c, f, tool, ti):
+    if not docs.usage_events(tool, ti):
+        return
+    key = f'docs-usage:{c["id"]}'
+    summary = json.loads(meta_get(conn, key, '{}'))
+    root = Path(f['path']).resolve() if f else CODE
+    if docs.update_usage(summary, tool, ti, root, ti.get('workdir') or os.getcwd()):
+        meta_set(conn, key, json.dumps(summary, ensure_ascii=False))
 
 
 def _pretool(tool, ti):
@@ -6812,6 +6836,10 @@ def _pretool(tool, ti):
                       f'{hit[1]}：{json.dumps(ti, ensure_ascii=False)[:200]}')
             return
     if not hit:
+        try:
+            record_docs_usage(conn, c, f, tool, ti)
+        except (OSError, ValueError, sqlite3.Error):
+            pass
         return
     gate, label = hit
     detail = json.dumps(ti, ensure_ascii=False)[:300]
@@ -6856,7 +6884,7 @@ def session_context(conn, c):
                     f'{project["title"]} · {project["producer_name"]}' for project in films(conn)[:24]) + '\n'
                 f'在办（节选）：\n{tail(MEMORY / "在办.md", 3000)}\n\n'
                 f'你手上的上报：{len(open_reports(conn, "assistant"))} 个（mashu reports）；全局：mashu status'
-                + handoff_context(conn, c))
+                + docs.routes(CODE) + handoff_context(conn, c))
     f = film(conn, c['film_id'])
     if not f:
         return ''
@@ -6866,8 +6894,10 @@ def session_context(conn, c):
                 f'{brain_profile("producer", f)[:2400]}\n{project_codex(f)[:2200]}\n{parallel_roster(conn, f)}\n'
                 f'项目笔记（节选）：\n{tail(d / "producer-notes.md", 1500)}\n\n'
                 f'你手上的上报：{len(open_reports(conn, "producer", f["id"]))} 个（mashu reports）；项目状态：mashu status {f["id"]}'
-                + handoff_context(conn, c))
-    return '[上下文恢复 · 执行者]\n' + status_text(f, c['seq_key']) + handoff_context(conn, c)
+                + docs.routes(f['path']) + handoff_context(conn, c))
+    work = set_dir(f, c['seq_key'])
+    return ('[上下文恢复 · 执行者]\n' + status_text(f, c['seq_key'])
+            + (docs.routes(work) or docs.routes(f['path'])) + handoff_context(conn, c))
 
 
 def cmd_hook_session(args):
@@ -7676,6 +7706,8 @@ def cmd_handoff(args):
         secs = parse_handoff(Path(args.file).read_text())
     else:
         secs = {'现状': args.now or '', '下一步': args.next or '', '未决事项': args.open or '', '关键文件': args.files or ''}
+    if args.docs is not None:
+        secs['文档回写'] = args.docs.strip()
     if args.evidence:
         secs['现状'] = (secs.get('现状') or '') + f'\n\n证据：{args.evidence}'
     if args.risk:
@@ -7686,6 +7718,8 @@ def cmd_handoff(args):
     if c['role'] == 'crew':
         mirror = {k: v for k, v in dict(progress=args.now, next=args.next, confirm=args.open, context=args.files,
                                          evidence=args.evidence, risk=args.risk).items() if v} if not args.file else None
+        if mirror is not None and args.docs is not None:
+            mirror['docs'] = secs['文档回写']
     p = write_handoff(conn, c, secs, mirror=mirror)
     notice(conn, channel_of(c), f'「{c["name"]}」写好交接：{p}')
     print(f'已写 {p}。' + ('现在 `mashu finish --reason "上下文交接"`。' if c['context_warned'] else ''))
@@ -8030,14 +8064,41 @@ def cmd_init(args):
         directory = film_docs(project)
         if directory.is_dir() and not (directory / 'codex.md').exists():
             (directory / 'codex.md').write_text(CODEX_TEMPLATE)
+    sync_project_skills(conn)
     conn.close()
     print(f'  ✓ 数据目录 {HOME}')
     missing = [n for n in ('index.md', '用户.md', '方针.md', '在办.md', '复盘.md', '守则.md') if not (MEMORY / n).exists()]
     print(f'  {"✗ 记忆缺文件：" + "、".join(missing) if missing else "✓ 记忆 " + str(MEMORY)}')
     host = skill_host()
-    print(f'  {"✓ docs skill 已挂载" if host else "- 没找到 docs skill（studio.json 的 docs_skill），知识地图照常可读，只是不加载 skill"}')
+    print(f'  {"✓ docs skill 已挂载，可用 mashu skills status 检查安装位置" if host else "- docs skill 未启用，知识地图照常可读"}')
     print('\n下一步：' + ('./start.sh 启动，然后在网页主对话里跟麻薯说话。想定制自己的麻薯：改 docs/memory/（用户、方针、守则）'
                         '和 mashu/prompts/，详见 README。' if ok else '先装好上面标 ✗ 的依赖，再跑一次 mashu init。'))
+
+
+def cmd_skills(args):
+    with db() as conn:
+        if args.action == 'status':
+            rows = skill_inventory(conn)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            else:
+                for row in rows:
+                    print(f'{row["status"]}\t{row["version"] or "—"}\t{(row["fingerprint"] or "—")[:8]}\t{row["path"]}')
+            return
+        projects = films(conn)
+        if args.project:
+            projects = [require_film(conn, args.project)]
+        changes, errors = skills_dist.sync(HOME, Path.home(), codex_homes(), projects,
+                                           apply=args.apply, managed_only=args.managed_only)
+    print('已同步' if args.apply else '预览（加 --apply 执行）')
+    for change in changes:
+        print(f'- {change}')
+    if not changes:
+        print('无需更改')
+    for error in errors:
+        print(f'ERROR {error}', file=sys.stderr)
+    if errors:
+        raise SystemExit(1)
 
 
 def _prompt_passphrase(prompt, confirm=False):
@@ -8166,7 +8227,7 @@ def main(argv=None):
     s.add_argument('--seq'); s.add_argument('--ratify', action='store_true', help='要用户追认（默认记为已执行）')
     s = sub.add_parser('finish', aliases=['wrap'], help='本阶段完成 / 交接'); s.add_argument('--reason', required=True)
     s = sub.add_parser('handoff', help='写交接文档 handoff.md（上下文到 75%% 时用）')
-    for k in ('now', 'next', 'open', 'files', 'evidence', 'risk', 'file'):
+    for k in ('now', 'next', 'open', 'files', 'evidence', 'risk', 'file', 'docs'):
         s.add_argument(f'--{k}')
     sub.add_parser('reports', help='我手上的上报')
     s = sub.add_parser('priority', help='调整排队优先级'); s.add_argument('ref'); s.add_argument('value', type=int)
@@ -8180,6 +8241,12 @@ def main(argv=None):
     s.add_argument('arg', nargs='?', help='add：内容；pass/fail：AC 编号'); s.add_argument('--evidence'); s.add_argument('--ref')
     s = sub.add_parser('claim', help='声明改动范围'); s.add_argument('globs', nargs='+'); s.add_argument('--add', action='store_true')
     s = sub.add_parser('sync', help='查看或更新项目协作板'); s.add_argument('text', nargs='?')
+    s = sub.add_parser('skills', help='检查或同步 caesar-docs').add_subparsers(dest='action', required=True)
+    s.add_parser('status', help='查看版本和指纹').add_argument('--json', action='store_true')
+    s = s.add_parser('sync', help='预览或应用同步')
+    s.add_argument('--apply', action='store_true')
+    s.add_argument('--managed-only', action='store_true', help='跳过用户级目录')
+    s.add_argument('--project', help='只同步指定工程的副本')
     s = sub.add_parser('peer', help='联系同项目执行者'); s.add_argument('ref'); s.add_argument('text')
     s = sub.add_parser('codex', help='查看工程法典或追加子脑约定'); s.add_argument('action', choices=['note'], nargs='?'); s.add_argument('text', nargs='?')
     s.add_argument('--ref')
@@ -8227,7 +8294,7 @@ def main(argv=None):
         'tell': cmd_tell, 'report': cmd_report, 'pass': cmd_pass, 'answer': cmd_answer, 'decide': cmd_decide, 'browser': cmd_browser,
         'finish': cmd_finish, 'handoff': cmd_handoff, 'reports': cmd_reports, 'priority': cmd_priority, 'feature': cmd_seq, 'tick': cmd_tick,
         'playbook': cmd_playbook, 'retro': cmd_retro, 'logs': cmd_logs, 'ac': cmd_ac, 'claim': cmd_claim, 'waive': cmd_waive, 'digest': cmd_digest,
-        'sync': cmd_collaboration, 'peer': cmd_collaboration, 'codex': cmd_collaboration,
+        'sync': cmd_collaboration, 'peer': cmd_collaboration, 'codex': cmd_collaboration, 'skills': cmd_skills,
         'statusline': cmd_statusline, 'hook-prompt': cmd_hook_prompt, 'hook-stop': cmd_hook_stop, 'hook-notify': cmd_hook_notify,
         'hook-pretool': cmd_hook_pretool, 'hook-session': cmd_hook_session,
         'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,

@@ -4,7 +4,7 @@ km_type: reference
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-13
+last_verified: 2026-11-27
 source_of_truth:
   - mashu/studio.py
   - mashu/prompts/
@@ -29,7 +29,7 @@ related:
 
 ## 范围与何时读
 
-麻薯电脑秘书（本仓库）的入口。主脑、子脑、执行者的系统提示只写身份和“先读哪里”，其余都在这里按需读：像读 skill 一样，用到哪节读哪节，不要一次全读。
+麻薯电脑秘书（本仓库）的入口。先用下表定位职责、实现和验证路线，读到足以动手就停。落点明确的小修可以直接改。文档内容和实现冲突时，查代码与测试，再回写受影响的事实。
 
 ## 按角色
 
@@ -56,5 +56,5 @@ related:
 
 ## 记录、验证与回写
 
-- 维护 docs 时可以用 caesar-docs skill（受管会话已加载）：`python3 <skill>/scripts/caesar_docs.py validate`。
+- 维护 docs 时可用 `caesar-docs`。带 check 的阶段会自动验证涉及的知识地图，手动检查可运行 `python3 skills/caesar-docs/scripts/caesar_docs.py validate`。
 - 只改对应节点，不往本索引追加日志；行为变了就同步改节点和 `last_verified`。

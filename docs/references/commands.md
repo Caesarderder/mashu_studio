@@ -32,7 +32,9 @@ related:
 | `mashu status [项目]` | 全局或某个项目的状态 |
 | `mashu ask "…" --options "A|B" --recommend A --why "…" [--gate prod|irreversible] [--summary …]` | 请示（执行者 → 子脑；子脑 / 主脑 → 用户）。需要真人帮忙（登录、密钥、付款、线下）加 `--human`。自己上一条 ask 还没回（30 分钟内）时会被拦，让你合并；紧急且无关加 `--urgent`。正文超过 400 字或 3 个以上问号会被拒（一条只问一件事） |
 | `mashu tell "…"` | 通报，不需要回答 |
-| `mashu handoff --now … --next … [--open … --files … --evidence … --risk …]` / `--file PATH` | 写交接文档 handoff.md |
+| `mashu handoff --now … --next … [--open … --files … --evidence … --risk … --docs …]` / `--file PATH` | 写交接文档。`--docs` 记录回写节点或无需回写的理由 |
+| `mashu skills status [--json]` | 列出 caesar-docs 来源和各安装位置的版本、指纹及漂移 |
+| `mashu skills sync [--apply] [--managed-only] [--project ID]` | 默认预览。应用时备份并替换用户级链接，`--managed-only` 跳过用户级位置，`--project` 限定工程副本 |
 | `mashu finish --reason "…"` | 本阶段完成 / 交接 |
 | `mashu restart-server --reason "…"` | 重启网页服务与调度器（只给主脑；各会话不受影响，和网页「重启服务」按钮同一做法） |
 

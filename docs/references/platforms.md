@@ -75,6 +75,12 @@ related:
 - 启动前去掉 `TMUX` / `TMUX_PANE`：用户装的 opentmux 插件在 tmux 里会自己开窗格，会打乱麻薯的窗口布局。其他用户插件（dcp、handoff、agent-memory …）照常加载。
 - 会话记录在 OpenCode 自己的库里（`~/.local/share/opencode/`，和用户手开的会话在一起，`opencode` 的会话列表里能看到麻薯开的会话）。
 
+## caesar-docs 分发
+
+麻薯仓库的 `skills/caesar-docs` 是唯一来源。Claude 受管会话用 `--plugin-dir` 加载本地插件，并保留麻薯知识地图的 `--add-dir`。Codex 从各账号的 `CODEX_HOME/skills` 读取。agy 从 `~/.gemini/skills` 读取。OpenCode 从用户级、受管配置的 `skills/` 或兼容目录读取。受管会话启动时列出项目现有的职能索引路径。
+
+执行 `mashu skills sync` 可预览同步。用户级位置在 `--apply` 时用软链接替换，原件保存在 `state/backup/caesar-docs-*`。工程副本由各自的 `.agents/skills-lock.json` 跟踪，检测到本地修改时保留原样。其余 Caesar skill 由 Caesar 游戏工作区维护。每日自迭代汇总版本漂移、阅读、校验和写入观测。
+
 ## 已知限制
 
 - Codex 走订阅，没在 `prices` 里配价格就不算钱；OpenCode 的花费用它自己按 models.dev 价格算的累计值。

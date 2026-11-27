@@ -38,7 +38,7 @@ related:
 ```
 mashu feature status
 mashu feature set <阶段号> <未开始|进行中|待确认|已完成|跳过> [--note "…"]
-mashu handoff --now "做到哪" --next "下一步" [--open "未决事项"] [--files "改了哪些文件、提交"] [--evidence "命令和结果"] [--risk "…"]
+mashu handoff --now "做到哪" --next "下一步" [--open "未决事项"] [--files "改了哪些文件、提交"] [--evidence "命令和结果"] [--risk "…"] [--docs "回写节点或无需修改的理由"]
 mashu feature handoff --progress … --next …      # 旧写法，效果同上
 mashu feature block --text "阻塞原因"            # 解除：mashu feature block --clear
 mashu ac add "WHEN … THE system SHALL …"         # 任何阶段都能加
@@ -51,6 +51,10 @@ mashu peer 12 "请确认导出接口"
 ## 停止条件
 
 全部阶段已完成 → `mashu finish` 后执行者收工。
+
+- 功能标签下既有 `docs/` 外的提交又没有文档改动时，在 `handoff --docs` 写一句无需回写的理由即可。
+- 本功能删除其他功能提交过的 Markdown 一级到三级标题时，完成检查会报告原功能编号。恢复小节，或在获得用户确认后通过 `--docs '允许删除 #N「标题」及其依据'` 说明。
+- 带 check 的阶段在工程脚本之外校验涉及的知识地图。以该仓库首个功能提交之前的版本为基线，原有错误只提示。项目可在 `.mashu/docs-governance.json` 写 `{"validate":"warn"}` 改为只提示，cysj 默认使用该模式。
 
 ## 相关节点
 

@@ -1,9 +1,6 @@
 # Repository docs discovery
 
-Before writing code or taking implementation steps, discover and read the
-repository's docs knowledge map so execution starts from the project's system of
-record. Skip only for one-line edits, renames, trivial regex, or when the user
-explicitly asks to bypass repository docs.
+Use this deeper discovery route when reviewing or migrating the map, or when the implementation spans domains and ownership, constraints, or validation are unclear. For routine tasks, start with the entry in `SKILL.md` and proceed once the relevant facts are known.
 
 ## Precedence
 
@@ -25,13 +22,13 @@ Before recommending, account for the task goal, repository root, docs convention
 
 Before implementing, ask: "What does the repository docs knowledge map say about the workflow, domain, ownership, constraints, and validation path for this task?"
 
-Search the docs route first, read the smallest relevant nodes, and present the route before execution. If docs are missing, stale, or insufficient, say that explicitly and verify against code instead of guessing.
+Search the docs route first and read the smallest relevant nodes. Report findings that change your decision or require user input. Verify missing or stale facts against code.
 
 ## Docs Knowledge Map Pass
 
 Before implementation or external tool discovery, check whether the current project has a docs knowledge map.
 
-Look for lightweight index entry points first, such as `AGENTS.md`, `ARCHITECTURE.md`, `docs/index.md`, `docs/map/index.md`, `docs/map/workflows.md`, `docs/map/domains.md`, `docs/references/indexes/*`, `docs/**/index.md`, `omx_wiki/`, or other clearly named knowledge-map files. Prefer repository-local docs over external search when they are relevant.
+Start at `docs/indexes/docs.md`, or use `AGENTS.md` to find the active entry for projects that use another layout.
 
 If a map or index exists:
 
@@ -62,7 +59,7 @@ Relevance, trustworthiness, maintenance, documentation quality, stack fit, secur
 - `ASK_USER`: approval, credentials, cost, risk, or ambiguity blocks a safe decision.
 - `AVOID`: docs route or requested action is unsafe.
 
-## Output Format
+## Optional Review Notes
 
 ```text
 Docs Discovery Pass:

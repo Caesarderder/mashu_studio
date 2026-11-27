@@ -8,6 +8,8 @@
 
 ## 先读什么（按需读）
 
+开工读当前工程的 `docs/indexes/docs.md`，没有就读 `AGENTS.md`。用 `caesar-docs` 查路由，按任务选读能定位目标、约束和验证命令的节点，找到方向就动手。麻薯的常规任务可跳过通用 skill 的发现报告，已有明确落点的小修可以直接改。
+
 你的手册 `{{manual}}`：什么时候找子脑、并行开发规矩、完成与交接。状态文件 / 验收标准 / claim 的用法、上报与权限都从知识地图 `{{kmap}}` 找。
 
 ## 消息
@@ -28,7 +30,7 @@
 - 要用户回复时用 `mashu ask --options "A|B" --recommend A` 发成选项按钮，正文一两句说清问什么；不在正文里列编号清单让用户回数字。一条 ask 只问一件事（超过 400 字或 3 个以上问号调度器会拒发）；问题多就写进文档，ask 附链接。
 - 禁止 `git stash`、`git checkout .`、`git restore .`、`git reset --hard`、`git clean -f`、`git add -A`、`git add .`、`git commit -a`；只 `git add <自己改的文件>`，提交信息以 `[{{film}}#<编号>]` 开头。
 - 标「已完成」前逐条对照验收标准：量化指标（花费、通过率、耗时等）没达标，要么补做到达标，要么 `mashu ask` 请子脑 / 用户接受「部分完成」；评测之后又改过代码、没重跑的，交接里写「未验证」。不把没达标的指标只写进遗留就标完成。（自迭代 #99）
-- 做完：`mashu feature set <阶段号> 已完成` → `mashu handoff --now … --next … --files …` → `mashu finish --reason "完成"`。
+- 做完：`mashu feature set <阶段号> 已完成` → `mashu handoff --now … --next … --files … --docs "回写节点或无需修改的理由"` → `mashu finish --reason "完成"`。
 - 上下文到 75% 调度器会提醒：`mashu handoff …`（写到 `{{handoff}}`）→ `mashu finish --reason "上下文交接"`，同一个你会在新会话里接着做。
 - 不自己重启 / 停止麻薯服务（`start.sh restart`、杀 server 进程）：要重启网页服务时，先备份改过的文件，在回复和交接里写明哪些改动要重启才生效、怎么回滚，然后请用户点网页右上角「重启服务」按钮，不发审批卡。
 - 推断出来的限制性结论（平台规则、账号、权限、额度会卡住某条路），先核实前提（如账号归属、实名主体、版本）再写进文档；核实不了就标「待确认」去问，不当结论写。

@@ -38,17 +38,12 @@ Without `docs-init`, never initialize a missing map or perform repository-wide n
 
 ## Default Discovery Route
 
-For non-trivial implementation, review, migration, architecture, or documentation work:
+1. Start at `docs/indexes/docs.md`. If it is absent, follow `AGENTS.md` to the repository's existing entry. With no map, continue from the code and tests.
+2. Follow only the links needed to find the implementation, relevant constraints, and verification command. Verify behavior-sensitive facts against current code. Once you can proceed, start the task.
+3. For a map review, migration, or an unclear cross-domain change, use [discovery guidance](references/docs-discovery.md) and the project's impact map if available. Give a brief route when it helps explain a decision or an actual blocker.
+4. Update only the knowledge nodes whose facts changed. Run the validator once after map changes, or use the project's automatic check.
 
-1. Read [references/docs-discovery.md](references/docs-discovery.md) completely.
-2. Find lightweight entries such as `AGENTS.md`, `ARCHITECTURE.md`, `docs/index.md`, and `docs/map/index.md`.
-3. Publish the required Docs Discovery Pass before implementation.
-4. Follow indexes to the smallest relevant set of nodes. Stop when route, ownership, invariants, implementation locations, validation, and sync targets are known.
-5. Verify behavior-sensitive documentation against current code, configuration, and tests.
-6. For non-trivial modifications, use the repository's `KM:workflow.impact-map` before editing when available.
-7. After implementation, synchronize only durable changed facts and run the map validator.
-
-One-line edits, obvious renames, trivial regex changes, pure answers, or an explicit request to bypass docs may skip this route.
+Skip discovery for a small change with a known implementation location, a direct answer, or when the user requests it.
 
 ## Knowledge Operations
 
