@@ -66,6 +66,7 @@ DEFAULTS = dict(
     producer_idle_minutes=30,
     report_timeout_minutes=10,    # 上报在某一级停留超时后自动上交
     urgent_timeout_minutes=3,     # 闸门审批、阶段确认的超时
+    user_ask_remind_minutes=120,  # 发给用户的 ask 挂了这么久没人回：回到发卡子脑 inbox 提醒，不再重复推用户
     approval_ttl_hours=2,
     context_window=200000,
     context_window_large=1000000,
@@ -130,6 +131,91 @@ KIND_LABEL = {'ask': '请示', 'confirm': '申请进入下一阶段', 'gate': '�
               'stage-done': '阶段完成', 'sequence-done': '功能完成'}
 MUST_PASS = ('stage-done', 'sequence-done')       # 只能往上交，不能就地结案
 NOTIFY_KINDS = ('tell', 'report', 'stage-done', 'sequence-done')
+
+API_VERSION = 1
+EXIT_OK = 0
+EXIT_ERR = 1
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 3
+EXIT_CONFIRM = 4
+EXIT_RULE = 5
+EXIT_CONFLICT = 6
+EXIT_CODES = {
+    0: '成功',
+    1: '一般错误',
+    2: '用法错误',
+    3: '找不到对象（卡、功能、项目）',
+    4: '需要确认（确认信封）',
+    5: '被规则拦下（例如已有未答 ask、正文超长、路由拒绝）',
+    6: '冲突（热点租约、生效中的批准、已结案）',
+}
+MSG_TYPES = ('ask', 'approve', 'fyi', 'done', 'blocked', 'handoff')
+MSG_TYPE_LABEL = {
+    'ask': '请示',
+    'approve': '审批',
+    'fyi': '通报',
+    'done': '完成',
+    'blocked': '阻塞',
+    'handoff': '交接',
+}
+
+
+class MashuError(ValueError):
+    """结构化 CLI 报错：固定 code + 中文 error + 下一条命令 fix + 退出码枚举。"""
+
+    def __init__(self, code, message, fix='', exit_code=EXIT_ERR, data=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.fix = fix
+        self.exit_code = exit_code
+        self.data = data or {}
+
+
+class CliExit(SystemExit):
+    """兼容 unittest assertRaisesRegex(SystemExit, ...) 同时保留精确退出码与结构化载荷。"""
+
+    def __init__(self, message, exit_code=EXIT_ERR, payload=None, printed=False):
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.payload = payload
+        self.printed = printed
+
+
+def fail(code, msg, fix='', exit_code=EXIT_ERR, data=None):
+    raise MashuError(code, msg, fix=fix, exit_code=exit_code, data=data)
+
+
+def confirm_or_fail(args, code, summary, confirm_cmd, changes=None):
+    if getattr(args, 'confirm', False) or getattr(args, 'force', False):
+        return
+    fail(code, summary, fix=confirm_cmd, exit_code=EXIT_CONFIRM,
+         data={'confirm_required': True, 'confirm_cmd': confirm_cmd, 'changes': list(changes or [])})
+
+
+def out_ok(payload=None, text=None, as_json=False):
+    if as_json:
+        obj = {'ok': True, 'api_version': API_VERSION}
+        if isinstance(payload, dict):
+            obj.update(payload)
+        elif payload is not None:
+            obj['data'] = payload
+        print(json.dumps(obj, ensure_ascii=False, separators=(',', ':')))
+        return
+    if text is not None and text != '':
+        print(text)
+
+
+def read_text_arg(val, allow_empty=False, label='正文'):
+    """正文支持 '-' 从 stdin 读取，避开 shell 的 $ 展开和引号转义。"""
+    if val is None:
+        if allow_empty:
+            return ''
+        fail('empty_text', f'{label}不能为空', fix='传正文字符串，或用 - 从标准输入读取', exit_code=EXIT_USAGE)
+    text = sys.stdin.read() if val == '-' else str(val)
+    if not allow_empty and not text.strip():
+        fail('empty_text', f'{label}不能为空', fix='传非空正文，或用 - 从标准输入读取', exit_code=EXIT_USAGE)
+    return text.strip() if val == '-' else text
 
 SONGS = [
     '天黑黑', '遇见', '绿光', '开始懂了', '我怀念的', '逆光', '雨天', '风筝', '我不难过', '克卜勒',
@@ -232,12 +318,21 @@ def db():
     conn.execute('CREATE TABLE IF NOT EXISTS trust(film_id TEXT, category TEXT, streak INTEGER DEFAULT 0, total INTEGER DEFAULT 0, '
                  'delegated INTEGER DEFAULT 0, proposed INTEGER DEFAULT 0, updated TEXT, PRIMARY KEY(film_id, category))')
     for table, col in (('reports', 'need TEXT'), ('decisions', 'undo TEXT'), ('reports', 'meta TEXT'),
+                       ('reports', 'msg_type TEXT'), ('reports', 'to_addr TEXT'), ('reports', 'supersedes INTEGER'),
+                       ('reports', 're_id INTEGER'), ('reports', 'dedupe_key TEXT'), ('reports', 'stale_reason TEXT'),
                        ('approvals', 'payload TEXT'), ('cameras', 'ctx_at REAL'),
                        ('cameras', 'handoff_at REAL'), ('cameras', 'effort TEXT'), ('cameras', 'pref_applied TEXT'),
                        ('cameras', 'ctx_window INTEGER'), ('cameras', 'health TEXT'), ('cameras', 'health_at REAL'),
                        ('cameras', 'health_note TEXT'), ('peer_waits', 'timed_out_at REAL')):
         if col.split()[0] not in {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}:
             conn.execute(f'ALTER TABLE {table} ADD COLUMN {col}')
+    # 旧数据按 kind / gate / confirm_stage 回填 msg_type（只填 NULL 行，幂等）
+    conn.execute("UPDATE reports SET msg_type=CASE "
+                 "WHEN gate IS NOT NULL AND gate!='' THEN 'approve' "
+                 "WHEN kind IN ('gate','confirm') THEN 'approve' "
+                 "WHEN kind='ask' THEN 'ask' "
+                 "WHEN kind IN ('stage-done','sequence-done') THEN 'done' "
+                 "ELSE 'fyi' END WHERE msg_type IS NULL OR msg_type=''")
     conn.executescript(EVENTS_SCHEMA)
     conn.commit()
     return conn
@@ -1304,12 +1399,27 @@ def find_seq(conn, f, ref):
 
 
 def resolve_ref(conn, ref):
-    """'film/seq' → (film, seq)。"""
-    film_id, _, seq_ref = str(ref).partition('/')
-    f = require_film(conn, film_id)
-    if not seq_ref:
-        raise ValueError('要写成 <项目>/<功能编号>，例如 builda/3')
-    return f, find_seq(conn, f, seq_ref)
+    """'film/seq'（也兼容 'film#seq'）→ (film, seq)。"""
+    raw = str(ref or '').strip()
+    if '/' in raw:
+        film_id, _, seq_ref = raw.partition('/')
+    elif '#' in raw:
+        film_id, _, seq_ref = raw.partition('#')
+    else:
+        fail('invalid_ref', f'功能引用「{raw}」格式不对：要写成 <项目>/<编号>（如 mashu/16）',
+             fix='mashu status 查看项目与功能编号', exit_code=EXIT_USAGE)
+    if not film_id or not seq_ref:
+        fail('invalid_ref', f'功能引用「{raw}」格式不对：要写成 <项目>/<编号>（如 mashu/16）',
+             fix='mashu status 查看项目与功能编号', exit_code=EXIT_USAGE)
+    try:
+        f = require_film(conn, film_id)
+    except ValueError as exc:
+        fail('not_found', str(exc), fix='mashu status 查看已登记项目', exit_code=EXIT_NOT_FOUND)
+    try:
+        s = find_seq(conn, f, seq_ref)
+    except ValueError as exc:
+        fail('not_found', str(exc), fix=f'mashu status {f["id"]}', exit_code=EXIT_NOT_FOUND)
+    return f, s
 
 
 def seq_label(f, key):
@@ -3193,8 +3303,150 @@ def producer_prompt(f, extra=''):
 def report(conn, rid):
     r = one(conn, 'SELECT * FROM reports WHERE id=?', rid)
     if not r:
-        raise ValueError(f'上报 #{rid} 不存在')
+        fail('not_found', f'上报 #{rid} 不存在', fix='mashu inbox --all', exit_code=EXIT_NOT_FOUND)
     return r
+
+
+def infer_msg_type(r):
+    mt = (r.get('msg_type') or '').strip()
+    if mt in MSG_TYPES:
+        return mt
+    if r.get('gate') or r.get('kind') in ('gate', 'confirm'):
+        return 'approve'
+    if r.get('kind') == 'ask':
+        return 'ask'
+    if r.get('kind') in ('stage-done', 'sequence-done'):
+        return 'done'
+    return 'fyi'
+
+
+def report_superseded_by(conn, r):
+    m = json.loads(r.get('meta') or '{}')
+    if m.get('superseded_by'):
+        return m['superseded_by']
+    row = one(conn, 'SELECT id FROM reports WHERE supersedes=? ORDER BY id DESC LIMIT 1', r['id'])
+    return row['id'] if row else None
+
+
+def resolve_choice(r, choice, extra_text=''):
+    """把 --choice A/B/1/2 或选项文本精确映射为卡上的完整选项，彻底避免多写一字导致审批判定失败。"""
+    opts = json.loads(r.get('options') or '[]')
+    if choice is None or choice == '':
+        return extra_text, ''
+    if not opts:
+        fail('no_options', f'#{r["id"]} 没有预设选项，直接传回复文本即可',
+             fix=f'mashu reply {r["id"]} "你的回复"', exit_code=EXIT_USAGE)
+    raw = str(choice).strip()
+    idx = None
+    if len(raw) == 1 and raw.upper() >= 'A' and raw.upper() <= 'Z':
+        idx = ord(raw.upper()) - ord('A')
+    elif raw.isdigit():
+        idx = int(raw) - 1
+    if idx is not None:
+        if 0 <= idx < len(opts):
+            return opts[idx], (extra_text or '').strip()
+        avail = ' | '.join(f'{chr(65 + i)}:{o}' for i, o in enumerate(opts))
+        fail('invalid_choice', f'选项 {raw} 超出范围（可选：{avail}）',
+             fix=f'mashu reply {r["id"]} --choice A', exit_code=EXIT_USAGE)
+    key = _PUNCT.sub('', raw)
+    for o in opts:
+        if raw == o or (key and _PUNCT.sub('', o) == key):
+            return o, (extra_text or '').strip()
+    avail = ' | '.join(f'{chr(65 + i)}:{o}' for i, o in enumerate(opts))
+    fail('invalid_choice', f'找不到选项「{raw}」（可选：{avail}）',
+         fix=f'mashu reply {r["id"]} --choice A', exit_code=EXIT_USAGE)
+
+
+def resolve_recommend(options, recommend):
+    """允许 --recommend A/B/1/2 自动映射成完整选项文本。"""
+    if not recommend or not options:
+        return recommend
+    raw = str(recommend).strip()
+    if raw in options:
+        return raw
+    idx = None
+    if len(raw) == 1 and 'A' <= raw.upper() <= 'Z':
+        idx = ord(raw.upper()) - ord('A')
+    elif raw.isdigit():
+        idx = int(raw) - 1
+    if idx is not None and 0 <= idx < len(options):
+        return options[idx]
+    return recommend
+
+
+def supersede_report(conn, old_id, new_id, by_role, by_label):
+    """将旧卡标记为已被 #new_id 取代并结案（从待处理列表消失）。"""
+    old = one(conn, 'SELECT * FROM reports WHERE id=?', old_id)
+    if not old or old['status'] != 'open' or old['id'] == new_id:
+        return False
+    reason = f'已被 #{new_id} 取代'
+    m = json.loads(old.get('meta') or '{}')
+    m['superseded_by'] = new_id
+    conn.execute('UPDATE reports SET status="superseded", answer=?, answered_by=?, closed_at=?, stale_reason=?, meta=? WHERE id=?',
+                 (reason, by_role or 'system', time.time(), reason, json.dumps(m, ensure_ascii=False), old_id))
+    conn.commit()
+    add_route(conn, old_id, action='supersede', who=by_label or '调度器', level=by_role or 'system', note=reason, by_id=new_id)
+    notice(conn, report_channel(old), f'#{old_id} 已被 #{new_id} 取代并自动结案')
+    return True
+
+
+def evaluate_stale(conn, r):
+    """判断上报是否已过时或被取代；返回中文原因或空串。"""
+    if r.get('status') == 'superseded':
+        sb = report_superseded_by(conn, r)
+        return r.get('stale_reason') or (f'已被 #{sb} 取代' if sb else '已被取代')
+    if r.get('status') != 'open':
+        return r.get('stale_reason') or ''
+    if r.get('film_id') and r.get('seq_key'):
+        f = film(conn, r['film_id'])
+        if not f:
+            return '所属项目已移除'
+        data = seq_state(f, r['seq_key'])
+        if seq_flag(conn, f, r['seq_key'], 'archive', data):
+            return '所属功能已归档'
+        if r.get('gate') == 'kickoff' and not kickoff_pending(f, r['seq_key']):
+            return '开工申请已过期（不再等待开工）'
+        if r.get('kind') == 'confirm' and r.get('confirm_stage'):
+            st = next((x for x in (data or {}).get('stages', []) if x['id'] == r['confirm_stage']), None)
+            if (st and st['status'] in ('进行中', '已完成', '跳过')) or has_approval(conn, f['id'], r['seq_key'], f'stage-{r["confirm_stage"]}'):
+                return '已越过该阶段或批准已生效'
+        if r.get('gate') and r.get('gate') != 'kickoff' and has_approval(conn, f['id'], r['seq_key'], r['gate']):
+            return '同类批准已生效'
+        if seq_done(data) and infer_msg_type(r) in ('ask', 'approve', 'blocked'):
+            return '所属功能已完成'
+    return r.get('stale_reason') or ''
+
+
+def triage_reports(conn, notify_remind=True):
+    """收件箱自动分拣：刷新过时原因；用户手上挂久的卡回到发卡子脑 inbox 提醒，不再重复推用户。"""
+    now = time.time()
+    remind_sec = (cfg('user_ask_remind_minutes') or 120) * 60
+    changed = 0
+    reminded = 0
+    for r in rows(conn, 'SELECT * FROM reports WHERE status="open" ORDER BY id'):
+        sr = evaluate_stale(conn, r)
+        if (r.get('stale_reason') or '') != sr:
+            conn.execute('UPDATE reports SET stale_reason=? WHERE id=?', (sr or None, r['id']))
+            changed += 1
+        if notify_remind and r['holder'] == 'executive' and infer_msg_type(r) in ('ask', 'approve'):
+            since = r['holder_since'] or r['created_at'] or now
+            if now - since >= remind_sec:
+                m = json.loads(r.get('meta') or '{}')
+                if not m.get('reminded_at'):
+                    m['reminded_at'] = now
+                    conn.execute('UPDATE reports SET meta=? WHERE id=?', (json.dumps(m, ensure_ascii=False), r['id']))
+                    target = f'producer:{r["film_id"]}' if r['film_id'] else 'assistant'
+                    channel = r['film_id'] or 'assistant'
+                    hours = max(0.1, (now - since) / 3600)
+                    stale_hint = f'（已过时：{sr}）' if sr else ''
+                    post(conn, 'system', channel, 'notice',
+                         f'[收件箱 · 挂久提醒] #{r["id"]} 发给用户已超 {hours:.1f} 小时无人回复{stale_hint}：{r["summary"]}。'
+                         f'请用 `mashu inbox` 查看，判断能否代答或 `mashu close {r["id"]} --why "过时：…" --confirm` 结案（不再重复推用户）。',
+                         target=target, report_id=r['id'])
+                    reminded += 1
+    if changed or reminded:
+        conn.commit()
+    return dict(updated=changed, reminded=reminded)
 
 
 def next_level(level):
@@ -3247,10 +3499,11 @@ def route_lines(r):
 def report_text_for(conn, r, level):
     """投递给子脑 / 麻薯会话的上报文本。"""
     where, who = report_origin(conn, r)
-    lines = [f'[上报 #{r["id"]} · {KIND_LABEL.get(r["kind"], r["kind"])}] {where} · {who}', r['text']]
+    mt = infer_msg_type(r)
+    lines = [f'[上报 #{r["id"]} · {KIND_LABEL.get(r["kind"], r["kind"])} ({mt})] {where} · {who}', r['text']]
     opts = json.loads(r['options'] or '[]')
     if opts:
-        lines.append('选项：' + ' | '.join(opts))
+        lines.append('选项：' + ' | '.join(f'{chr(65 + i)}. {o}' for i, o in enumerate(opts)))
     if r['gate']:
         lines.append(f'闸门：{GATES.get(r["gate"], r["gate"])}')
     prior = route_lines(r)
@@ -3261,11 +3514,12 @@ def report_text_for(conn, r, level):
         lines.append(f'当前推荐：{m["recommend"]}' + (f'（{m.get("why")}）' if m.get('why') else ''))
     up = '用户（项目对话里的卡片）' if level == 'producer' else '用户'
     if can_answer(r, level):
-        lines.append(f'你有权批复：`mashu answer {r["id"]} "批复内容"`；需要{up}知道或决定就 `mashu pass {r["id"]} "一句意见"`。')
+        reply_hint = f'`mashu reply {r["id"]} --choice A`' if opts else f'`mashu reply {r["id"]} "批复内容"`'
+        lines.append(f'你有权批复：{reply_hint}；需要{up}知道或决定就 `mashu forward {r["id"]} user "一句意见"`。')
     elif r['kind'] in MUST_PASS:
-        lines.append(f'这是通报，附一句总结交给{up}：`mashu pass {r["id"]} "一句话总结"`。')
+        lines.append(f'这是通报，附一句总结交给{up}：`mashu forward {r["id"]} user "一句话总结"`。')
     else:
-        lines.append(f'此单要{LEVEL_LABEL[required_level(r)]}拍板，你只能附意见上交：`mashu pass {r["id"]} "你的意见"`。')
+        lines.append(f'此单要{LEVEL_LABEL[required_level(r)]}拍板，你只能附意见上交：`mashu forward {r["id"]} user "你的意见"`。')
     return '\n'.join(lines)
 
 
@@ -3297,11 +3551,19 @@ def add_route(conn, rid, **step):
 
 
 def create_report(conn, kind, source, film_id, key, text, summary=None, options=None, gate=None, confirm_stage=None,
-                  holder=None, meta=None, need=None):
+                  holder=None, meta=None, need=None, msg_type=None, to_addr=None, supersedes=None, re_id=None,
+                  dedupe_key=None, auto_supersede=True):
     """source：发起的会话行，None 表示调度器自动生成。holder 可指定首个处理者（'digest' = 直接进简报）。
     need='executive' 且没有闸门：只能用户在网页回答（外部卡片用，麻薯不能代答）。"""
     force_need = need
     source_role = source['role'] if source else 'system'
+    if dedupe_key:
+        dup = one(conn, 'SELECT * FROM reports WHERE dedupe_key=? AND IFNULL(source_role,"")=? AND IFNULL(film_id,"")=? '
+                        'AND created_at>? ORDER BY id DESC LIMIT 1',
+                  dedupe_key, source_role, film_id or '', time.time() - 86400)
+        if dup:
+            dup['_deduped'] = True
+            return dup
     if not holder:
         holder = next_level(source_role) if source else 'producer'
         if not film_id:
@@ -3323,21 +3585,45 @@ def create_report(conn, kind, source, film_id, key, text, summary=None, options=
     if force_need:
         need = force_need
     meta = dict(auto_meta(conn, f, key, kind, gate), **(meta or {}))
+    if meta.get('recommend') and options:
+        meta['recommend'] = resolve_recommend(options, meta['recommend'])
+    mt = msg_type if msg_type in MSG_TYPES else infer_msg_type(dict(kind=kind, gate=gate, confirm_stage=confirm_stage))
     summary = summary or text.strip().splitlines()[0][:80]
     cur = conn.execute(
         'INSERT INTO reports(kind, film_id, seq_key, source_camera, source_role, source_name, text, summary, options, gate, '
-        'confirm_stage, need, holder, holder_since, route, created_at, meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'confirm_stage, need, holder, holder_since, route, created_at, meta, msg_type, to_addr, supersedes, re_id, dedupe_key) '
+        'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         (kind, film_id, key, source['id'] if source else None, source_role, source['name'] if source else '', text, summary,
          json.dumps(options, ensure_ascii=False) if options else None, gate, confirm_stage, need, holder, time.time(),
          json.dumps([dict(ts=now_iso(), action='raise', who=(source or {}).get('name') or '调度器')], ensure_ascii=False),
-         time.time(), json.dumps(meta, ensure_ascii=False)))
+         time.time(), json.dumps(meta, ensure_ascii=False), mt, to_addr, supersedes, re_id, dedupe_key))
     conn.commit()
     rid = cur.lastrowid
+    superseded_ids = []
+    who_lbl = actor_label(source) if source else '调度器'
+    if supersedes:
+        if supersede_report(conn, int(supersedes), rid, source_role, who_lbl):
+            superseded_ids.append(int(supersedes))
+    if auto_supersede and film_id and key and mt in ('ask', 'approve'):
+        same_open = rows(conn, 'SELECT * FROM reports WHERE status="open" AND id!=? AND film_id=? AND seq_key=? ORDER BY id',
+                         rid, film_id, key)
+        for old in same_open:
+            if infer_msg_type(old) != mt:
+                continue
+            if mt == 'approve' and ((old.get('gate') or '') != (gate or '') or old.get('confirm_stage') != confirm_stage):
+                continue
+            if mt == 'ask' and (old.get('gate') or old.get('confirm_stage')):
+                continue
+            if supersede_report(conn, old['id'], rid, source_role, who_lbl):
+                superseded_ids.append(old['id'])
     if key:
         post(conn, source_role if source else 'system', f'{film_id}/{key}', 'raised',
              f'{KIND_LABEL.get(kind, kind)} #{rid}：{text}', camera=source, report_id=rid)
     deliver_report(conn, rid)
-    return report(conn, rid)
+    res = report(conn, rid)
+    if superseded_ids:
+        res['_superseded'] = superseded_ids
+    return res
 
 
 def actor_level(cam):
@@ -3354,30 +3640,36 @@ def actor_label(cam):
 
 def check_holder(conn, r, cam):
     if r['status'] != 'open':
-        raise ValueError(f'上报 #{r["id"]} 已结案')
+        fail('already_closed', f'上报 #{r["id"]} 已结案（{r["status"]}）', fix='mashu inbox', exit_code=EXIT_CONFLICT)
     level = actor_level(cam)
     if level == 'executive':
         return
     if r['holder'] != level:
-        raise ValueError(f'上报 #{r["id"]} 现在在{LEVEL_LABEL[r["holder"]]}手上，不归你处理')
+        fail('wrong_holder', f'上报 #{r["id"]} 现在在{LEVEL_LABEL[r["holder"]]}手上，不归你处理',
+             fix='mashu inbox', exit_code=EXIT_RULE)
     if level == 'producer' and r['film_id'] != cam['film_id']:
-        raise ValueError(f'上报 #{r["id"]} 不属于你的项目')
+        fail('wrong_project', f'上报 #{r["id"]} 不属于你的项目',
+             fix='mashu inbox', exit_code=EXIT_RULE)
 
 
-def pass_report(conn, rid, cam, note, auto=False, recommend=None, why=None):
+def pass_report(conn, rid, cam, note, auto=False, recommend=None, why=None, to_holder=None):
     r = report(conn, rid)
     if not auto:
         check_holder(conn, r, cam)
     if recommend:
+        opts = json.loads(r.get('options') or '[]')
+        rec = resolve_recommend(opts, recommend)
         m = json.loads(r.get('meta') or '{}')
-        m.update(recommend=recommend, why=why or m.get('why'), recommend_by=actor_label(cam))
+        m.update(recommend=rec, why=why or m.get('why'), recommend_by=actor_label(cam))
         conn.execute('UPDATE reports SET meta=? WHERE id=?', (json.dumps(m, ensure_ascii=False), rid))
         conn.commit()
     who = '调度器' if auto else actor_label(cam)
     if r['holder'] == 'executive':
-        raise ValueError('已经在用户手上了')
+        fail('already_at_user', '已经在用户手上了', fix='mashu inbox', exit_code=EXIT_CONFLICT)
+    up = to_holder or next_level(r['holder'])
+    if up == r['holder']:
+        fail('same_holder', f'#{rid} 已经在{LEVEL_LABEL[up]}手上', fix='mashu inbox', exit_code=EXIT_CONFLICT)
     add_route(conn, rid, action='pass', who=who, level=r['holder'], note=note, auto=auto)
-    up = next_level(r['holder'])
     conn.execute('UPDATE reports SET holder=?, holder_since=? WHERE id=?', (up, time.time(), rid))
     conn.commit()
     if r['film_id']:
@@ -3428,27 +3720,32 @@ def is_approval(r, text):
     return bool(opts) and text.strip() == opts[0]
 
 
-def answer_report(conn, rid, cam, text, exec_cfg=None):
+def answer_report(conn, rid, cam, text, exec_cfg=None, extra_note=None):
     """批复上报：cam 为 None 表示用户（只能来自网页）。exec_cfg：开工审批卡上改过的执行配置（CLI / 模型 / 思考程度）。"""
     r = report(conn, rid)
     if exec_cfg:
         if r['gate'] != 'kickoff':
-            raise ValueError('只有开工审批能带执行配置')
+            fail('invalid_exec_cfg', '只有开工审批能带执行配置', fix=f'mashu reply {rid} "…"', exit_code=EXIT_USAGE)
         exec_cfg = check_exec(exec_cfg)
     check_holder(conn, r, cam)
     if cam is None and re.fullmatch(r'\s*\d{6}\s*', text or '') and text.strip() not in (json.loads(r.get('options') or '[]') or []):
-        raise ValueError('这像是一次性验证码：请在要验证码的那个网页里输入，不要发在批复里（这条没有记为批复）')
+        fail('otp_rejected', '这像是一次性验证码：请在要验证码的那个网页里输入，不要发在批复里（这条没有记为批复）',
+             fix='请在目标网页或终端直接输入验证码', exit_code=EXIT_RULE)
     if json.loads(r.get('meta') or '{}').get('external'):
         return answer_external(conn, r, cam, text)
     level = actor_level(cam)
     if not can_answer(r, level):
         need = LEVEL_LABEL[required_level(r)] if r['kind'] not in MUST_PASS else '用户'
-        raise ValueError(f'#{rid} 要{need}拍板，你只能 `mashu pass {rid} "意见"` 往上交')
+        fail('permission_denied', f'#{rid} 要{need}拍板，你只能附意见转交',
+             fix=f'mashu forward {rid} user "你的意见"', exit_code=EXIT_RULE)
     who = actor_label(cam)
     m = json.loads(r.get('meta') or '{}')
     close_report(conn, rid, text, level)
-    add_route(conn, rid, action='answer', who=who, level=level, note=text,
-              chose_recommended=(text == m.get('recommend')) if m.get('recommend') else None)
+    route_step = dict(action='answer', who=who, level=level, note=text,
+                      chose_recommended=(text == m.get('recommend')) if m.get('recommend') else None)
+    if extra_note:
+        route_step['detail'] = extra_note
+    add_route(conn, rid, **route_step)
     approved = is_approval(r, text)
     channel = report_channel(r)
     f = film(conn, r['film_id']) if r['film_id'] else None
@@ -3477,7 +3774,7 @@ def answer_report(conn, rid, cam, text, exec_cfg=None):
                 f, r['seq_key'], f'[系统] {who}已批准开工。需求：\n{data.get("summary") or r["text"]}\n\n方案见资料目录 docs/plan.md（如有），按它做。'))
         else:
             post(conn, 'system', f['id'], 'report', f'[系统] {who}没有批准 {seq_label(f, r["seq_key"])} 开工：{text}。'
-                 f'和用户把需求、技术方案谈清楚后改 docs/plan.md，再 `mashu ask "申请开工 …" --gate kickoff --ref {f["id"]}/{seq_num(r["seq_key"])}` 重新申请；'
+                 f'和用户把需求、技术方案谈清楚后改 docs/plan.md，再 `mashu send user "申请开工 …" --type approve --gate kickoff --ref {f["id"]}/{seq_num(r["seq_key"])}` 重新申请；'
                  '用户在对话里明确说「开工」时也这样重新发卡，让用户点按钮。',
                  target=f'producer:{f["id"]}', report_id=rid)
     if r['kind'] == 'confirm' and approved:
@@ -3489,11 +3786,11 @@ def answer_report(conn, rid, cam, text, exec_cfg=None):
         undo = dict(type='trust', film=r['film_id'], category=cat) if cat and r.get('need') == 'assistant' else None
         record_decision(conn, cam, r['film_id'], r['seq_key'], f'批复 #{rid}（{r["summary"]}）：{text}', undo=undo)
     # 投回发起者；cc 到频道
-    reply = f'[批复 #{rid} · {who}] {text}'
+    reply = f'[批复 #{rid} · {who}] {text}' + (f'\n补充：{extra_note}' if extra_note else '')
     if channel != 'assistant':
-        notice(conn, channel, f'#{rid} {who}批复：{text}')
+        notice(conn, channel, f'#{rid} {who}批复：{text}' + (f'（{extra_note}）' if extra_note else ''))
     if r['film_id'] and channel != r['film_id']:
-        notice(conn, r['film_id'], f'#{rid} {who}批复：{text}')
+        notice(conn, r['film_id'], f'#{rid} {who}批复：{text}' + (f'（{extra_note}）' if extra_note else ''))
     src = camera(conn, r['source_camera']) if r['source_camera'] else None
     live = active_crew(conn, f['id'], r['seq_key']) if r['kind'] == 'confirm' and f and r['seq_key'] else None
     if live and approved:          # 一个功能全程一个执行者：批准后同一个会话接着做下一阶段
@@ -3548,6 +3845,502 @@ def open_reports(conn, holder=None, film_id=None):
         sql += ' AND film_id=?'
         args.append(film_id)
     return rows(conn, sql + ' ORDER BY id', *args)
+
+
+def send_peer_message(conn, cam, f, seq, text, fyi=False):
+    """复用 #15 的点对点发送与 peer_waits 等待逻辑（不改表结构和清理策略）。"""
+    author = f'#{seq_num(cam["seq_key"])}' if cam.get('seq_key') else '子脑'
+    if seq['key'] == cam.get('seq_key') or not (text or '').strip():
+        fail('usage_error', '请指定另一功能并填写消息', fix='mashu send #<功能编号> "消息"', exit_code=EXIT_USAGE)
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        peer = active_crew(conn, f['id'], seq['key'])
+        if not peer or peer['state'] not in LIVE:
+            return dict(sent=False, online=False, target=f'#{seq["num"]}', fyi=bool(fyi))
+        now = time.time()
+        body = f'[点对点 {author} → #{seq["num"]}] {text.strip()[:800]}'
+        conn.execute('INSERT INTO peer_inbox(camera_id,text) VALUES(?,?)', (peer['id'], body))
+        post(conn, 'system', f['id'], 'notice', body, target=f'producer:{f["id"]}', camera=cam)
+        if cam.get('seq_key'):
+            conn.execute(
+                'UPDATE peer_waits SET cleared_at=? WHERE film_id=? AND to_seq=? AND cleared_at IS NULL '
+                'AND from_camera IN (SELECT id FROM cameras WHERE film_id=? AND seq_key=?)',
+                (now, f['id'], cam['seq_key'], f['id'], seq['key']),
+            )
+        if not fyi:
+            conn.execute(
+                'UPDATE peer_waits SET cleared_at=? WHERE film_id=? AND from_camera=? AND to_seq=? AND cleared_at IS NULL',
+                (now, f['id'], cam['id'], seq['key']),
+            )
+            conn.execute(
+                'INSERT INTO peer_waits(film_id, from_camera, to_seq, since, why) VALUES(?,?,?,?,?)',
+                (f['id'], cam['id'], seq['key'], now, text.strip()[:120]),
+            )
+    return dict(sent=True, online=True, target=f'#{seq["num"]}', peer_camera=peer['id'], fyi=bool(fyi), waiting=not fyi)
+
+
+def resolve_address(conn, cam, raw_addr):
+    """解析统一通信地址：user / boss / lead / up / @crew / #N / <film> / <film>#N。按角色做路由权限校验。"""
+    addr = (raw_addr or '').strip()
+    if not addr:
+        fail('usage_error', '缺少发送对象', fix='mashu me 查看可用对象地址', exit_code=EXIT_USAGE)
+    role = cam['role'] if cam else 'executive'
+    cur_film = cam['film_id'] if cam else None
+    if addr == 'user':
+        if role == 'crew':
+            fail('route_denied', '执行者不能直接发给 user，请发给上级（up / lead）由子脑处理或转交用户',
+                 fix='mashu send up "你的内容" --type ask', exit_code=EXIT_RULE)
+        return dict(route='report', addr='user', holder='executive', film_id=cur_film, seq_key=None)
+    if addr == 'boss':
+        if role == 'crew':
+            fail('route_denied', '执行者不能直接发给主脑（boss），请发给本项目子脑（up / lead）',
+                 fix='mashu send up "你的内容"', exit_code=EXIT_RULE)
+        if role == 'assistant':
+            fail('route_denied', '你就是主脑（boss），无需发给自己', fix='mashu me', exit_code=EXIT_RULE)
+        return dict(route='report', addr='boss', holder='assistant', film_id=cur_film, seq_key=None)
+    if addr == 'lead':
+        if role == 'assistant':
+            fail('usage_error', '主脑没有单一的本项目子脑，请指定项目 id（例如 mashu send <项目id> "…"）',
+                 fix='mashu status', exit_code=EXIT_USAGE)
+        if role == 'producer':
+            fail('route_denied', '你就是本项目子脑（lead），发给上级请用 user 或 boss',
+                 fix='mashu send user "你的内容"', exit_code=EXIT_RULE)
+        if not cur_film:
+            fail('usage_error', '当前不在项目会话内，请指定项目 id', fix='mashu status', exit_code=EXIT_USAGE)
+        return dict(route='report', addr='lead', holder='producer', film_id=cur_film, seq_key=cam.get('seq_key'))
+    if addr == 'up':
+        if role == 'crew':
+            return dict(route='report', addr='up', holder='producer', film_id=cur_film, seq_key=cam.get('seq_key'))
+        if role == 'producer':
+            return dict(route='report', addr='up', holder='executive', film_id=cur_film, seq_key=None)
+        if role == 'assistant':
+            return dict(route='report', addr='up', holder='executive', film_id=None, seq_key=None)
+        fail('usage_error', '用户没有上级地址 up，请指定项目或功能地址', fix='mashu me', exit_code=EXIT_USAGE)
+    if addr == '@crew':
+        if not cur_film:
+            fail('usage_error', '@crew 只能在项目会话内使用', fix='mashu me', exit_code=EXIT_USAGE)
+        return dict(route='board', addr='@crew', film_id=cur_film, seq_key=None, film=require_film(conn, cur_film))
+    if addr.startswith('#'):
+        if not cur_film:
+            fail('usage_error', f'地址 {addr} 需要指明项目，请写成 <项目>{addr}', fix='mashu status', exit_code=EXIT_USAGE)
+        f = require_film(conn, cur_film)
+        try:
+            s = find_seq(conn, f, addr[1:])
+        except ValueError as exc:
+            fail('not_found', str(exc), fix=f'mashu status {f["id"]}', exit_code=EXIT_NOT_FOUND)
+        route = 'peer' if role == 'crew' else 'note'
+        return dict(route=route, addr=f'#{s["num"]}', film_id=f['id'], seq_key=s['key'], film=f, seq=s)
+    if '#' in addr or '/' in addr:
+        sep = '#' if '#' in addr else '/'
+        fid, _, sref = addr.partition(sep)
+        f = film(conn, fid)
+        if not f:
+            fail('not_found', f'找不到项目：{fid}', fix='mashu status', exit_code=EXIT_NOT_FOUND)
+        try:
+            s = find_seq(conn, f, sref)
+        except ValueError as exc:
+            fail('not_found', str(exc), fix=f'mashu status {f["id"]}', exit_code=EXIT_NOT_FOUND)
+        if role == 'crew':
+            if f['id'] != cur_film:
+                fail('route_denied', f'执行者不能跨项目联系 {addr}，请发给上级（up）由子脑协调',
+                     fix='mashu send up "你的内容"', exit_code=EXIT_RULE)
+            return dict(route='peer', addr=f'#{s["num"]}', film_id=f['id'], seq_key=s['key'], film=f, seq=s)
+        if role == 'producer' and f['id'] != cur_film:
+            fail('route_denied', f'子脑不能直接给其他项目的功能 {addr} 发消息，跨项目请发给主脑（boss）',
+                 fix='mashu send boss "你的内容"', exit_code=EXIT_RULE)
+        return dict(route='note', addr=f'{f["id"]}#{s["num"]}', film_id=f['id'], seq_key=s['key'], film=f, seq=s)
+    f = film(conn, addr)
+    if f:
+        if role == 'crew':
+            if f['id'] == cur_film:
+                return dict(route='report', addr=f['id'], holder='producer', film_id=cur_film, seq_key=cam.get('seq_key'))
+            fail('route_denied', f'执行者不能直接发给其他项目子脑 {addr}，请发给上级（up）',
+                 fix='mashu send up "你的内容"', exit_code=EXIT_RULE)
+        if role == 'producer':
+            if f['id'] == cur_film:
+                fail('route_denied', '你就是本项目子脑，无需发给自己', fix='mashu me', exit_code=EXIT_RULE)
+            fail('route_denied', f'子脑不能直接发给其他项目子脑 {addr}，跨项目的事请发给主脑（boss）',
+                 fix='mashu send boss "你的内容"', exit_code=EXIT_RULE)
+        return dict(route='memo', addr=f['id'], film_id=f['id'], seq_key=None, film=f)
+    fail('not_found', f'找不到发送对象「{addr}」', fix='mashu me 查看可用对象地址', exit_code=EXIT_NOT_FOUND)
+
+
+def send_message(conn, cam, to, text, msg_type=None, options=None, recommend=None, why=None, summary=None,
+                 gate=None, confirm_stage=None, impact=None, reversible=None, human=False, urgent=False,
+                 ref=None, re_id=None, supersedes=None, dedupe_key=None, legacy_kind=None):
+    """统一发送内核：send / ask / tell / report / note / memo / peer / sync 全部收敛于此。"""
+    dest = resolve_address(conn, cam, to)
+    route = dest['route']
+    if route == 'board':
+        author = f'#{seq_num(cam["seq_key"])}' if cam and cam.get('seq_key') else ('子脑' if cam else '用户')
+        board_post(dest['film'], author, text, cam['id'] if cam else None)
+        return dict(route='board', addr=dest['addr'], film_id=dest['film_id'], msg_type=msg_type or 'fyi')
+    if route == 'peer':
+        mt = msg_type or 'ask'
+        res = send_peer_message(conn, cam, dest['film'], dest['seq'], text, fyi=(mt in ('fyi', 'done', 'handoff')))
+        res.update(route='peer', addr=dest['addr'], film_id=dest['film_id'], seq_key=dest['seq_key'], msg_type=mt)
+        return res
+    if route == 'note':
+        sender = cam['role'] if cam else 'executive'
+        mid = post(conn, sender, f'{dest["film_id"]}/{dest["seq_key"]}', 'note' if cam else 'chat', text,
+                   target=f'crew:{dest["film_id"]}/{dest["seq_key"]}', camera=cam)
+        return dict(route='note', addr=dest['addr'], film_id=dest['film_id'], seq_key=dest['seq_key'],
+                    message_id=mid, msg_type=msg_type or 'fyi')
+    if route == 'memo':
+        sender = 'assistant' if cam else 'executive'
+        mid = post(conn, sender, dest['film_id'], 'memo' if cam else 'chat', text,
+                   target=f'producer:{dest["film_id"]}', camera=cam)
+        return dict(route='memo', addr=dest['addr'], film_id=dest['film_id'], film_title=dest['film']['title'],
+                    message_id=mid, msg_type=msg_type or 'fyi')
+    # route == 'report'
+    if not cam:
+        fail('session_required', '向该地址发送上报需要在麻薯受管会话内执行（缺少 MASHU_SESSION）',
+             fix='在受管会话内执行，或直接指定项目 / 功能地址如 mashu send <项目> "…"', exit_code=EXIT_RULE)
+    if gate and gate not in GATES:
+        fail('invalid_gate', f'闸门只能是：{", ".join(GATES)}',
+             fix=f'mashu send {to} "…" --type approve --gate prod', exit_code=EXIT_USAGE)
+    if msg_type and msg_type not in MSG_TYPES:
+        fail('invalid_type', f'消息类型只能是：{", ".join(MSG_TYPES)}',
+             fix=f'mashu send {to} "…" --type ask', exit_code=EXIT_USAGE)
+    opts = [o.strip() for o in options.split('|') if o.strip()] if isinstance(options, str) else (list(options) if options else None)
+    # 推断 msg_type 与旧 kind 的映射，保证与调度器 / 网页 / 审批机制完全一致
+    mt = msg_type
+    if not mt:
+        if gate or confirm_stage:
+            mt = 'approve'
+        elif opts:
+            mt = 'ask'
+        elif legacy_kind in ('tell', 'report'):
+            mt = 'fyi'
+        elif legacy_kind == 'ask':
+            mt = 'ask'
+        else:
+            mt = 'fyi'
+    if legacy_kind:
+        kind = legacy_kind
+    elif gate:
+        kind = 'gate'
+    elif confirm_stage:
+        kind = 'confirm'
+    elif mt in ('ask', 'approve', 'blocked'):
+        kind = 'ask'
+    elif dest['holder'] == 'assistant':
+        kind = 'report'
+    else:
+        kind = 'tell'
+    if re_id is not None:
+        re_id = int(str(re_id).lstrip('#'))
+        report(conn, re_id)
+    if supersedes is not None:
+        supersedes = int(str(supersedes).lstrip('#'))
+        report(conn, supersedes)
+    if kind == 'ask' and mt == 'ask' and not human and not urgent and not supersedes and not re_id:
+        prev = one(conn, 'SELECT id, created_at, summary FROM reports WHERE source_camera=? AND kind="ask" AND status="open" '
+                         'AND created_at>? ORDER BY id DESC LIMIT 1', cam['id'], time.time() - ASK_MERGE_MINUTES * 60)
+        if prev:
+            mins = (time.time() - prev['created_at']) / 60
+            fail('ask_pending',
+                 f'你 {mins:.0f} 分钟前发的 #{prev["id"]}（{prev["summary"]}）还没回。同一轮要问的事合成一条；'
+                 f'确实要取代旧卡加 --supersedes {prev["id"]}，紧急且无关加 --urgent。',
+                 fix=f'mashu inbox 或 mashu send {to} "…" --supersedes {prev["id"]}', exit_code=EXIT_RULE,
+                 data=dict(pending_id=prev['id'], pending_summary=prev['summary']))
+    q = text or ''
+    if kind == 'ask' and mt == 'ask' and not human and (len(q) > ASK_MAX_CHARS or q.count('？') + q.count('?') > 2):
+        fail('ask_too_long',
+             f'这条请示 {len(q)} 字、{q.count("？") + q.count("?")} 个问号：一条请示只问一件事，正文一两句（≤{ASK_MAX_CHARS}字、≤2个问号）。',
+             fix='把问题清单写进文档，正文只留一两句摘要 + 文档路径 + --options', exit_code=EXIT_RULE,
+             data=dict(length=len(q), max_chars=ASK_MAX_CHARS, question_marks=q.count('？') + q.count('?')))
+    meta = {k: v for k, v in dict(
+        recommend=resolve_recommend(opts, recommend) if recommend else None,
+        why=why, impact=impact,
+        reversible=None if reversible is None else (reversible == 'yes' if isinstance(reversible, str) else bool(reversible)),
+        human=True if human else None,
+    ).items() if v is not None}
+    if meta.get('recommend'):
+        meta['recommend_by'] = actor_label(cam)
+    film_id, key = dest['film_id'], dest['seq_key']
+    if ref:
+        if cam['role'] not in ('producer', 'assistant'):
+            fail('permission_denied', '--ref 只给子脑和主脑用；执行者的请示自动挂在自己的功能上',
+                 fix=f'去掉 --ref 重试：mashu send {to} "…"', exit_code=EXIT_RULE)
+        try:
+            rf, rs = resolve_ref(conn, ref)
+        except ValueError as exc:
+            fail('not_found', str(exc), fix='mashu status', exit_code=EXIT_NOT_FOUND)
+        film_id, key = rf['id'], rs['key']
+    if gate == 'kickoff':
+        if not key:
+            fail('usage_error', '开工卡要挂到功能上：加 --ref <项目>/<功能编号>',
+                 fix='mashu send user "申请开工 …" --type approve --gate kickoff --ref <项目>/<编号>', exit_code=EXIT_USAGE)
+        kf = film(conn, film_id)
+        if not kickoff_pending(kf, key):
+            fail('invalid_state', f'{seq_label(kf, key)} 不在等开工状态，不用再申请开工',
+                 fix=f'mashu status {film_id}', exit_code=EXIT_CONFLICT)
+        if not opts:
+            opts = ['批准开工', '先别']
+        ex = kickoff_exec(conn, kf, key)
+        meta['exec'] = ex
+        if '执行者：' not in q:
+            q = q + f'\n\n执行者：{exec_label(ex["cli"], ex["model"], ex["effort"])}'
+        plan = seq_dir(kf, key) / 'docs' / 'plan.md'
+        if plan.exists() and 'plan.md' not in q:
+            q = q + f'\n\n方案（docs/plan.md）：\n{plan.read_text()}'
+    r = create_report(conn, kind, cam, film_id, key, q, summary, opts, gate, confirm_stage,
+                      holder=dest['holder'], meta=meta, msg_type=mt, to_addr=dest['addr'],
+                      supersedes=supersedes, re_id=re_id, dedupe_key=dedupe_key)
+    return dict(route='report', addr=dest['addr'], report=r, id=r['id'], holder=r['holder'],
+                msg_type=infer_msg_type(r), kind=r['kind'], deduped=bool(r.get('_deduped')),
+                superseded=r.get('_superseded') or [])
+
+
+def reply_report(conn, rid, cam, text='', choice=None):
+    rid = int(str(rid).lstrip('#'))
+    r = report(conn, rid)
+    ans, extra = resolve_choice(r, choice, text or '')
+    if not (ans or '').strip():
+        opts = json.loads(r.get('options') or '[]')
+        fix = f'mashu reply {rid} --choice A' if opts else f'mashu reply {rid} "批复内容"'
+        fail('empty_text', '回复内容不能为空（传文本或 --choice）', fix=fix, exit_code=EXIT_USAGE)
+    updated = answer_report(conn, rid, cam, ans, extra_note=extra or None)
+    return dict(id=updated['id'], status=updated['status'], answer=updated['answer'],
+                extra=extra, answered_by=updated['answered_by'], msg_type=infer_msg_type(updated))
+
+
+def forward_report(conn, rid, cam, to='user', note='', recommend=None, why=None, require_confirm=True, confirm=False):
+    rid = int(str(rid).lstrip('#'))
+    r = report(conn, rid)
+    to_norm = (to or 'user').strip()
+    if to_norm in ('user', 'up', 'executive'):
+        to_holder = None if to_norm == 'up' else 'executive'
+        target_label = 'user'
+    elif to_norm in ('boss', 'assistant'):
+        to_holder = 'assistant'
+        target_label = 'boss'
+    else:
+        fail('usage_error', f'forward 目标只能是 user / up / boss（收到：{to_norm}）',
+             fix=f'mashu forward {rid} user "一句意见"', exit_code=EXIT_USAGE)
+    if require_confirm and target_label == 'user' and infer_msg_type(r) == 'approve' and not confirm:
+        cmd = f'mashu forward {rid} user {shlex.quote(note or "")} --confirm'
+        fail('confirm_required', f'#{rid} 是审批类卡片（{r["summary"]}），转交用户需要确认',
+             fix=cmd, exit_code=EXIT_CONFIRM,
+             data=dict(confirm_required=True, confirm_cmd=cmd, changes=[f'将审批卡 #{rid} 推送给用户处理']))
+    updated = pass_report(conn, rid, cam, note or '', recommend=recommend, why=why, to_holder=to_holder)
+    return dict(id=updated['id'], holder=updated['holder'], to=target_label, msg_type=infer_msg_type(updated))
+
+
+def close_report_action(conn, rid, cam, why, silent=False, confirm=False):
+    rid = int(str(rid).lstrip('#'))
+    r = report(conn, rid)
+    if r['status'] != 'open':
+        fail('already_closed', f'#{rid} 已结案（{r["status"]}）', fix='mashu inbox --all', exit_code=EXIT_CONFLICT)
+    if not (why or '').strip():
+        fail('usage_error', '结案必须填写原因 --why',
+             fix=f'mashu close {rid} --why "过时：…"', exit_code=EXIT_USAGE)
+    role = actor_level(cam)
+    if role == 'crew' and r['source_camera'] != cam['id']:
+        fail('permission_denied', f'执行者只能结案自己发起的卡片（#{rid} 不是你发起的）',
+             fix='mashu inbox', exit_code=EXIT_RULE)
+    if role == 'producer' and r['film_id'] != cam['film_id']:
+        fail('wrong_project', f'#{rid} 不属于你的项目，不能结案', fix='mashu inbox', exit_code=EXIT_RULE)
+    if r['holder'] == 'executive' and not confirm:
+        flag = ' --silent' if silent else ''
+        cmd = f'mashu close {rid} --why {shlex.quote(why.strip())}{flag} --confirm'
+        fail('confirm_required', f'#{rid} 当前挂在用户手上（{r["summary"]}），结案用户卡片需要确认',
+             fix=cmd, exit_code=EXIT_CONFIRM,
+             data=dict(confirm_required=True, confirm_cmd=cmd, changes=[f'结案用户手上的卡片 #{rid}：{why.strip()}']))
+    status = 'muted' if silent else 'closed'
+    who = actor_label(cam)
+    close_report(conn, rid, why.strip(), role, status=status)
+    conn.execute('UPDATE reports SET stale_reason=? WHERE id=?', (why.strip(), rid))
+    conn.commit()
+    add_route(conn, rid, action='close', who=who, level=role, note=why.strip(), silent=bool(silent))
+    audit(conn, role, 'close', r['film_id'], r['seq_key'], f'#{rid} {"静默" if silent else ""}结案：{why.strip()}')
+    notice(conn, report_channel(r), f'#{rid} 已由{who}{"静默" if silent else ""}结案：{why.strip()}')
+    return dict(id=rid, status=status, why=why.strip(), silent=bool(silent), closed_by=role)
+
+
+def _format_inbox_report(conn, r, role, reminded=False, auto_closed=False):
+    now = time.time()
+    since = r['holder_since'] or r['created_at'] or now
+    age_min = max(0, int((now - since) / 60))
+    mt = infer_msg_type(r)
+    sr = evaluate_stale(conn, r)
+    sb = report_superseded_by(conn, r)
+    opts = json.loads(r.get('options') or '[]')
+    m = json.loads(r.get('meta') or '{}')
+    where, who = report_origin(conn, r)
+    if r['status'] != 'open':
+        suggested = ''
+    elif sr:
+        need_cfm = ' --confirm' if r['holder'] == 'executive' else ''
+        suggested = f'mashu close {r["id"]} --why "已过时：{sr}"{need_cfm}'
+    elif reminded:
+        suggested = f'判断能否代答，或 mashu close {r["id"]} --why "已过时：挂久无人回复" --confirm'
+    elif mt in ('fyi', 'done') and r['kind'] not in MUST_PASS:
+        suggested = '已阅自动结案'
+    elif can_answer(r, role):
+        suggested = f'mashu reply {r["id"]} --choice A' if opts else f'mashu reply {r["id"]} "批复内容"'
+    else:
+        suggested = f'mashu forward {r["id"]} user "一句意见"'
+    return dict(
+        id=r['id'], msg_type=mt, msg_type_label=MSG_TYPE_LABEL.get(mt, mt), kind=r['kind'],
+        status=r['status'], holder=r['holder'], to_addr=r.get('to_addr') or '',
+        film_id=r['film_id'], seq_key=r['seq_key'], origin=f'{where} · {who}',
+        age_minutes=age_min, stale_reason=sr, superseded_by=sb, reminded=bool(reminded),
+        auto_closed=bool(auto_closed), summary=r['summary'] or '', text=r['text'] or '',
+        options=opts, recommend=m.get('recommend') or '', gate=r['gate'] or '',
+        suggested_action=suggested,
+    )
+
+
+def collect_inbox(conn, cam, include_all=False, mark_fyi_read=False):
+    """按当前身份收集收件箱条目：自动刷新过时标记；mark_fyi_read=True 时自动结案已看过的通报类。"""
+    triage_reports(conn, notify_remind=False)
+    role = actor_level(cam)
+    items = []
+    seen_ids = set()
+    auto_closed_ids = []
+    remind_sec = (cfg('user_ask_remind_minutes') or 120) * 60
+    now = time.time()
+
+    def _is_reminded(r):
+        m = json.loads(r.get('meta') or '{}')
+        if m.get('reminded_at'):
+            return True
+        return (r['holder'] == 'executive' and infer_msg_type(r) in ('ask', 'approve')
+                and now - (r['holder_since'] or r['created_at'] or now) >= remind_sec)
+
+    if role == 'producer':
+        direct = open_reports(conn, 'producer', cam['film_id'])
+        for r in direct:
+            auto_c = False
+            if mark_fyi_read and infer_msg_type(r) in ('fyi', 'done') and r['kind'] not in MUST_PASS:
+                close_report(conn, r['id'], '已阅', 'producer', status='closed')
+                r = report(conn, r['id'])
+                auto_c = True
+                auto_closed_ids.append(r['id'])
+            items.append(_format_inbox_report(conn, r, role, reminded=False, auto_closed=auto_c))
+            seen_ids.add(r['id'])
+        # 发给用户的挂久卡 / 已过时卡也回到发卡子脑 inbox 提醒处理
+        for r in open_reports(conn, 'executive', cam['film_id']):
+            if r['id'] in seen_ids:
+                continue
+            rem = _is_reminded(r)
+            sr = evaluate_stale(conn, r)
+            if rem or sr or include_all:
+                items.append(_format_inbox_report(conn, r, role, reminded=rem))
+                seen_ids.add(r['id'])
+        if include_all:
+            for r in rows(conn, 'SELECT * FROM reports WHERE film_id=? ORDER BY id DESC LIMIT 20', cam['film_id']):
+                if r['id'] not in seen_ids:
+                    items.append(_format_inbox_report(conn, r, role))
+                    seen_ids.add(r['id'])
+    elif role == 'assistant':
+        direct = open_reports(conn, 'assistant')
+        for r in direct:
+            auto_c = False
+            if mark_fyi_read and infer_msg_type(r) in ('fyi', 'done') and r['kind'] not in MUST_PASS:
+                close_report(conn, r['id'], '已阅', 'assistant', status='closed')
+                r = report(conn, r['id'])
+                auto_c = True
+                auto_closed_ids.append(r['id'])
+            items.append(_format_inbox_report(conn, r, role, reminded=False, auto_closed=auto_c))
+            seen_ids.add(r['id'])
+        for r in open_reports(conn, 'executive'):
+            if r['id'] in seen_ids:
+                continue
+            rem = _is_reminded(r)
+            sr = evaluate_stale(conn, r)
+            if (not r['film_id'] and rem) or sr or include_all:
+                items.append(_format_inbox_report(conn, r, role, reminded=rem))
+                seen_ids.add(r['id'])
+        if include_all:
+            for r in rows(conn, 'SELECT * FROM reports ORDER BY id DESC LIMIT 25'):
+                if r['id'] not in seen_ids:
+                    items.append(_format_inbox_report(conn, r, role))
+                    seen_ids.add(r['id'])
+    elif role == 'executive':
+        for r in open_reports(conn, 'executive'):
+            items.append(_format_inbox_report(conn, r, role, reminded=_is_reminded(r)))
+            seen_ids.add(r['id'])
+        if include_all:
+            for r in rows(conn, 'SELECT * FROM reports ORDER BY id DESC LIMIT 30'):
+                if r['id'] not in seen_ids:
+                    items.append(_format_inbox_report(conn, r, role))
+                    seen_ids.add(r['id'])
+    else:  # crew
+        sql = 'SELECT * FROM reports WHERE source_camera=?' + ('' if include_all else ' AND status="open"') + ' ORDER BY id DESC LIMIT 20'
+        for r in rows(conn, sql, cam['id']):
+            items.append(_format_inbox_report(conn, r, role))
+            seen_ids.add(r['id'])
+
+    peer_msgs = []
+    peer_waits = []
+    if cam:
+        peer_msgs = rows(conn, 'SELECT id, text FROM peer_inbox WHERE camera_id=? ORDER BY id', cam['id'])
+        if cam.get('film_id') and cam.get('seq_key'):
+            for w in active_peer_waits(conn, cam['film_id']):
+                if w['to_seq'] == cam['seq_key']:
+                    peer_waits.append(dict(from_label=w['from_label'], why=w.get('why') or '', timed_out=bool(w['timed_out'])))
+    return dict(role=role, items=items, peer_messages=peer_msgs, peer_waits=peer_waits, auto_closed=auto_closed_ids)
+
+
+def inbox_summary_line(conn, cam):
+    """子脑 / 主脑每轮注入的一行收件箱摘要，不再贴全文。"""
+    if not cam or cam['role'] not in ('producer', 'assistant'):
+        return ''
+    data = collect_inbox(conn, cam, include_all=False, mark_fyi_read=False)
+    items = [x for x in data['items'] if x['status'] == 'open']
+    if not items:
+        return ''
+    n_stale = sum(1 for x in items if x['stale_reason'])
+    n_rem = sum(1 for x in items if x['reminded'] and not x['stale_reason'])
+    n_fyi = sum(1 for x in items if not x['stale_reason'] and not x['reminded'] and x['msg_type'] in ('fyi', 'done'))
+    n_act = len(items) - n_stale - n_rem - n_fyi
+    parts = []
+    if n_act:
+        parts.append(f'{n_act} 件要你处理')
+    if n_rem:
+        parts.append(f'{n_rem} 件用户挂久待复核')
+    if n_stale:
+        parts.append(f'{n_stale} 件已过时建议结案')
+    if n_fyi:
+        parts.append(f'{n_fyi} 件通报')
+    return f'收件箱 {len(items)} 件：{"、".join(parts)}（运行 mashu inbox 查看）'
+
+
+def me_data(conn, cam):
+    """返回当前调用者的身份、作用域、可达地址与手头待办计数。"""
+    role = actor_level(cam)
+    f = film(conn, cam['film_id']) if cam and cam.get('film_id') else None
+    seq_info = None
+    if f and cam and cam.get('seq_key'):
+        s = one(conn, 'SELECT * FROM sequences WHERE film_id=? AND key=?', f['id'], cam['seq_key'])
+        if s:
+            seq_info = dict(key=s['key'], num=s['num'], title=s['title'])
+    if role == 'crew':
+        can_send = ['up（本项目子脑）', 'lead（本项目子脑）', '#<编号>（同项目其他执行者）', '@crew（本项目协作板）']
+    elif role == 'producer':
+        can_send = ['user（用户）', 'up（用户）', 'boss（麻薯主脑）', '#<编号>（本项目执行者）', '@crew（本项目协作板）']
+    elif role == 'assistant':
+        can_send = ['user（用户）', 'up（用户）', '<项目id>（任意项目子脑）', '<项目id>#<编号>（任意项目执行者）']
+    else:
+        can_send = ['<项目id>（任意项目子脑）', '<项目id>#<编号>（任意项目执行者）']
+    ib = collect_inbox(conn, cam, include_all=False, mark_fyi_read=False)
+    open_items = [x for x in ib['items'] if x['status'] == 'open']
+    stale_cnt = sum(1 for x in open_items if x['stale_reason'])
+    rem_cnt = sum(1 for x in open_items if x['reminded'])
+    return dict(
+        role=role,
+        role_label=LEVEL_LABEL.get(role, role),
+        name=cam['name'] if cam else '用户',
+        camera_id=cam['id'] if cam else None,
+        film=dict(id=f['id'], title=f['title']) if f else None,
+        feature=seq_info,
+        can_send=can_send,
+        counts=dict(inbox=len(open_items), stale=stale_cnt, reminded=rem_cnt,
+                    peer_messages=len(ib['peer_messages']), peer_waits=len(ib['peer_waits'])),
+    )
 
 
 def auto_meta(conn, f, key, kind, gate):
@@ -4714,6 +5507,7 @@ def _tick(conn):
     accounts_tick(conn)
     refresh_running_usage(conn)
     report_timeouts(conn)
+    triage_reports(conn)
     peer_wait_tick(conn)
     maybe_digest(conn)
     selfiter_call('maybe_run', conn)
@@ -7260,7 +8054,7 @@ def cmd_hook_prompt(args):
         conn.commit()
         prompt = payload.get('lastUserInput') or ''
         if payload.get('invocationNum') in (0, None):
-            out = [collaboration_context(conn, c)]
+            out = [collaboration_context(conn, c), inbox_summary_line(conn, c)]
             if c['role'] == 'crew' and prompt.lstrip().startswith('继续'):
                 out.append('[麻薯电脑秘书 · 状态文件]\n' + status_text(film(conn, c['film_id']), c['seq_key']))
             if any(out):
@@ -7281,6 +8075,7 @@ def cmd_hook_prompt(args):
         if f:
             out.append('[麻薯电脑秘书 · 状态文件]\n' + status_text(f, c['seq_key']))
     out.append(collaboration_context(conn, c))
+    out.append(inbox_summary_line(conn, c))
     text = '\n\n'.join(x for x in out if x and x.strip())
     if text:
         if fmt == 'codex':
@@ -8632,107 +9427,225 @@ def cmd_retake(args):
     print(f'新执行者「{row["name"]}」（{row["state"]}）')
 
 
+def cmd_me(args):
+    conn = db()
+    c = caller(conn)
+    d = me_data(conn, c)
+    if getattr(args, 'json', False):
+        out_ok(d, as_json=True)
+        return
+    where = d['film']['title'] + f'[{d["film"]["id"]}]' if d['film'] else '全局'
+    feat = f' #{d["feature"]["num"]} {d["feature"]["title"]}' if d['feature'] else ''
+    lines = [
+        f'你是：{d["role_label"]}「{d["name"]}」（{where}{feat}）',
+        '可发给：' + '、'.join(d['can_send']),
+        f'手头待办：收件箱 {d["counts"]["inbox"]} 件'
+        + (f'（其中 {d["counts"]["stale"]} 件已过时）' if d['counts']['stale'] else '')
+        + (f'（{d["counts"]["reminded"]} 件用户挂久）' if d['counts']['reminded'] else '')
+        + (f'；点对点消息 {d["counts"]["peer_messages"]} 条' if d['counts']['peer_messages'] else '')
+        + (f'；{d["counts"]["peer_waits"]} 个会话在等你回复' if d['counts']['peer_waits'] else ''),
+    ]
+    print('\n'.join(lines))
+
+
+def cmd_inbox(args):
+    conn = db()
+    c = caller(conn)
+    d = collect_inbox(conn, c, include_all=bool(getattr(args, 'all', False)), mark_fyi_read=True)
+    if getattr(args, 'json', False):
+        out_ok(d, as_json=True)
+        return
+    items = d['items']
+    if not items and not d['peer_messages'] and not d['peer_waits']:
+        print('收件箱为空')
+        return
+    lines = []
+    for it in items:
+        tags = [f'[{it["msg_type"]}/{it["msg_type_label"]}]']
+        if it['status'] == 'superseded':
+            tags.append(f'[已被 #{it["superseded_by"]} 取代]' if it['superseded_by'] else '[已被取代]')
+        elif it['status'] != 'open':
+            tags.append(f'[{it["status"]}]')
+        if it['stale_reason'] and it['status'] == 'open':
+            tags.append(f'[已过时：{it["stale_reason"]}]')
+        if it['reminded']:
+            tags.append('[挂久了]')
+        if it['auto_closed']:
+            tags.append('[已阅自动结案]')
+        age = f'{it["age_minutes"]}m' if it['age_minutes'] < 60 else f'{it["age_minutes"] / 60:.1f}h'
+        lines.append(f'#{it["id"]} {" ".join(tags)} {it["origin"]} · 挂了 {age}')
+        lines.append(f'  {it["summary"]}')
+        if it['options']:
+            lines.append('  选项：' + ' | '.join(f'{chr(65 + i)}. {o}' for i, o in enumerate(it['options'])))
+        if it['suggested_action']:
+            lines.append(f'  建议：{it["suggested_action"]}')
+    for pm in d['peer_messages']:
+        lines.append(f'[点对点] {pm["text"]}')
+    for pw in d['peer_waits']:
+        lines.append(f'[点对点等待] {pw["from_label"]} 在等你回复：{pw["why"]}')
+    print('\n'.join(lines))
+
+
+def cmd_send(args):
+    conn = db()
+    c = caller(conn)
+    text = read_text_arg(args.text, label='消息正文')
+    res = send_message(
+        conn, c, args.to, text,
+        msg_type=getattr(args, 'type', None),
+        options=getattr(args, 'options', None),
+        recommend=getattr(args, 'recommend', None),
+        why=getattr(args, 'why', None),
+        summary=getattr(args, 'summary', None),
+        gate=getattr(args, 'gate', None),
+        confirm_stage=getattr(args, 'confirm_stage', None),
+        impact=getattr(args, 'impact', None),
+        reversible=getattr(args, 'reversible', None),
+        human=bool(getattr(args, 'human', False)),
+        urgent=bool(getattr(args, 'urgent', False)),
+        ref=getattr(args, 'ref', None),
+        re_id=getattr(args, 're', None),
+        supersedes=getattr(args, 'supersedes', None),
+        dedupe_key=getattr(args, 'key', None),
+    )
+    payload = {k: v for k, v in res.items() if k != 'report'}
+    if res['route'] == 'board':
+        out_ok(payload, '已同步到项目协作板', as_json=getattr(args, 'json', False))
+    elif res['route'] == 'peer':
+        if not res['online']:
+            out_ok(payload, '对方不在线，未发送', as_json=getattr(args, 'json', False))
+        else:
+            out_ok(payload, '已送入对方下一轮上下文，并抄送子脑' + ('' if res['fyi'] else '（已记为等待对方回复）'),
+                   as_json=getattr(args, 'json', False))
+    elif res['route'] == 'note':
+        out_ok(payload, '已排入投递（没有在拍的执行者时会自动启动）', as_json=getattr(args, 'json', False))
+    elif res['route'] == 'memo':
+        out_ok(payload, f'已发给 {res["film_title"]} 子脑（没在运行会自动启动）', as_json=getattr(args, 'json', False))
+    else:
+        r = res['report']
+        sup_note = f'（已自动取代 {", ".join(f"#{i}" for i in res["superseded"])}）' if res.get('superseded') else ''
+        dup_note = '（去重命中，未重复建卡）' if res.get('deduped') else ''
+        if infer_msg_type(r) in ('ask', 'approve', 'blocked'):
+            msg = f'已提交 #{r["id"]}（{res["msg_type"]}），交给{LEVEL_LABEL[r["holder"]]}{sup_note}{dup_note}。现在结束本轮；批复会以「[批复 #{r["id"]} …]」发给你。'
+        else:
+            msg = f'已发送 #{r["id"]}（{res["msg_type"]}）给{LEVEL_LABEL[r["holder"]]}{sup_note}{dup_note}'
+        out_ok(payload, msg, as_json=getattr(args, 'json', False))
+
+
+def cmd_reply(args):
+    conn = db()
+    c = caller(conn)
+    if c and c['role'] not in ('producer', 'assistant'):
+        fail('permission_denied', '执行者不能批复上报', fix='mashu inbox', exit_code=EXIT_RULE)
+    text = read_text_arg(args.text, allow_empty=True, label='回复正文')
+    res = reply_report(conn, args.id, c, text=text, choice=getattr(args, 'choice', None))
+    out_ok(res, f'#{res["id"]} 已批复（{res["answer"]}）并结案', as_json=getattr(args, 'json', False))
+
+
+def cmd_forward(args):
+    conn = db()
+    c = my_camera(conn, ['producer', 'assistant'])
+    note = read_text_arg(args.note, allow_empty=True, label='转交意见')
+    res = forward_report(conn, args.id, c, to=args.to, note=note,
+                         recommend=getattr(args, 'recommend', None),
+                         why=getattr(args, 'why', None),
+                         require_confirm=True, confirm=bool(getattr(args, 'confirm', False)))
+    out_ok(res, f'#{res["id"]} 已转交给{LEVEL_LABEL[res["holder"]]}', as_json=getattr(args, 'json', False))
+
+
+def cmd_close(args):
+    conn = db()
+    c = caller(conn)
+    why = read_text_arg(args.why, label='结案原因')
+    res = close_report_action(conn, args.id, c, why=why,
+                              silent=bool(getattr(args, 'silent', False)),
+                              confirm=bool(getattr(args, 'confirm', False)))
+    out_ok(res, f'#{res["id"]} 已{"静默" if res["silent"] else ""}结案：{res["why"]}', as_json=getattr(args, 'json', False))
+
+
 def cmd_note(args):
     conn = db()
     c = caller(conn)
     f, s = resolve_ref(conn, args.ref)
-    sender = c['role'] if c else 'executive'
-    post(conn, sender, f'{f["id"]}/{s["key"]}', 'note' if c else 'chat', args.text, target=f'crew:{f["id"]}/{s["key"]}', camera=c)
-    print('已排入投递（没有在拍的执行者时会自动启动）')
+    text = read_text_arg(args.text, label='补充指令')
+    res = send_message(conn, c, f'{f["id"]}#{s["num"]}', text, msg_type='fyi')
+    out_ok(res, '已排入投递（没有在拍的执行者时会自动启动）', as_json=getattr(args, 'json', False))
 
 
 def cmd_memo(args):
     conn = db()
     c = env_camera(conn)
     if c and c['role'] != 'assistant':
-        raise SystemExit('指示只有麻薯能发；子脑向上汇报用 mashu report')
-    f = require_film(conn, args.film)
-    post(conn, 'assistant' if c else 'executive', f['id'], 'memo' if c else 'chat', args.text, target=f'producer:{f["id"]}', camera=c)
-    print(f'已发给 {f["title"]} 子脑（没在运行会自动启动）')
+        fail('permission_denied', '指示只有主脑能发；子脑向上汇报用 mashu send boss 或 mashu report',
+             fix='mashu send boss "你的内容"', exit_code=EXIT_RULE)
+    text = read_text_arg(args.text, label='指示正文')
+    res = send_message(conn, c, args.film, text, msg_type='fyi')
+    out_ok(res, f'已发给 {res["film_title"]} 子脑（没在运行会自动启动）', as_json=getattr(args, 'json', False))
 
 
 def cmd_say(args):
     conn = db()
     c = my_camera(conn, ['assistant'])
-    post(conn, 'assistant', 'assistant', 'reply', args.text, camera=c)
-    print('已发到主对话')
+    text = read_text_arg(args.text, label='正文')
+    mid = post(conn, 'assistant', 'assistant', 'reply', text, camera=c)
+    out_ok(dict(message_id=mid, channel='assistant'), '已发到主对话', as_json=getattr(args, 'json', False))
 
 
 def cmd_ask(args):
     conn = db()
     c = my_camera(conn)
-    if args.gate and args.gate not in GATES:
-        raise SystemExit(f'闸门只能是：{", ".join(GATES)}')
-    options = [o.strip() for o in args.options.split('|') if o.strip()] if args.options else None
-    kind = 'gate' if args.gate else ('confirm' if args.confirm_stage else 'ask')
-    if kind == 'ask' and not args.human and not args.urgent:     # 一轮只问一次：上一条还没回就不再发新卡（自迭代 #62→#68 复发）
-        prev = one(conn, 'SELECT id, created_at, summary FROM reports WHERE source_camera=? AND kind="ask" AND status="open" '
-                         'AND created_at>? ORDER BY id DESC LIMIT 1', c['id'], time.time() - ASK_MERGE_MINUTES * 60)
-        if prev:
-            raise SystemExit(f'你 {(time.time() - prev["created_at"]) / 60:.0f} 分钟前发的 #{prev["id"]}（{prev["summary"]}）还没回。'
-                             '同一轮要问的事合成一条：这件先能按已有偏好定的就 `mashu decide` 自己定，定不了的记下来，'
-                             f'等 #{prev["id"]} 批复后和其余待定的合成一次问。确实紧急且和 #{prev["id"]} 无关，加 --urgent 再发。')
-    q = args.question or ''
-    if kind == 'ask' and not args.human and (len(q) > ASK_MAX_CHARS or q.count('？') + q.count('?') > 2):
-        raise SystemExit(f'这条请示 {len(q)} 字、{q.count("？") + q.count("?")} 个问号：一条 ask 只问一件事，正文一两句。'
-                         '能按已有偏好定的先 `mashu decide` 自己定；剩下的拆成一件一件问，或把问题清单写进文档、ask 里只附链接和一个选项组。')
-    meta = {k: v for k, v in dict(recommend=args.recommend, why=args.why, impact=args.impact,
-                                   reversible=None if args.reversible is None else args.reversible == 'yes',
-                                   human=True if args.human else None).items() if v is not None}
-    if meta.get('recommend'):
-        meta['recommend_by'] = actor_label(c)
-    film_id, key = c['film_id'], c['seq_key']
-    if args.ref:       # 子脑 / 主脑没有自己的 seq_key：用 --ref 把上报挂到指定功能上（如重新申请开工卡，上报 #256）
-        if c['role'] not in ('producer', 'assistant'):
-            raise SystemExit('--ref 只给子脑和主脑用；执行者的请示自动挂在自己的功能上')
-        rf, rs = resolve_ref(conn, args.ref)
-        film_id, key = rf['id'], rs['key']
-    if args.gate == 'kickoff':
-        if not key:
-            raise SystemExit('开工卡要挂到功能上：加 --ref <项目>/<功能编号>')
-        kf = film(conn, film_id)
-        if not kickoff_pending(kf, key):
-            raise SystemExit(f'{seq_label(kf, key)} 不在等开工状态，不用再申请开工')
-        if not options:
-            options = ['批准开工', '先别']
-        ex = kickoff_exec(conn, kf, key)
-        meta['exec'] = ex
-        if '执行者：' not in (args.question or ''):
-            args.question = (args.question or '') + f'\n\n执行者：{exec_label(ex["cli"], ex["model"], ex["effort"])}'
-        plan = seq_dir(kf, key) / 'docs' / 'plan.md'
-        if plan.exists() and 'plan.md' not in (args.question or ''):
-            args.question = (args.question or '') + f'\n\n方案（docs/plan.md）：\n{plan.read_text()}'
-    r = create_report(conn, kind, c, film_id, key, args.question, args.summary, options, args.gate,
-                      args.confirm_stage, meta=meta)
-    print(f'已提交上报 #{r["id"]}，交给{LEVEL_LABEL[r["holder"]]}。现在结束本轮；批复会以「[批复 #{r["id"]} …]」发给你。')
+    q = read_text_arg(args.question, label='请示正文')
+    mt = 'approve' if (args.gate or args.confirm_stage) else 'ask'
+    res = send_message(
+        conn, c, 'up', q, msg_type=mt, options=args.options, recommend=args.recommend, why=args.why,
+        summary=args.summary, gate=args.gate, confirm_stage=args.confirm_stage, impact=args.impact,
+        reversible=args.reversible, human=bool(args.human), urgent=bool(args.urgent), ref=args.ref,
+        re_id=getattr(args, 're', None), supersedes=getattr(args, 'supersedes', None),
+        dedupe_key=getattr(args, 'key', None),
+        legacy_kind='gate' if args.gate else ('confirm' if args.confirm_stage else 'ask'),
+    )
+    r = res['report']
+    payload = {k: v for k, v in res.items() if k != 'report'}
+    out_ok(payload, f'已提交上报 #{r["id"]}，交给{LEVEL_LABEL[r["holder"]]}。现在结束本轮；批复会以「[批复 #{r["id"]} …]」发给你。',
+           as_json=getattr(args, 'json', False))
 
 
 def cmd_tell(args):
     conn = db()
     c = my_camera(conn)
-    r = create_report(conn, 'tell', c, c['film_id'], c['seq_key'], args.text, args.summary)
-    print(f'已通报 #{r["id"]}（交给{LEVEL_LABEL[r["holder"]]}）')
+    text = read_text_arg(args.text, label='通报正文')
+    res = send_message(conn, c, 'up', text, msg_type='fyi', summary=args.summary,
+                       dedupe_key=getattr(args, 'key', None), legacy_kind='tell')
+    r = res['report']
+    payload = {k: v for k, v in res.items() if k != 'report'}
+    out_ok(payload, f'已通报 #{r["id"]}（交给{LEVEL_LABEL[r["holder"]]}）', as_json=getattr(args, 'json', False))
 
 
 def cmd_report(args):
     conn = db()
     c = my_camera(conn, ['producer'])
-    r = create_report(conn, 'report', c, c['film_id'], None, args.text, args.summary, holder='assistant')
-    print(f'已交给主脑 #{r["id"]}')
+    text = read_text_arg(args.text, label='汇报正文')
+    res = send_message(conn, c, 'boss', text, msg_type='fyi', summary=args.summary,
+                       dedupe_key=getattr(args, 'key', None), legacy_kind='report')
+    r = res['report']
+    payload = {k: v for k, v in res.items() if k != 'report'}
+    out_ok(payload, f'已交给主脑 #{r["id"]}', as_json=getattr(args, 'json', False))
 
 
 def cmd_pass(args):
     conn = db()
     c = my_camera(conn, ['producer', 'assistant'])
-    r = pass_report(conn, int(str(args.id).lstrip('#')), c, args.note or '', recommend=args.recommend, why=args.why)
-    print(f'#{r["id"]} 已上交给{LEVEL_LABEL[r["holder"]]}')
+    note = read_text_arg(args.note, allow_empty=True, label='意见')
+    res = forward_report(conn, args.id, c, to='up', note=note, recommend=args.recommend, why=args.why, require_confirm=False)
+    out_ok(res, f'#{res["id"]} 已上交给{LEVEL_LABEL[res["holder"]]}', as_json=getattr(args, 'json', False))
 
 
 def cmd_answer(args):
     conn = db()
     c = my_camera(conn, ['producer', 'assistant'])
-    r = answer_report(conn, int(str(args.id).lstrip('#')), c, args.text)
-    print(f'#{r["id"]} 已批复并结案')
+    text = read_text_arg(args.text, label='批复正文')
+    res = reply_report(conn, args.id, c, text=text)
+    out_ok(res, f'#{res["id"]} 已批复并结案', as_json=getattr(args, 'json', False))
 
 
 def cmd_decide(args):
@@ -8882,41 +9795,23 @@ def cmd_collaboration(args):
         print(project_codex(f) + '\n' + parallel_roster(conn, f))
     elif args.command == 'sync':
         if args.text is None:
-            print('\n'.join(f'{item["author"]} · {item["text"]}' for item in board_page(f)[0]) or '协作板暂无进展')
+            items = board_page(f)[0]
+            out_ok(dict(items=items), '\n'.join(f'{item["author"]} · {item["text"]}' for item in items) or '协作板暂无进展',
+                   as_json=getattr(args, 'json', False))
         else:
-            board_post(f, author, args.text, cam['id'])
-            print('已同步到项目协作板')
+            txt = read_text_arg(args.text, label='进展内容')
+            res = send_message(conn, cam, '@crew', txt, msg_type='fyi')
+            out_ok(res, '已同步到项目协作板', as_json=getattr(args, 'json', False))
     else:
         seq = find_seq(conn, f, args.ref.lstrip('#'))
-        if seq['key'] == cam['seq_key'] or not args.text.strip():
-            raise ValueError('请指定另一功能并填写消息')
+        txt = read_text_arg(args.text, label='消息内容')
         fyi = bool(getattr(args, 'fyi', False))
-        with conn:
-            conn.execute('BEGIN IMMEDIATE')
-            peer = active_crew(conn, f['id'], seq['key'])
-            if not peer or peer['state'] not in LIVE:
-                print('对方不在线，未发送')
-                return
-            now = time.time()
-            text = f'[点对点 {author} → #{seq["num"]}] {args.text.strip()[:800]}'
-            conn.execute('INSERT INTO peer_inbox(camera_id,text) VALUES(?,?)', (peer['id'], text))
-            post(conn, 'system', f['id'], 'notice', text, target=f'producer:{f["id"]}', camera=cam)
-            if cam['seq_key']:
-                conn.execute(
-                    'UPDATE peer_waits SET cleared_at=? WHERE film_id=? AND to_seq=? AND cleared_at IS NULL '
-                    'AND from_camera IN (SELECT id FROM cameras WHERE film_id=? AND seq_key=?)',
-                    (now, f['id'], cam['seq_key'], f['id'], seq['key']),
-                )
-            if not fyi:
-                conn.execute(
-                    'UPDATE peer_waits SET cleared_at=? WHERE film_id=? AND from_camera=? AND to_seq=? AND cleared_at IS NULL',
-                    (now, f['id'], cam['id'], seq['key']),
-                )
-                conn.execute(
-                    'INSERT INTO peer_waits(film_id, from_camera, to_seq, since, why) VALUES(?,?,?,?,?)',
-                    (f['id'], cam['id'], seq['key'], now, args.text.strip()[:120]),
-                )
-        print('已送入对方下一轮上下文，并抄送子脑' + ('' if fyi else '（已记为等待对方回复）'))
+        res = send_peer_message(conn, cam, f, seq, txt, fyi=fyi)
+        if not res['online']:
+            out_ok(res, '对方不在线，未发送', as_json=getattr(args, 'json', False))
+            return
+        out_ok(res, '已送入对方下一轮上下文，并抄送子脑' + ('' if fyi else '（已记为等待对方回复）'),
+               as_json=getattr(args, 'json', False))
 
 
 def cmd_claim(args):
@@ -9302,6 +10197,52 @@ def cmd_tick(args):
 def main(argv=None):
     p = argparse.ArgumentParser(prog='mashu', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='command', required=True)
+    # 新统一通信面（6 个核心动词）
+    s = sub.add_parser('me', help='我是谁：角色、项目、功能、可发对象与手头待办')
+    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
+    s = sub.add_parser('inbox', help='收件箱：发给我的待处理、已过时与挂久提醒')
+    s.add_argument('--all', action='store_true', help='包含已结案、被取代和全部上报')
+    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
+    s = sub.add_parser('send', help='按对象地址发消息（支持 user/boss/lead/up/#N/<项目>/<项目>#N/@crew）')
+    s.add_argument('to', help='发送对象地址')
+    s.add_argument('text', help='消息正文（写 - 从标准输入读取）')
+    s.add_argument('--type', choices=MSG_TYPES, help='消息类型：ask/approve/fyi/done/blocked/handoff')
+    s.add_argument('--options', help='选项列表，用 | 分隔，如 "A 方案|B 方案"')
+    s.add_argument('--recommend', help='推荐选项（可写选项全文或字母 A/B）')
+    s.add_argument('--why', help='推荐理由（一句话）')
+    s.add_argument('--summary', help='一句话摘要')
+    s.add_argument('--gate', help='审批闸门（prod/irreversible/kickoff/...）')
+    s.add_argument('--confirm-stage', type=int, help='申请进入的阶段号')
+    s.add_argument('--impact', help='影响范围')
+    s.add_argument('--reversible', choices=['yes', 'no'], help='是否可逆')
+    s.add_argument('--human', action='store_true', help='需要真人帮忙（归入网页「要你帮忙」）')
+    s.add_argument('--urgent', action='store_true', help='紧急且与上一条未回请示无关')
+    s.add_argument('--ref', help='子脑/主脑用：挂到指定功能 <项目>/<功能编号>')
+    s.add_argument('--re', help='关联/回复某条旧卡编号')
+    s.add_argument('--supersedes', help='取代某条旧卡编号并自动将其结案')
+    s.add_argument('--key', help='去重键（重试安全，同键不重复建卡）')
+    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
+    s = sub.add_parser('reply', help='回答 / 批复一条上报（支持 --choice A）')
+    s.add_argument('id', help='上报编号（如 380 或 #380）')
+    s.add_argument('text', nargs='?', default='', help='回复文本或补充说明（写 - 从标准输入读取）')
+    s.add_argument('--choice', help='按选项编号作答（A/B/1/2 或选项文本）')
+    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
+    reply_parser = s
+    s = sub.add_parser('forward', help='转交上报给上级或主脑（原 pass）')
+    s.add_argument('id', help='上报编号')
+    s.add_argument('to', help='转交对象：user / up / boss')
+    s.add_argument('note', nargs='?', default='', help='一句意见（写 - 从标准输入读取）')
+    s.add_argument('--recommend', help='推荐选项（可写 A/B 或选项文本）')
+    s.add_argument('--why', help='推荐理由')
+    s.add_argument('--confirm', action='store_true', help='确认执行')
+    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
+    forward_parser = s
+    s = sub.add_parser('close', help='结案一条待处理上报（含过时清理与静默结案）')
+    s.add_argument('id', help='上报编号')
+    s.add_argument('--why', required=True, help='结案原因（如 "过时：已合并"）')
+    s.add_argument('--silent', action='store_true', help='静默结案，不唤醒发起者')
+    s.add_argument('--confirm', action='store_true', help='确认结案用户手上的卡片')
+    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
     s = sub.add_parser('status', aliases=['callsheet'], help='状态总览'); s.add_argument('film', nargs='?')
     s = sub.add_parser('add-project', aliases=['greenlight'], help='登记项目'); s.add_argument('path'); s.add_argument('--id')
     s.add_argument('--title')
@@ -9411,13 +10352,22 @@ def main(argv=None):
     s.add_argument('--with-secrets', action='store_true', help='export：带上密钥并交互输入口令加密（默认省略密钥）')
     s.add_argument('--dry-run', action='store_true', help='import：只预览差异，不写入')
     s.add_argument('-y', '--yes', action='store_true', help='import：跳过确认直接写入')
-    if not next(iter(sys.argv[1:] if argv is None else argv), '').startswith(('hook-', 'statusline')):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if not next(iter(raw_argv), '').startswith(('hook-', 'statusline')):
         selfiter_call('add_parser', sub)          # 每日自迭代（hooks 和状态栏调用频繁，不加载）
-    args = p.parse_args(argv)
+    if raw_argv and raw_argv[0] == 'reply' and '-h' not in raw_argv and '--help' not in raw_argv:
+        args = reply_parser.parse_intermixed_args(raw_argv[1:])
+        args.command = 'reply'
+    elif raw_argv and raw_argv[0] == 'forward' and '-h' not in raw_argv and '--help' not in raw_argv:
+        args = forward_parser.parse_intermixed_args(raw_argv[1:])
+        args.command = 'forward'
+    else:
+        args = p.parse_args(raw_argv)
     alias = {'callsheet': 'status', 'greenlight': 'add-project', 'pitch': 'new-feature', 'workflow': 'playbook', 'action': 'start',
              'cut': 'stop', 'retake': 'restart', 'wrap': 'finish', 'seq': 'feature'}
     cmd = alias.get(args.command, args.command)
     handler = {
+        'me': cmd_me, 'inbox': cmd_inbox, 'send': cmd_send, 'reply': cmd_reply, 'forward': cmd_forward, 'close': cmd_close,
         'status': cmd_callsheet, 'add-project': cmd_greenlight, 'scan': cmd_scan, 'new-feature': cmd_pitch, 'start': cmd_action,
         'stop': cmd_cut, 'restart': cmd_retake, 'note': cmd_note, 'memo': cmd_memo, 'say': cmd_say, 'ask': cmd_ask,
         'tell': cmd_tell, 'report': cmd_report, 'pass': cmd_pass, 'answer': cmd_answer, 'decide': cmd_decide, 'browser': cmd_browser,
@@ -9429,13 +10379,34 @@ def main(argv=None):
         'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,
         'opencode-models': cmd_opencode_models, 'init': cmd_init, 'account': cmd_account, 'preset': cmd_preset, 'config': cmd_config,
         'self-iterate': lambda a: __import__('selfiter').cmd(a)}[cmd]
+    as_json = bool(getattr(args, 'json', False))
     try:
         handler(args)
+    except MashuError as exc:
+        if cmd.startswith('hook-') or cmd == 'statusline':
+            return
+        payload = {'ok': False, 'api_version': API_VERSION, 'code': exc.code, 'error': exc.message, 'fix': exc.fix}
+        if exc.data:
+            payload.update(exc.data)
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+            raise CliExit(exc.message, exit_code=exc.exit_code, payload=payload, printed=True)
+        msg = f'错误：{exc.message}' + (f'\n下一步：{exc.fix}' if exc.fix else '')
+        raise CliExit(msg, exit_code=exc.exit_code, payload=payload, printed=False)
     except (ValueError, RuntimeError) as exc:
         if cmd.startswith('hook-') or cmd == 'statusline':
             return
-        raise SystemExit(f'错误：{exc}')
+        payload = {'ok': False, 'api_version': API_VERSION, 'code': 'error', 'error': str(exc), 'fix': f'mashu {cmd} --help'}
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+            raise CliExit(str(exc), exit_code=EXIT_ERR, payload=payload, printed=True)
+        raise CliExit(f'错误：{exc}\n下一步：mashu {cmd} --help', exit_code=EXIT_ERR, payload=payload, printed=False)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except CliExit as exc:
+        if not exc.printed and str(exc):
+            print(str(exc), file=sys.stderr)
+        sys.exit(exc.exit_code)
