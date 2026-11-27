@@ -1220,7 +1220,11 @@ table { border-radius: var(--r-card); box-shadow: var(--shadow-card); border: 1p
 .row.seq-row::before { content: ''; position: absolute; left: 15px; top: 0; bottom: 0; width: 1.5px; background: var(--line); }
 .row.seq-row { margin-left: 0; }
 .seq-row .t-line .t { font-size: 13px; font-weight: 500; color: var(--text-2); }
-.seq-row .t-line .seq-num { flex: none; margin-right: 5px; color: var(--faint); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.seq-row .seq-num { position: absolute; left: 0; top: 7px; width: 28px; text-align: center; color: var(--faint); font-size: 11px; font-weight: 600; line-height: 14px; font-variant-numeric: tabular-nums; letter-spacing: -.2px; }
+.seq-row.active .seq-num, .seq-row.fresh .seq-num { color: var(--muted); }
+.row.seq-row.has-num::before { top: 24px; }
+.seq-row.has-num .fresh-dot { top: 25px; }
+.seq-row.has-num.fresh .seq-num { color: var(--accent); }
 .seq-row.active .t-line .t, .seq-row.fresh .t-line .t { color: var(--text); font-weight: 650; }
 .fresh-dot { left: 12px; z-index: 1; box-shadow: 0 0 0 2px var(--side); }
 .done-head { margin-left: 0; padding-left: 26px; position: relative; }
