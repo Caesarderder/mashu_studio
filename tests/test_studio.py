@@ -748,6 +748,17 @@ class TestStudio(Base):
             'file_path': str(studio.seq_dir(self.film, kc) / 'acceptance.json')}})
         self.assertIn('deny', out)
 
+    def test_user_opened_features_without_scope_do_not_queue_each_other(self):
+        # 用户从网页开的功能 / 会话（by=None）没写范围：自动认领自己的资料夹，不再因「有一方没声明范围」互相排队（#6、#10）
+        studio.CONFIG_OVERRIDES['stages'] = 5
+        fa, ka, a = studio.pitch(self.conn, 'builda', 'chat-a', '聊聊')
+        fb, kb, b = studio.pitch(self.conn, 'builda', 'chat-b', '再聊')
+        self.assertEqual(studio.seq_state(fb, kb)['claims']['touches'], [f'.mashu/features/{kb}/**'])
+        self.tick()
+        self.assertEqual(self.cam(a['id'])['state'], 'running')
+        self.assertEqual(self.cam(b['id'])['state'], 'running')
+        self.assertFalse(studio.one(self.conn, 'SELECT id FROM messages WHERE text LIKE "%还没有声明改动范围%"'))
+
     def test_trust_ladder(self):
         self.strict()
         studio.CONFIG_OVERRIDES['trust_streak'] = 2

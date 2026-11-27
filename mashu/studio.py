@@ -1315,6 +1315,8 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
     data = new_seq_state(key, title or slug, brief, pb)
     if touches:        # 开功能时就声明改动范围：和同项目在跑的功能不重叠就能并行，重叠就排队
         data['claims'] = dict(touches=list(touches), declared_at=now_iso())
+    elif not by:       # 用户从网页开的功能 / 会话没写范围：先只认领自己的资料夹，不和别的功能互相排队；写了别的文件会自动记进范围
+        data['claims'] = dict(touches=[f'.mashu/features/{key}/**'], declared_at=now_iso(), auto=True)
     if account:        # 按账号分组的项目（accounts.json）：功能归哪个账号
         data['account'] = account
     if workdir:
