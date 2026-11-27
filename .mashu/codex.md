@@ -8,7 +8,7 @@
 
 | 功能 | 执行者 | 交付 / 状态 | 方案 |
 | --- | --- | --- | --- |
-| #13 caesar-docs 治理 | 很好 | 进行中（#279 用户批准开工） | `.mashu/plans/docs-governance.md`，依据 `.mashu/drafts/caesar-docs-audit-2026-11-27.md` |
+| #13 caesar-docs 治理 | 很好 | 已完成（d2a859a），待用户点「重启服务」生效 | `.mashu/plans/docs-governance.md`，依据 `.mashu/drafts/caesar-docs-audit-2026-11-27.md` |
 | #11 并行调度 + 法典 + 协作板 + 点对点 | — | 已完成（6e00cb8），服务 04:05 重启后已生效 | `.mashu/plans/parallel-codex.md` |
 | #12 semrush | — | 已归档 | 无 |
 
@@ -51,6 +51,8 @@
 | 时间 | 功能 | 变更 |
 | --- | --- | --- |
 | 2026-11-27 | #11 | 新增 `mashu sync "…"`（写协作板 `.mashu/board.jsonl`，其他会话下一轮注入）、`mashu peer <编号> "…"`（点对点，子脑抄送）、`mashu codex [note]`（查看 / 记录法典）；启动不再因范围重叠排队，热点改为写入时短租约（6e00cb8） |
+| 2026-11-27 | #13 | `mashu skills status [--json]`：列出 caesar-docs 各安装位置的版本和指纹；`mashu skills sync [--apply]`：默认只预览，`--apply` 才写（用户级、麻薯级做成软链接，工程副本按锁文件同步）。`mashu handoff --docs "…"` 写入 `handoff.docs`，结单时核验 docs 回写。SessionStart 只注入 docs 入口和索引的路径。实现在 `mashu/skill_sync.py`、`mashu/docs_governance.py`（d2a859a） |
+| 2026-11-27 | 子脑 | `hook_camera(conn, fmt)`：prompt / stop / session / notify 这几个 hook 改用它，嵌套子会话（平台和 camprov 不一致，或进程链上有两层以上 agent CLI）不认机位；pretool 安全拦截仍用 `env_camera`（2f15519） |
 
 ## 当前并行功能
 `mashu codex` 与会话上下文根据调度状态列出当前功能。
