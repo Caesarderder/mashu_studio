@@ -9314,10 +9314,10 @@ def cmd_callsheet(args):
             films=films_out, open_reports=open_reports(conn),
         ), as_json=True)
         return
+    print(_format_runtime_line(data.get('runtime')))
     st = data['stages']
     per = '、'.join(f'{x["label"]} {x["used"]}' for x in st['by_account'])
     print(f'状态总览 {today()}：执行者 {st["used"]} 个（每个账号上限 {st["max"]}{"：" + per if per else ""}），子脑并发 '
-    print(_format_runtime_line(data.get('runtime')))
           f'{data["desks"]["used"]}/{data["desks"]["max"]}，待用户处理 {len(data["inbox"])} 件，决策记录待追认 {data["decisions_pending"]} 条')
     for f in data['films']:
         if args.film and f['id'] != args.film:
