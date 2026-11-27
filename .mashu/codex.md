@@ -8,6 +8,7 @@
 
 | 功能 | 执行者 | 交付 / 状态 | 方案 |
 | --- | --- | --- | --- |
+| #17 stable-runtime 线上跑稳定快照（发布 = 重启服务） | 待批准开工 | `bin/mashu` 分流器、`bin/mashu-dev`、`start.sh` 服务路径、studio.py 路径常量 + `MASHU_CONTENT` + `cmd_release`/`runtime_info`/`cmd_restart_server`、`status_data` 只加 `runtime` 字段、server.py 重启接口、web 右上角。不碰 #16 的通信命令/hook_prompt/卡片，不碰 #15 的左栏 | `.mashu/plans/stable-runtime.md` |
 | #16 agent-cli 统一收发 + 收件箱分拣 + agent 友好输出 | 我不难过（#382 批准，阶段 1 进行中） | 新增 `cmd_me/inbox/send/reply/forward/close`、`resolve_address`、`triage_reports`、`fail()`；旧通信命令改为别名；`reports` 加列；hook_prompt 摘要；web 卡片类型/过时；提示词瘦身。`peer` 只调用 #15 的函数，不改其表 | `.mashu/plans/agent-cli.md` |
 | #15 左栏状态细化 + 点对点等待 | 雨天（2e81a8b 已完成；用户 13:58 要求左栏黄字更简洁，返工中） | 改 `seq_status`/`status_data`/`bg_tasks_of`/`cam_view_bg`/`launch_queue`（记排队原因）/`cmd_collaboration`（peer 等待）/`collaboration_context`、新表 `peer_waits`、web 左栏与对话头部 | `.mashu/plans/status-detail.md` |
 | #14 模型池（预设 + 备选预设） | 日落（已完成 1fb06e9、1694bfd，待重启服务） | 改 `session_pref`/`code_pref`/`choose_account`/`set_pref`/launch 取配置/defaults 动作/`pitch`、`config_file.py` 迁移、web 模型池页与各选择器 | `.mashu/plans/model-pool.md` |
