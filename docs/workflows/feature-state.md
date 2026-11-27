@@ -45,8 +45,10 @@ mashu ac add "WHEN … THE system SHALL …"         # 任何阶段都能加
 mashu ac pass AC-1 --evidence "命令和结果"  /  mashu ac fail AC-1 --evidence "…"  /  mashu ac list
 mashu claim "src/export/**" "tests/export/**" [--add]
 mashu sync "接口已提交，等待联调"
-mashu peer 12 "请确认导出接口"
+mashu peer 12 "请确认导出接口"                   # 默认记为等待对方回复；只通知加 --fyi
 ```
+
+左栏与 `/api/state` 的会话状态在原有大类（空闲 / 执行中 / 阻塞 / 待回复 / 待审批 / 等待后台任务 / 已完成 / 已归档）基础上新增「等会话回复」（`peer`，归入「执行中」筛选），每个会话和子脑/主脑都会附带一行状态详情（等谁审批/回复、等哪个会话、排队原因、后台任务简述、阻塞原因、待重启服务、上次回复首句等）。
 
 ## 停止条件
 

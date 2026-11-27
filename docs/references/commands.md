@@ -29,7 +29,7 @@ related:
 
 | 命令 | 用途 |
 | --- | --- |
-| `mashu status [项目]` | 全局或某个项目的状态 |
+| `mashu status [项目]` | 全局或某个项目的状态（含每个会话的详细状态与点对点等待） |
 | `mashu ask "…" --options "A|B" --recommend A --why "…" [--gate prod|irreversible] [--summary …]` | 请示（执行者 → 子脑；子脑 / 主脑 → 用户）。需要真人帮忙（登录、密钥、付款、线下）加 `--human`。自己上一条 ask 还没回（30 分钟内）时会被拦，让你合并；紧急且无关加 `--urgent`。正文超过 400 字或 3 个以上问号会被拒（一条只问一件事） |
 | `mashu tell "…"` | 通报，不需要回答 |
 | `mashu handoff --now … --next … [--open … --files … --evidence … --risk … --docs …]` / `--file PATH` | 写交接文档。`--docs` 记录回写节点或无需回写的理由 |
@@ -76,7 +76,7 @@ related:
 
 ## 执行者
 
-`mashu sync ["进展"]` 查看或发布项目进展。`mashu peer <编号> "消息"` 发给在线同项目执行者并抄送子脑。`mashu codex` 显示法典和当前分工，子脑可用 `mashu codex note "约定"` 追加。
+`mashu sync ["进展"]` 查看或发布项目进展。`mashu peer <编号> "消息" [--fyi]` 发给在线同项目执行者并抄送子脑；默认记为等待对方回复（对方回复、己方会话结束/换人或超过 `peer_wait_minutes` 默认 30 分钟后自动清除），加 `--fyi` 表示只通知不等回复。`mashu codex` 显示法典和当前分工，子脑可用 `mashu codex note "约定"` 追加。
 
 见 [功能状态文件](../workflows/feature-state.md)（feature / ac / claim）。
 

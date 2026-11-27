@@ -1194,8 +1194,10 @@ table { border-radius: var(--r-card); box-shadow: var(--shadow-card); border: 1p
 
 /* ---------- 会话状态：等待后台任务 / 已完成待查看小点 / 归档 ---------- */
 .st-waiting { --c: var(--blue); }
+.st-peer { --c: #0d9488; }
 .st-archived { --c: var(--faint); }
 .pill.st-waiting { color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, transparent); }
+.pill.st-peer { color: #0d9488; background: color-mix(in srgb, #0d9488 12%, transparent); }
 .pill.st-archived { color: var(--faint); background: color-mix(in srgb, var(--faint) 12%, transparent); }
 .st-done.pill { background: color-mix(in srgb, var(--green) 12%, transparent); }
 .row.seq-row { position: relative; }
@@ -1574,3 +1576,19 @@ details.sd-sec summary { cursor: pointer; }
 #projectBoard ul { max-height: 24vh; overflow: auto; list-style: none; padding: 0; margin: 8px 0 0; }
 #projectBoard li { padding: 6px 0; }
 #projectBoard p { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* 状态详情行（左栏 + 对话头，#15） */
+.film-head { flex-direction: column; align-items: stretch; gap: 3px; }
+.film-head .fh-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.film-head .fh-detail { padding-left: 20px; font-size: 11.5px; line-height: 1.35; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.st-detail { display: flex; align-items: center; gap: 5px; margin-top: 2px; font-size: 11.5px; line-height: 1.35; color: var(--muted); min-width: 0; width: 100%; }
+.st-detail .st-dt { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-detail .dots { flex: none; padding: 0; gap: 3px; }
+.st-detail .dots i { background: var(--accent); width: 4px; height: 4px; }
+.st-detail.live, .fh-detail.live, .st-line.live .st-t, .st-t.live { color: var(--accent); }
+.st-detail.warn, .fh-detail.warn, .st-line.warn .st-t, .st-t.warn { color: var(--amber); }
+.st-detail.bad, .fh-detail.bad, .st-line.bad .st-t, .st-t.bad { color: var(--red); }
+.st-detail.peer, .fh-detail.peer, .st-line.peer .st-t, .st-t.peer { color: #0d9488; }
+.st-detail.wait, .fh-detail.wait, .st-line.wait .st-t, .st-t.wait { color: var(--blue); }
+.st-detail.relay, .fh-detail.relay, .st-line.relay .st-t, .st-t.relay { color: var(--purple); }
+.chat-head .s .st-t { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

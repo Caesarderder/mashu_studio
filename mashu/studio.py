@@ -61,6 +61,7 @@ DEFAULTS = dict(
     producer_desks=3,             # 子脑并发：同时运行中的子脑上限
     max_stages_per_film=2,        # 每个项目默认最多占几个并发槽
     hotspot_lease_minutes=15,
+    peer_wait_minutes=30,         # 点对点等待超时分钟数：超时先提示已超时，再过一拍自动清除
     scan_roots=['~/workspace'],   # 扫描未登记项目的根目录
     producer_idle_minutes=30,
     report_timeout_minutes=10,    # 上报在某一级停留超时后自动上交
@@ -143,6 +144,10 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS hotspot_leases(film_id TEXT, path TEXT, owner TEXT, head TEXT, until REAL,
   PRIMARY KEY(film_id, path));
 CREATE TABLE IF NOT EXISTS peer_inbox(id INTEGER PRIMARY KEY, camera_id INTEGER, text TEXT);
+CREATE TABLE IF NOT EXISTS peer_waits(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, film_id TEXT, from_camera INTEGER, to_seq TEXT,
+  since REAL, cleared_at REAL, why TEXT, timed_out_at REAL);
+CREATE INDEX IF NOT EXISTS peer_waits_open ON peer_waits(film_id, cleared_at);
 CREATE TABLE IF NOT EXISTS films(
   id TEXT PRIMARY KEY, title TEXT, type TEXT, path TEXT, producer_name TEXT, created_at TEXT, archived INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sequences(
@@ -230,7 +235,7 @@ def db():
                        ('approvals', 'payload TEXT'), ('cameras', 'ctx_at REAL'),
                        ('cameras', 'handoff_at REAL'), ('cameras', 'effort TEXT'), ('cameras', 'pref_applied TEXT'),
                        ('cameras', 'ctx_window INTEGER'), ('cameras', 'health TEXT'), ('cameras', 'health_at REAL'),
-                       ('cameras', 'health_note TEXT')):
+                       ('cameras', 'health_note TEXT'), ('peer_waits', 'timed_out_at REAL')):
         if col.split()[0] not in {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}:
             conn.execute(f'ALTER TABLE {table} ADD COLUMN {col}')
     conn.executescript(EVENTS_SCHEMA)
@@ -1688,6 +1693,8 @@ def end_camera(conn, cid, reason, detail=None):
             relayout(win)
     conn.execute('UPDATE cameras SET state="ended", ended_reason=?, wrap_reason=NULL, updated=? WHERE id=?',
                  (reason, time.time(), cid))
+    conn.execute('UPDATE peer_waits SET cleared_at=? WHERE from_camera=? AND cleared_at IS NULL', (time.time(), cid))
+    conn.execute('DELETE FROM meta WHERE k=?', (f'qreason:{cid}',))
     conn.commit()
     log_session_end(conn, cid, reason, detail)
     return c
@@ -3043,6 +3050,7 @@ def launch(conn, cid, pane=None, no_prompt=False):
                                                json.dumps(pref, sort_keys=True), cid))
     if prov in ('codex', 'opencode') and eff_for_record:     # 这两家不回报思考档位：记下实际传的那档，网页显示「现在：…」
         conn.execute('UPDATE cameras SET effort=? WHERE id=?', (platform_effort(prov, model_for_record, eff_for_record) or None, cid))
+    conn.execute('DELETE FROM meta WHERE k=?', (f'qreason:{cid}',))
     conn.commit()
     c = camera(conn, cid)
     if c['role'] == 'crew' and not respawn:
@@ -3707,6 +3715,47 @@ def parallel_roster(conn, f):
     return '当前并行功能（自动）\n' + ('\n'.join(f'#{seq_num(c["seq_key"])} {c["title"]} · {c["name"]}' for c in active) or '无')
 
 
+def active_peer_waits(conn, film_id=None, now=None):
+    """返回活跃的点对点等待列表（发起方仍是活跃机位且未清除）。"""
+    now = now or time.time()
+    limit = max(60, float(cfg('peer_wait_minutes') or 30) * 60)
+    sql = (f'SELECT w.*, c.role AS from_role, c.seq_key AS from_seq, c.name AS from_name '
+           f'FROM peer_waits w JOIN cameras c ON c.id=w.from_camera '
+           f'WHERE w.cleared_at IS NULL AND c.state IN {ACTIVE}')
+    args = []
+    if film_id:
+        sql += ' AND w.film_id=?'
+        args.append(film_id)
+    sql += ' ORDER BY w.since, w.id'
+    out = []
+    for r in rows(conn, sql, *args):
+        r['timed_out'] = bool(r.get('timed_out_at')) or (now - (r.get('since') or now) >= limit)
+        r['from_label'] = f'#{seq_num(r["from_seq"])}' if r.get('from_seq') else '子脑'
+        r['to_num'] = seq_num(r['to_seq'])
+        out.append(r)
+    return out
+
+
+def peer_wait_tick(conn, now=None):
+    """点对点等待超时管理：先清掉已结束发起方和上一拍已标超时的记录，再把新超时的标上 timed_out_at（本拍提示已超时，下一拍清除）。"""
+    now = now or time.time()
+    limit = max(60, float(cfg('peer_wait_minutes') or 30) * 60)
+    conn.execute(
+        f'UPDATE peer_waits SET cleared_at=? WHERE cleared_at IS NULL '
+        f'AND from_camera NOT IN (SELECT id FROM cameras WHERE state IN {ACTIVE})',
+        (now,),
+    )
+    conn.execute(
+        'UPDATE peer_waits SET cleared_at=? WHERE cleared_at IS NULL AND timed_out_at IS NOT NULL',
+        (now,),
+    )
+    conn.execute(
+        'UPDATE peer_waits SET timed_out_at=? WHERE cleared_at IS NULL AND timed_out_at IS NULL AND (? - since) >= ?',
+        (now, now, limit),
+    )
+    conn.commit()
+
+
 def collaboration_context(conn, cam):
     f = film(conn, cam['film_id'])
     prefix = f'collab:{cam["id"]}:'
@@ -3739,6 +3788,16 @@ def collaboration_context(conn, cam):
         if inbox:
             out.extend(item['text'] for item in inbox)
             conn.execute('DELETE FROM peer_inbox WHERE camera_id=? AND id<=?', (cam['id'], inbox[-1]['id']))
+    waits_all = active_peer_waits(conn, f['id'])
+    wait_lines = []
+    for w in waits_all:
+        to_lbl = f'#{w["to_num"]}' if w['to_num'] is not None else w['to_seq']
+        if w['from_camera'] == cam['id']:
+            wait_lines.append(f'你等 {to_lbl} 回复已超时' if w['timed_out'] else f'你在等 {to_lbl} 回复')
+        elif cam['role'] == 'crew' and cam['seq_key'] and w['to_seq'] == cam['seq_key'] and not w['timed_out']:
+            wait_lines.append(f'{w["from_label"]} 在等你回复')
+    if wait_lines:
+        out.append('点对点等待\n' + '\n'.join(dict.fromkeys(wait_lines)))
     return '\n\n'.join(out)
 
 
@@ -4567,8 +4626,10 @@ def launch_queue(conn):
     if queued_p and live_count(conn, 'producer') >= cfg('producer_desks'):
         offduty_producers(conn, force_one=True)
     for c in queued_p:
-        if live_count(conn, 'producer') >= cfg('producer_desks'):
-            break
+        p_used, p_max = live_count(conn, 'producer'), cfg('producer_desks')
+        if p_used >= p_max:
+            meta_set(conn, f'qreason:{c["id"]}', f'子脑并发已满 {p_used}/{p_max}')
+            continue
         launch(conn, c['id'])
     queued_c = rows(conn, 'SELECT c.* FROM cameras c LEFT JOIN sequences s ON s.film_id=c.film_id AND s.key=c.seq_key '
                           'WHERE c.state="queued" AND c.role="crew" ORDER BY IFNULL(s.priority,0) DESC, c.id')
@@ -4578,16 +4639,24 @@ def launch_queue(conn):
             continue
         _, r = crew_slots(conn)
         if not stage_writes(f, c['seq_key'], c['stage_no']):      # 只读阶段：单独的名额
-            if r < cfg('read_slots'):
+            r_max = cfg('read_slots')
+            if r < r_max:
                 launch(conn, c['id'])
+            else:
+                meta_set(conn, f'qreason:{c["id"]}', f'只读名额已满 {r}/{r_max}')
             continue
-        if crew_slots(conn, f['id'])[0] >= (f.get('max_stages') or cfg('max_stages_per_film')):
+        f_used = crew_slots(conn, f['id'])[0]
+        f_max = f.get('max_stages') or cfg('max_stages_per_film')
+        if f_used >= f_max:
+            meta_set(conn, f'qreason:{c["id"]}', f'本项目已有 {f_used} 个在跑')
             continue
         k = queued_account_key(conn, c)
-        if crew_by_account(conn).get(k, 0) >= cfg('stages'):
+        a_used, a_max = crew_by_account(conn).get(k, 0), cfg('stages')
+        if a_used >= a_max:
+            meta_set(conn, f'qreason:{c["id"]}', f'{account_key_label(k)} 已满 {a_used}/{a_max}')
             if c['id'] not in _acct_full_noted:
                 _acct_full_noted.add(c['id'])
-                notice(conn, f'{f["id"]}/{c["seq_key"]}', f'排队：{account_key_label(k)} 已有 {cfg("stages")} 个执行者在跑（每个账号上限），等它空出来')
+                notice(conn, f'{f["id"]}/{c["seq_key"]}', f'排队：{account_key_label(k)} 已有 {a_max} 个执行者在跑（每个账号上限），等它空出来')
             continue
         for other, why in scope_conflicts(conn, f, c['seq_key']):
             text = f'#{seq_num(c["seq_key"])} 与 #{seq_num(other)} 并行，{why}。请子脑更新 .mashu/codex.md 的分工。'
@@ -4645,6 +4714,7 @@ def _tick(conn):
     accounts_tick(conn)
     refresh_running_usage(conn)
     report_timeouts(conn)
+    peer_wait_tick(conn)
     maybe_digest(conn)
     selfiter_call('maybe_run', conn)
     deliver(conn)
@@ -4788,12 +4858,13 @@ def turn_progress_of(conn, cam, tail=256_000):
     return out
 
 
-def bg_pending(entries):
-    """还在跑的后台任务数：run_in_background 的命令、异步子代理、Workflow，减去已经发回 <task-notification> 的。"""
+def bg_pending_list(entries):
+    """还在跑的后台任务列表（run_in_background 的命令、异步子代理、Workflow，减去已发回 <task-notification> 的）。"""
     launched, done = {}, set()
     for d in entries:
         if d.get('isSidechain'):
             continue
+        ts = _iso_ts(d.get('timestamp'))
         raw = json.dumps(d, ensure_ascii=False)
         if '<task-notification>' in raw:      # 完成通知可能在 user / queue-operation / attachment 里
             for m in re.finditer(r'<task-notification>(.*?)</task-notification>', raw, re.S):
@@ -4806,41 +4877,58 @@ def bg_pending(entries):
             if not isinstance(b, dict):
                 continue
             if b.get('type') == 'tool_use':
-                if (b.get('input') or {}).get('run_in_background') or b.get('name') in ('Agent', 'Task', 'Workflow'):
-                    launched[b.get('id')] = b.get('name')
+                inp = b.get('input') or {}
+                name = b.get('name') or '工具'
+                if inp.get('run_in_background') or name in ('Agent', 'Task', 'Workflow'):
+                    raw_desc = str(inp.get('description') or inp.get('command') or inp.get('prompt') or name or '').strip()
+                    desc = raw_desc.splitlines()[0].strip()[:50] if raw_desc else name
+                    kind = 'agent' if name in ('Agent', 'Task', 'Workflow') else 'shell'
+                    launched[b.get('id')] = dict(kind=kind, tool=name, desc=desc, start=ts)
             elif b.get('type') == 'tool_result' and b.get('tool_use_id') in launched:
                 r = b.get('content')
                 r = r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)
-                if b.get('is_error') or (launched[b['tool_use_id']] in ('Agent', 'Task') and 'Async agent launched' not in r):
+                if b.get('is_error') or (launched[b['tool_use_id']]['tool'] in ('Agent', 'Task') and 'Async agent launched' not in r):
                     launched.pop(b['tool_use_id'], None)     # 前台跑完的子代理 / 没起来的任务
-    return len([k for k in launched if k not in done])
+    return [v for k, v in launched.items() if k not in done]
+
+
+def bg_pending(entries):
+    """还在跑的后台任务数（兼容旧接口）。"""
+    return len(bg_pending_list(entries))
 
 
 _BG_CACHE = {}
 
 
-def bg_tasks_of(conn, cam, tail=1_000_000):
-    """会话 transcript 末尾里还没结束的后台任务数；文件没变就用缓存。"""
+def bg_task_list(conn, cam, tail=1_000_000):
+    """会话 transcript 末尾里还没结束的后台任务列表 [{kind, tool, desc, start}]；文件没变就用缓存。"""
     if not cam:
-        return 0
+        return []
     prov = cam_provider(conn, cam)
     if prov != 'claude':
         if not cam['claude_sid'] and prov != 'opencode':
-            return 0
+            return []
         d = live_detail_of(conn, cam, tail=tail)
-        return sum(1 for x in (d.get('agents') or []) if x.get('state') == 'running') + \
-            sum(1 for x in (d.get('shells') or []) if x.get('state') == 'running')
+        out = []
+        for kind, items in (('shell', d.get('shells') or []), ('agent', d.get('agents') or [])):
+            for x in items:
+                if x.get('state') != 'running':
+                    continue
+                raw_desc = str(x.get('desc') or x.get('tool') or x.get('type') or '后台任务').strip()
+                desc = raw_desc.splitlines()[0].strip()[:50] if raw_desc else '后台任务'
+                out.append(dict(kind=x.get('kind') or kind, tool=x.get('tool') or kind, desc=desc, start=x.get('start')))
+        return out
     if not cam['claude_sid']:
-        return 0
+        return []
     try:
         p = CLAUDE_PROJECTS / re.sub(r'[^A-Za-z0-9]', '-', str(camera_cwd(conn, cam))) / f'{cam["claude_sid"]}.jsonl'
         st = p.stat()
     except (OSError, RuntimeError):
-        return 0
+        return []
     key = (st.st_size, st.st_mtime)
     hit = _BG_CACHE.get(p)
     if hit and hit[0] == key:
-        return hit[1]
+        return list(hit[1])
     with p.open('rb') as fh:
         if st.st_size > tail:
             fh.seek(st.st_size - tail)
@@ -4852,9 +4940,15 @@ def bg_tasks_of(conn, cam, tail=1_000_000):
             entries.append(json.loads(line))
         except ValueError:
             continue
-    n = bg_pending(entries) if time.time() - st.st_mtime < 6 * 3600 else 0     # 半天没动静的不算
-    _BG_CACHE[p] = (key, n)
-    return n
+    items = bg_pending_list(entries) if time.time() - st.st_mtime < 6 * 3600 else []     # 半天没动静的不算
+    _BG_CACHE[p] = (key, items)
+    return list(items)
+
+
+def bg_tasks_of(conn, cam, tail=1_000_000, detail=False):
+    """会话 transcript 末尾里还没结束的后台任务；默认返回数量（兼容旧接口），detail=True 返回列表。"""
+    items = bg_task_list(conn, cam, tail=tail)
+    return items if detail else len(items)
 
 
 def _iso_ts(v):
@@ -7727,22 +7821,26 @@ def cam_view(c, alive):
     return dict(id=c['id'], name=c['name'], role=c['role'], crew_role=c['crew_role'], state=c['state'], alive=live,
                 busy=live and c['last_active'] > c['last_stop'], ended_reason=c['ended_reason'], pane=c['pane'],
                 context_pct=c['context_pct'], effort=c['effort'], tokens=(c['tokens_in'] or 0) + (c['tokens_out'] or 0) + (c['cache_read'] or 0) +
-                (c['cache_write'] or 0), cost=c['cost'], model=c['model'], started_at=c['started_at'], wrap=bool(c['wrap_reason']),
-                health=c['health'] if live else None, health_note=c['health_note'] if live else None)
+                (c['cache_write'] or 0), cost=c['cost'], model=c['model'], started_at=c['started_at'],
+                last_active=c['last_active'], last_stop=c['last_stop'], updated=c['updated'], wrap=bool(c['wrap_reason']),
+                health=c['health'] if live else None, health_note=c['health_note'] if live else None,
+                health_at=c['health_at'] if live else None)
 
 
 def cam_view_bg(conn, c, alive):
-    """cam_view 加上空闲时还在跑的后台任务数（bg）。"""
+    """cam_view 加上空闲时还在跑的后台任务数（bg）及任务列表（bg_tasks）。"""
     v = cam_view(c, alive)
     if v:
         v['provider'] = cam_provider(conn, c)
     if v and v['alive'] and not v['busy']:
-        v['bg'] = bg_tasks_of(conn, c)
+        tasks = bg_task_list(conn, c)
+        v['bg'] = len(tasks)
+        v['bg_tasks'] = tasks
     return v
 
 
-def seq_status(crew, reports_open, data, executive_open, archived=False):
-    """(状态键, 直白说明)。会话状态：空闲 / 执行中 / 阻塞 / 待回复 / 待审批 / 等待后台任务 / 已完成 / 已归档。"""
+def seq_status(crew, reports_open, data, executive_open, archived=False, waits=None):
+    """(状态键, 直白说明)。会话状态：空闲 / 执行中 / 阻塞 / 待回复 / 待审批 / 等待后台任务 / 等会话回复 / 已完成 / 已归档。"""
     if executive_open:
         return 'sign', '等用户审批'
     if reports_open:
@@ -7756,6 +7854,8 @@ def seq_status(crew, reports_open, data, executive_open, archived=False):
             return 'shooting', '运行中'
         if crew['alive'] and crew.get('bg'):
             return 'waiting', '等待后台任务'
+        if crew['alive'] and waits:
+            return 'peer', '等会话回复'
     if archived:
         return 'archived', '已归档'
     if data and data.get('blocker'):
@@ -7765,6 +7865,234 @@ def seq_status(crew, reports_open, data, executive_open, archived=False):
     if crew and crew['alive']:
         return 'idle', '空闲'
     return 'stopped', '未开始'
+
+
+_ENDED_CN = {
+    'exited': '会话退出', 'cut': '手动停止', 'retake': '换人重启',
+    'linger': '空闲自动收工', 'done': '已收工', 'finished': '已收工',
+    'handoff': '交接换会话', 'new-session': '新开会话', 'offduty': '休息',
+}
+_RESTART_RE = re.compile(r'重启(?:网页)?服务')
+
+
+def _short_text(text, limit=24):
+    s = re.sub(r'\s+', ' ', str(text or '')).strip()
+    if not s:
+        return ''
+    return s if len(s) <= limit else s[:limit - 1] + '…'
+
+
+def _first_reply_line(text, limit=26):
+    for raw in str(text or '').splitlines():
+        line = raw.strip()
+        if not line or line.startswith('```') or re.match(r'^[-=*_]{3,}$', line):
+            continue
+        line = re.sub(r'^#{1,6}\s+', '', line)
+        line = re.sub(r'^[-*•>]\s+', '', line)
+        line = line.replace('**', '').replace('`', '').strip()
+        if line:
+            return _short_text(line, limit)
+    return ''
+
+
+def _ended_reason_cn(reason):
+    r = str(reason or '').strip()
+    if not r:
+        return ''
+    return _ENDED_CN.get(r, _short_text(r, 28))
+
+
+def _report_detail(items, for_executive=True):
+    if not items:
+        return '', None
+    ordered = sorted(items, key=lambda r: (0 if (for_executive and (r.get('gate') or r.get('kind') == 'confirm')) else 1, r['id']))
+    r = ordered[0]
+    since = r.get('holder_since') or r.get('created_at')
+    extra = f' 等 {len(items)} 件' if len(items) > 1 else ''
+    sm = _short_text(r.get('summary') or '', 20)
+    if for_executive:
+        if r.get('gate') == 'kickoff':
+            return f'等用户批准开工 #{r["id"]}{extra}', since
+        if r.get('gate'):
+            label = sm or GATES.get(r['gate'], r['gate'])
+            return f'等用户审批 #{r["id"]}：{label}{extra}', since
+        if r.get('kind') == 'confirm':
+            return f'等用户确认 #{r["id"]}：{sm or "进入下一阶段"}{extra}', since
+        if '截图' in sm or '确认' in sm:
+            return f'等用户确认 #{r["id"]}：{sm}{extra}', since
+        return (f'等用户回复 #{r["id"]}：{sm}{extra}' if sm else f'等用户回复 #{r["id"]}{extra}'), since
+    who = LEVEL_LABEL.get(r.get('holder'), r.get('holder') or '上级')
+    return (f'等{who}回复 #{r["id"]}：{sm}{extra}' if sm else f'等{who}回复 #{r["id"]}{extra}'), since
+
+
+def _bg_detail(bg_list, bg_count, fallback_since=None):
+    if bg_list:
+        first = _short_text(bg_list[0].get('desc') or bg_list[0].get('tool') or '后台任务', 26)
+        txt = f'后台：{first} 等 {len(bg_list)} 个' if len(bg_list) > 1 else f'后台：{first}'
+        starts = [x['start'] for x in bg_list if x.get('start')]
+        return txt, (min(starts) if starts else fallback_since)
+    return f'后台：等待 {bg_count} 个任务', fallback_since
+
+
+def _peer_wait_detail(waits):
+    w = waits[0]
+    to_lbl = f'#{w["num"]}' if w.get('num') is not None else w['to']
+    if w.get('timed_out'):
+        return f'等 {to_lbl} 回复已超时', None
+    txt = f'等 {to_lbl} 等 {len(waits)} 个会话回复' if len(waits) > 1 else f'等 {to_lbl} 回复'
+    return txt, w.get('since')
+
+
+def _live_detail_text(live_entry):
+    if not live_entry:
+        return ''
+    if live_entry.get('waiting'):
+        return '等待接收'
+    if live_entry.get('tool'):
+        tool = str(live_entry['tool']).split('__')[-1]
+        return f'正在用 {_short_text(tool, 28)}'
+    if live_entry.get('text'):
+        return '正在写回复'
+    if live_entry.get('tools_total'):
+        return f'思考中 · 已执行 {live_entry["tools_total"]} 步'
+    return '思考中'
+
+
+def _append_peer_suffixes(detail, status_key, waits, waited_by):
+    parts = [detail] if detail else []
+    if status_key != 'peer' and waits:
+        active_w = [w for w in waits if not w.get('timed_out')]
+        if active_w:
+            lbls = '、'.join(dict.fromkeys(f'#{w["num"]}' if w.get('num') is not None else w['to'] for w in active_w))
+            parts.append(f'在等 {lbls}')
+        else:
+            lbls = '、'.join(dict.fromkeys(f'#{w["num"]}' if w.get('num') is not None else w['to'] for w in waits))
+            parts.append(f'等 {lbls} 已超时')
+    if waited_by:
+        active_by = [w for w in waited_by if not w.get('timed_out')]
+        if active_by:
+            lbls = '、'.join(dict.fromkeys(w['from'] for w in active_by))
+            parts.append(f'{lbls} 在等它回复')
+    return ' · '.join(parts)
+
+
+def seq_detail(status_key, status_label, crew, last, ro, exec_ro, data, waits=None, waited_by=None,
+               qreason='', live_entry=None, last_reply=''):
+    """返回 (detail, detail_since)：detail 不含动态分钟数，由前端 / mashu status 按 detail_since 计算。"""
+    waits, waited_by = waits or [], waited_by or []
+    detail, since = '', None
+    if status_key == 'sign':
+        detail, since = _report_detail(exec_ro, for_executive=True)
+    elif status_key == 'asking':
+        detail, since = _report_detail(ro, for_executive=False)
+    elif status_key == 'queued':
+        detail = f'排队：{_short_text(qreason, 36)}' if qreason else '排队等空位'
+        since = (crew or {}).get('updated') or (crew or {}).get('started_at') or None
+    elif status_key in ('stuck', 'apierr'):
+        detail = (crew or {}).get('health_note') or ('可能卡住' if status_key == 'stuck' else 'API 报错')
+        since = (crew or {}).get('health_at') or (crew or {}).get('last_active') or None
+    elif status_key == 'shooting':
+        detail = _live_detail_text(live_entry) or '运行中'
+        since = (crew or {}).get('last_active') or (crew or {}).get('started_at') or None
+    elif status_key == 'waiting':
+        detail, since = _bg_detail((crew or {}).get('bg_tasks') or [], (crew or {}).get('bg') or 0,
+                                   fallback_since=(crew or {}).get('last_stop') or None)
+    elif status_key == 'peer':
+        detail, since = _peer_wait_detail(waits)
+    elif status_key == 'archived':
+        detail = '已归档'
+    elif status_key == 'blocked':
+        detail = f'阻塞：{_short_text((data or {}).get("blocker") or "", 40)}'
+    elif status_key in ('done', 'closed'):
+        ho = (data or {}).get('handoff') or {}
+        nxt = str(ho.get('next') or '').strip()
+        confirm = str(ho.get('confirm') or '').strip()
+        if _RESTART_RE.search(nxt) or _RESTART_RE.search(confirm):
+            detail = f'{status_label} · 待重启服务'
+        elif nxt and nxt.lower() not in ('无', '无。', '-', 'none', 'n/a'):
+            detail = f'{status_label} · {_first_reply_line(nxt, 28)}'
+        else:
+            detail = status_label
+    elif status_key == 'idle':
+        rep = _first_reply_line(last_reply, 26)
+        detail = f'空闲 · 上次：{rep}' if rep else '空闲'
+        since = (crew or {}).get('last_stop') or (crew or {}).get('started_at') or None
+    else:
+        reason = _ended_reason_cn((last or {}).get('ended_reason'))
+        detail = f'已停：{reason}' if reason else '未开始'
+    return _append_peer_suffixes(detail, status_key, waits, waited_by), since
+
+
+def brain_detail(role, cam, ro_exec_own, ro_exec_all, ro_self, waits=None, qreason='', live_entry=None, last_reply=''):
+    """子脑 / 主脑的状态详情 (detail, detail_since)。"""
+    waits = waits or []
+    detail, since, st_key = '', None, ''
+    if ro_exec_own:
+        detail, since = _report_detail(ro_exec_own, for_executive=True)
+        st_key = 'sign'
+    elif ro_self:
+        r0 = ro_self[0]
+        since = r0.get('holder_since') or r0.get('created_at')
+        if len(ro_self) == 1:
+            sm = _short_text(r0.get('summary') or '', 18)
+            detail = f'待处理上报 #{r0["id"]}：{sm}' if sm else f'待处理上报 #{r0["id"]}'
+        else:
+            detail = f'待处理上报 {len(ro_self)} 件'
+        st_key = 'asking'
+    elif ro_exec_all:
+        r0 = ro_exec_all[0]
+        since = r0.get('holder_since') or r0.get('created_at')
+        detail = f'待用户处理 {len(ro_exec_all)} 件（#{r0["id"]}）' if len(ro_exec_all) > 1 else _report_detail(ro_exec_all, for_executive=True)[0]
+        st_key = 'sign'
+    elif cam and cam['state'] == 'queued':
+        detail = f'排队：{_short_text(qreason, 36)}' if qreason else '排队等名额'
+        since = cam.get('updated') or cam.get('started_at') or None
+        st_key = 'queued'
+    elif cam and cam['alive'] and cam.get('health') in ('stuck', 'apierr'):
+        detail = cam.get('health_note') or ('可能卡住' if cam['health'] == 'stuck' else 'API 报错')
+        since = cam.get('health_at') or cam.get('last_active') or None
+        st_key = cam['health']
+    elif cam and cam['alive'] and cam['busy']:
+        detail = _live_detail_text(live_entry) or '运行中'
+        since = cam.get('last_active') or cam.get('started_at') or None
+        st_key = 'shooting'
+    elif cam and cam['alive'] and cam.get('bg'):
+        detail, since = _bg_detail(cam.get('bg_tasks') or [], cam.get('bg') or 0, fallback_since=cam.get('last_stop') or None)
+        st_key = 'waiting'
+    elif cam and cam['alive'] and waits:
+        detail, since = _peer_wait_detail(waits)
+        st_key = 'peer'
+    elif cam and cam['alive']:
+        rep = _first_reply_line(last_reply, 26)
+        detail = f'空闲 · 上次：{rep}' if rep else '空闲'
+        since = cam.get('last_stop') or cam.get('started_at') or None
+        st_key = 'idle'
+    else:
+        detail = '未启动' if role == 'assistant' else '休息中'
+        st_key = 'stopped'
+    return _append_peer_suffixes(detail, st_key, waits, []), since
+
+
+def format_detail_with_age(detail, since, status_key='', now=None):
+    """给 CLI（mashu status）拼上动态分钟数；detail 已含分钟或已超时时不重复拼。"""
+    if not detail:
+        return ''
+    if not since:
+        return detail
+    mins = max(0, int(((now or time.time()) - since) // 60))
+    if mins < 1 or '分钟' in detail or '已超时' in detail:
+        return detail
+    if status_key == 'idle' and detail.startswith('空闲'):
+        return detail.replace('空闲', f'空闲 {mins} 分钟', 1)
+    is_wait_det = detail.startswith(('等', '待处理', '待用户', '排队', '后台'))
+    dur = f'已跑 {mins} 分钟' if (status_key == 'shooting' and not is_wait_det) else f'{mins} 分钟'
+    for marker in (' · 在等 ', ' · 等 ', ' 在等它回复'):
+        idx = detail.find(marker)
+        if idx > 0:
+            cut = detail.rfind(' · ', 0, idx + 1) if marker == ' 在等它回复' else idx
+            if cut > 0:
+                return f'{detail[:cut]} · {dur}{detail[cut:]}'
+    return f'{detail} · {dur}'
 
 
 def done_stamp(data):
@@ -7805,19 +8133,48 @@ def status_data(conn):
     alive = alive_panes()
     out_films = []
     day = today()
+    live_map = live_replies(conn)
+    qreasons = {r['k'][8:]: r['v'] for r in rows(conn, 'SELECT k, v FROM meta WHERE k LIKE "qreason:%"')}
+    last_replies = {
+        r['channel']: r['text']
+        for r in rows(conn, 'SELECT channel, text FROM messages WHERE id IN '
+                            '(SELECT MAX(id) FROM messages WHERE kind="reply" GROUP BY channel)')
+    }
+    all_open_reports = rows(conn, 'SELECT id, film_id, seq_key, holder, kind, gate, confirm_stage, summary, holder_since, created_at '
+                                  'FROM reports WHERE status="open" AND holder!="digest" ORDER BY id')
+    all_waits = active_peer_waits(conn)
+    waits_by_cam = {}
+    waited_by_seq = {}
+    for w in all_waits:
+        w_item = dict(to=w['to_seq'], num=w['to_num'], since=w['since'], why=w.get('why') or '', timed_out=bool(w['timed_out']))
+        waits_by_cam.setdefault(w['from_camera'], []).append(w_item)
+        wb_item = dict(from_=w['from_label'], from_seq=w.get('from_seq') or '', since=w['since'],
+                       why=w.get('why') or '', timed_out=bool(w['timed_out']))
+        wb_item['from'] = wb_item.pop('from_')
+        waited_by_seq.setdefault((w['film_id'], w['to_seq']), []).append(wb_item)
     spend = {r['film_id']: r for r in rows(conn, 'SELECT film_id, SUM(tokens_in+tokens_out+cache_read+cache_write) tokens, '
                                                  'SUM(cost) cost FROM usage WHERE day=? GROUP BY film_id', day)}
     for f in films(conn):
         seqs = []
         acc = film_accounts(f)
+        film_reports = [r for r in all_open_reports if r['film_id'] == f['id']]
         for s in sequences(conn, f):
             data = seq_state(f, s['key'])
             crew = cam_view_bg(conn, active_crew(conn, f['id'], s['key']), alive)
             last = cam_view(last_camera(conn, 'crew', f['id'], s['key']), alive)
-            ro = rows(conn, 'SELECT id, holder, kind, summary FROM reports WHERE status="open" AND holder!="digest" '
-                            'AND film_id=? AND seq_key=?', f['id'], s['key'])     # 进简报的例行通报不算“上报中”
-            st = seq_status(crew, ro, data, [r for r in ro if r['holder'] == 'executive'],
-                            archived=seq_flag(conn, f, s['key'], 'archive', data))
+            ro = [r for r in film_reports if r['seq_key'] == s['key']]
+            exec_ro = [r for r in ro if r['holder'] == 'executive']
+            s_waits = waits_by_cam.get(crew['id'], []) if crew else []
+            s_waited_by = waited_by_seq.get((f['id'], s['key']), [])
+            st = seq_status(crew, ro, data, exec_ro, archived=seq_flag(conn, f, s['key'], 'archive', data), waits=s_waits)
+            ch = f'{f["id"]}/{s["key"]}'
+            det, det_since = seq_detail(
+                st[0], st[1], crew, last, ro, exec_ro, data,
+                waits=s_waits, waited_by=s_waited_by,
+                qreason=qreasons.get(str(crew['id']), '') if crew else '',
+                live_entry=live_map.get(ch),
+                last_reply=last_replies.get(ch, ''),
+            )
             cur = current_stage(data)
             seqs.append(dict(
                 key=s['key'], num=s.get('num'), title=(data or {}).get('title') or s.get('title') or s['key'],
@@ -7827,7 +8184,9 @@ def status_data(conn):
                            status=cur['status']) if cur else None,
                 stage_defs=[dict(name=d['name'], plain=d['plain'], role=d['role'], entry=d.get('entry')) for d in stage_defs(data)],
                 playbook=(data or {}).get('playbook') or {},
-                status=st[0], status_label=st[1], crew=crew, last=last, reports=ro, priority=s.get('priority') or 0,
+                status=st[0], status_label=st[1], detail=det, detail_since=det_since,
+                waits=s_waits, waited_by=s_waited_by,
+                crew=crew, last=last, reports=ro, priority=s.get('priority') or 0,
                 blocker=(data or {}).get('blocker', ''), handoff=(data or {}).get('handoff') or {},
                 branch=s.get('branch') or '', set_dir=str(set_dir(f, s['key'])), summary=(data or {}).get('summary', ''),
                 done=seq_done(data), updated=(data or {}).get('updated_at', ''),
@@ -7839,24 +8198,52 @@ def status_data(conn):
                 commits=[x[:8] for x in all_feature_commits(f, s['key'])[:12]],
                 checks=[dict(stage=x['id'], **x['check_result']) for x in (data or {}).get('stages', []) if isinstance(x.get('check_result'), dict)]))
         prod = cam_view_bg(conn, active_producer(conn, f['id']), alive)
+        p_waits = waits_by_cam.get(prod['id'], []) if prod else []
+        p_det, p_det_since = brain_detail(
+            'producer', prod,
+            [r for r in film_reports if r['holder'] == 'executive' and not r['seq_key']],
+            [r for r in film_reports if r['holder'] == 'executive'],
+            [r for r in film_reports if r['holder'] == 'producer'],
+            waits=p_waits,
+            qreason=qreasons.get(str(prod['id']), '') if prod else '',
+            live_entry=live_map.get(f['id']),
+            last_reply=last_replies.get(f['id'], ''),
+        )
+        if prod:
+            prod['detail'] = p_det
+            prod['detail_since'] = p_det_since
+            prod['waits'] = p_waits
         sp = spend.get(f['id']) or {}
         fpb = film_playbook(f)
         out_films.append(dict(id=f['id'], title=f['title'], type=f['type'], path=f['path'], producer_name=f['producer_name'],
                               docs=str(film_docs(f)),
                               playbook=dict(name=fpb.get('name'), version=fpb.get('version'), based_on=fpb.get('based_on'),
                                             stages=[x['name'] for x in fpb.get('stages', [])]),
-                              producer=prod, sequences=seqs, board=board_page(f)[0], max_stages=f.get('max_stages'),
+                              producer=prod, detail=p_det, detail_since=p_det_since, waits=p_waits,
+                              sequences=seqs, board=board_page(f)[0], max_stages=f.get('max_stages'),
                               accounts=acc and dict(accounts=[{k: a[k] for k in ('id', 'name', 'account', 'order')} for a in acc['accounts']],
                                                     workflows=acc['workflows'], default=acc['default']),
                               budget=dict(today_tokens=sp.get('tokens') or 0, today_cost=sp.get('cost'),
                                           daily_limit=(f.get('budget') or {}).get('daily_limit')),
-                              reports=len([r for r in open_reports(conn, film_id=f['id']) if r['holder'] != 'digest']),
+                              reports=len(film_reports),
                               trust=rows(conn, 'SELECT category, streak, total, delegated FROM trust WHERE film_id=?', f['id']),
                               check_configured='MASHU_CHECK_UNCONFIGURED' not in ((film_docs(f) / 'check.sh').read_text()
                                                                                   if (film_docs(f) / 'check.sh').exists() else 'MASHU_CHECK_UNCONFIGURED')))
     cams = [cam_view(c, alive) | dict(title=camera_title(conn, c), film_id=c['film_id'], seq_key=c['seq_key'], provider=cam_provider(conn, c),
                                      account=meta_get(conn, f'camacct:{c["id"]}') or '')
             for c in rows(conn, 'SELECT * FROM cameras WHERE state IN ("queued","running","idle") ORDER BY role="crew", role="producer", id')]
+    asst = cam_view_bg(conn, active_assistant(conn), alive)
+    a_exec_own = [r for r in all_open_reports if r['holder'] == 'executive' and not r['film_id']]
+    a_self = [r for r in all_open_reports if r['holder'] == 'assistant']
+    a_det, a_det_since = brain_detail(
+        'assistant', asst, a_exec_own, a_exec_own, a_self,
+        qreason=qreasons.get(str(asst['id']), '') if asst else '',
+        live_entry=live_map.get('assistant'),
+        last_reply=last_replies.get('assistant', ''),
+    )
+    if asst:
+        asst['detail'] = a_det
+        asst['detail_since'] = a_det_since
     ps, rp = presets_state()
     role_defs = {r: role_default_exec(r) for r in ROLES}
     pref_defaults = dict(
@@ -7869,7 +8256,7 @@ def status_data(conn):
         codes={r: 'on' for r in ROLES if role_defs[r]['cli'] == 'claude' and role_defs[r]['code']},
     )
     return dict(
-        assistant=cam_view_bg(conn, active_assistant(conn), alive), films=out_films, cameras=cams,
+        assistant=asst, assistant_detail=a_det, assistant_detail_since=a_det_since, films=out_films, cameras=cams,
         stages=dict(used=crew_slots(conn)[0], max=cfg('stages'),
                     by_account=[dict(key=k, label=account_key_label(k), used=n) for k, n in sorted(crew_by_account(conn).items())]),
         reads=dict(used=crew_slots(conn)[1], max=cfg('read_slots')),
@@ -7878,7 +8265,7 @@ def status_data(conn):
         decisions_pending=one(conn, 'SELECT COUNT(*) n FROM decisions WHERE status="待追认"')['n'],
         self_iterate_pending=selfiter_call('pending_count', conn, default=0),
         tmux=session_name(), stage_names=STAGES, approval_ttl_hours=cfg('approval_ttl_hours'),
-        live=live_replies(conn), limits=read_limits(), cli_accounts=cli_accounts(), vendors=vendor_info(),
+        live=live_map, limits=read_limits(), cli_accounts=cli_accounts(), vendors=vendor_info(),
         prefs={r['k'][5:]: json.loads(r['v'] or '{}') for r in rows(conn, 'SELECT k, v FROM meta WHERE k LIKE "pref:%"')},
         pref_defaults=pref_defaults,
         presets=ps, role_presets=rp, preset_fallback_pct=cfg('preset_fallback_pct'),
@@ -8043,17 +8430,23 @@ def cmd_callsheet(args):
         p = f['producer']
         pb = film_playbook(f)
         print(f'\n{f["title"]}[{f["id"]}] {f["path"]}  工作流「{pb.get("name")}」v{pb.get("version")}  资料库 {film_docs(f)}')
+        p_det = format_detail_with_age(f.get('detail') or '', f.get('detail_since'),
+                                       'shooting' if (p and p['alive'] and p['busy']) else ('idle' if (p and p['alive']) else ''))
         print(f'  子脑：' + ('运行中' if p and p['alive'] else ('排队' if p else '停止')) +
+              (f'（{p_det}）' if p_det and p_det not in ('运行中', '休息中', '空闲') else '') +
               f'；今日 token {f["budget"]["today_tokens"]:,}')
         names = {a['id']: a['name'] for a in (f.get('accounts') or {}).get('accounts') or []}
         for s in f['sequences']:
             st = s['stage']
             crew = s['crew']
             who = f'{crew["crew_role"]}「{crew["name"]}」' if crew else '无执行者'
+            det = format_detail_with_age(s.get('detail') or '', s.get('detail_since'), s.get('status') or '')
+            show_det = det and det != s['status_label']
             print(f'  - #{s["num"]} {s["key"]}：{s["title"]}｜' + (f'{names.get(s["account"], s["account"])}｜' if names and s['account'] else '') +
                   (f'阶段 {st["id"]} {st["name"]}·{st["status"]}｜' if st and s['status'] != 'archived' else '') + f'{s["status_label"]}｜{who}' +
-                  (f'｜阻塞：{s["blocker"]}' if s['blocker'] else '') +
-                  (f'｜下一镜：{s["handoff"].get("next")}' if s['handoff'].get('next') else ''))
+                  (f'｜{det}' if show_det else '') +
+                  (f'｜阻塞：{s["blocker"]}' if s['blocker'] and not (show_det and det.startswith('阻塞：')) else '') +
+                  (f'｜下一镜：{s["handoff"].get("next")}' if s['handoff'].get('next') and not (show_det and s['status'] in ('done', 'closed')) else ''))
         if not f['sequences']:
             print('  （还没有功能）')
     rs = open_reports(conn)
@@ -8496,16 +8889,33 @@ def cmd_collaboration(args):
         seq = find_seq(conn, f, args.ref.lstrip('#'))
         if seq['key'] == cam['seq_key'] or not args.text.strip():
             raise ValueError('请指定另一功能并填写消息')
+        fyi = bool(getattr(args, 'fyi', False))
         with conn:
             conn.execute('BEGIN IMMEDIATE')
             peer = active_crew(conn, f['id'], seq['key'])
             if not peer or peer['state'] not in LIVE:
                 print('对方不在线，未发送')
                 return
+            now = time.time()
             text = f'[点对点 {author} → #{seq["num"]}] {args.text.strip()[:800]}'
             conn.execute('INSERT INTO peer_inbox(camera_id,text) VALUES(?,?)', (peer['id'], text))
             post(conn, 'system', f['id'], 'notice', text, target=f'producer:{f["id"]}', camera=cam)
-        print('已送入对方下一轮上下文，并抄送子脑')
+            if cam['seq_key']:
+                conn.execute(
+                    'UPDATE peer_waits SET cleared_at=? WHERE film_id=? AND to_seq=? AND cleared_at IS NULL '
+                    'AND from_camera IN (SELECT id FROM cameras WHERE film_id=? AND seq_key=?)',
+                    (now, f['id'], cam['seq_key'], f['id'], seq['key']),
+                )
+            if not fyi:
+                conn.execute(
+                    'UPDATE peer_waits SET cleared_at=? WHERE film_id=? AND from_camera=? AND to_seq=? AND cleared_at IS NULL',
+                    (now, f['id'], cam['id'], seq['key']),
+                )
+                conn.execute(
+                    'INSERT INTO peer_waits(film_id, from_camera, to_seq, since, why) VALUES(?,?,?,?,?)',
+                    (f['id'], cam['id'], seq['key'], now, args.text.strip()[:120]),
+                )
+        print('已送入对方下一轮上下文，并抄送子脑' + ('' if fyi else '（已记为等待对方回复）'))
 
 
 def cmd_claim(args):
@@ -8962,7 +9372,7 @@ def main(argv=None):
     s.add_argument('--apply', action='store_true')
     s.add_argument('--managed-only', action='store_true', help='跳过用户级目录')
     s.add_argument('--project', help='只同步指定工程的副本')
-    s = sub.add_parser('peer', help='联系同项目执行者'); s.add_argument('ref'); s.add_argument('text')
+    s = sub.add_parser('peer', help='联系同项目执行者'); s.add_argument('ref'); s.add_argument('text'); s.add_argument('--fyi', action='store_true', help='只通知，不等对方回复')
     s = sub.add_parser('codex', help='查看工程法典或追加子脑约定'); s.add_argument('action', choices=['note'], nargs='?'); s.add_argument('text', nargs='?')
     s.add_argument('--ref')
     s = sub.add_parser('waive', help='豁免一次自动检查'); s.add_argument('ref'); s.add_argument('--reason', required=True)

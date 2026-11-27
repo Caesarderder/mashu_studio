@@ -362,21 +362,21 @@ function moveTabInd() {
 // 统一的执行状态（侧栏只用直白说法，一眼能看懂）
 // 会话状态：空闲 / 执行中 / 阻塞 / 待回复 / 待审批 / 等待后台任务 / 已完成（待查看带小点）/ 已归档（手点归档）
 const ST = {
-  approve: '待审批', answer: '待回复', relay: '待回复', busy: '执行中', queued: '执行中', waiting: '等待后台任务',
+  approve: '待审批', answer: '待回复', relay: '待回复', busy: '执行中', queued: '执行中', waiting: '等待后台任务', peer: '等会话回复',
   idle: '空闲', blocked: '阻塞', done: '已完成', archived: '已归档', off: '空闲', rest: '空闲',
   stuck: '可能卡住', apierr: 'API 报错',
 };
-const ST_TIP = { relay: '在等子脑回复', queued: '排队等空位', off: '还没启动', rest: '会话在休息，有事会自动叫醒',
+const ST_TIP = { relay: '在等子脑回复', queued: '排队等空位', peer: '发了点对点消息，在等对方会话回复', off: '还没启动', rest: '会话在休息，有事会自动叫醒',
   stuck: '忙碌中但很久没有任何进展，可能卡住了', apierr: '调用接口报错，麻薯会自动让它继续' };
-const SEQ_ST = { stuck: 'stuck', apierr: 'apierr', sign: 'answer', asking: 'relay', queued: 'queued', shooting: 'busy', waiting: 'waiting', idle: 'idle', blocked: 'blocked',
+const SEQ_ST = { stuck: 'stuck', apierr: 'apierr', sign: 'answer', asking: 'relay', queued: 'queued', shooting: 'busy', waiting: 'waiting', peer: 'peer', idle: 'idle', blocked: 'blocked',
   done: 'done', closed: 'done', archived: 'archived', stopped: 'off' };
 // 左侧筛选胶囊：每类对应哪些状态（已归档只在「全部」底下的折叠组里）
-const FILTERS = [['all', '全部', null], ['need', '需要我', ['approve', 'answer', 'blocked']], ['busy', '执行中', ['busy', 'relay', 'queued', 'waiting']],
+const FILTERS = [['all', '全部', null], ['need', '需要我', ['approve', 'answer', 'blocked']], ['busy', '执行中', ['busy', 'relay', 'queued', 'waiting', 'peer']],
   ['idle', '空闲', ['idle', 'off', 'rest']], ['done', '已完成', ['done']]];
 let sideFilter = null;   // 只看某类
 function inFilter(k, f = sideFilter) { const x = FILTERS.find((y) => y[0] === f); return !x || !x[2] || x[2].includes(k); }
-// 侧栏功能排序：需要我 → 执行中 → 等后台 → 已完成 → 空闲（已归档另收进折叠组）
-const ST_RANK = { approve: 0, answer: 0, blocked: 1, relay: 2, busy: 2, queued: 3, waiting: 3, done: 4, idle: 5, off: 6, rest: 6, archived: 7 };
+// 侧栏功能排序：需要我 → 执行中 → 等后台 / 等会话回复 → 已完成 → 空闲（已归档另收进折叠组）
+const ST_RANK = { approve: 0, answer: 0, blocked: 1, relay: 2, busy: 2, queued: 3, waiting: 3, peer: 3, done: 4, idle: 5, off: 6, rest: 6, archived: 7 };
 const unseenDone = (s) => s.seen === false && SEQ_ST[s.status] === 'done';   // 老服务没有 seen 字段时不显示小点
 function needOf(list) {
   if (!list.length) return null;
@@ -392,7 +392,14 @@ function camState(c, offKey = 'rest') {
 function inboxOf(fid, key) {
   return (state.inbox || []).filter((r) => (fid === null ? !r.film_id : r.film_id === fid) && (key === undefined || r.seq_key === key));
 }
-function brainState(f) { return needOf(inboxOf(f.id)) || (f.reports ? 'relay' : camState(f.producer)); }
+function brainState(f) {
+  const need = needOf(inboxOf(f.id));
+  if (need) return need;
+  if (f.reports) return 'relay';
+  const cs = camState(f.producer);
+  if (cs === 'idle' && f.waits && f.waits.length) return 'peer';
+  return cs;
+}
 function seqStateKey(f, s) { return needOf(inboxOf(f.id, s.key)) || SEQ_ST[s.status] || 'off'; }
 function pill(k) { return `<span class="pill st-${k}"${ST_TIP[k] ? ` title="${ST_TIP[k]}"` : ''}>${ST[k]}</span>`; }
 function sdot(k) { return `<span class="sdot st-${k}"></span>`; }
@@ -417,6 +424,64 @@ function liveText(ch) {
 const STALL_HINT_MIN = 3;       // 屏幕和记录这么多分钟没变化就在状态里提示（15 分钟才算「可能卡住」并提醒）
 function liveKey(ch) { const l = live[ch]; return l && l.health ? l.health : 'busy'; }
 function liveBusy(ch) { const l = live[ch]; return !!(l && !l.waiting); }
+function ageMinutes(since) { return since ? Math.max(0, Math.floor((Date.now() / 1000 - since) / 60)) : 0; }
+function insertDetailDur(detail, dur) {
+  if (!detail || !dur || detail.includes('分钟') || detail.includes('已超时')) return detail;
+  for (const mk of [' · 在等 ', ' · 等 ', ' 在等它回复']) {
+    const idx = detail.indexOf(mk);
+    if (idx > 0) {
+      const cut = mk === ' 在等它回复' ? detail.lastIndexOf(' · ', idx) : idx;
+      if (cut > 0) return `${detail.slice(0, cut)} · ${dur}${detail.slice(cut)}`;
+    }
+  }
+  return `${detail} · ${dur}`;
+}
+function waitSuffixes(waits, waitedBy, k) {
+  const parts = [];
+  if (k !== 'peer' && waits && waits.length) {
+    const liveW = waits.filter((w) => !w.timed_out);
+    const src = liveW.length ? liveW : waits;
+    const lbls = [...new Set(src.map((w) => (w.num != null ? `#${w.num}` : w.to)))].join('、');
+    parts.push(liveW.length ? `在等 ${lbls}` : `等 ${lbls} 已超时`);
+  }
+  if (waitedBy && waitedBy.length) {
+    const activeB = waitedBy.filter((w) => !w.timed_out);
+    if (activeB.length) {
+      const lbls = [...new Set(activeB.map((w) => w.from))].join('、');
+      parts.push(`${lbls} 在等它回复`);
+    }
+  }
+  return parts.join(' · ');
+}
+function formatStatusDetail(rawDetail, since, k, ch, waits, waitedBy) {
+  const mins = ageMinutes(since);
+  if (ch && liveBusy(ch) && !['approve', 'answer'].includes(k)) {
+    const lt = liveText(ch);
+    let out = mins >= 1 && !lt.includes('分钟') ? `${lt} · 已跑 ${mins} 分钟` : lt;
+    const suf = waitSuffixes(waits, waitedBy, 'busy');
+    if (suf) out = `${out} · ${suf}`;
+    return out;
+  }
+  let det = rawDetail || '';
+  if (!det) return ST[k] || '';
+  if (mins >= 1 && !det.includes('分钟') && !det.includes('已超时')) {
+    if (k === 'idle' && det.startsWith('空闲')) det = det.replace(/^空闲/, `空闲 ${mins} 分钟`);
+    else if (k === 'busy') det = insertDetailDur(det, `已跑 ${mins} 分钟`);
+    else if (['peer', 'waiting', 'queued', 'stuck', 'apierr', 'approve', 'answer', 'relay'].includes(k)) {
+      det = insertDetailDur(det, `${mins} 分钟`);
+    }
+  }
+  return det;
+}
+function detailTone(k, isLive) {
+  if (isLive || k === 'busy') return 'live';
+  if (k === 'approve' || k === 'answer' || k === 'queued') return 'warn';
+  if (k === 'blocked' || k === 'stuck' || k === 'apierr') return 'bad';
+  if (k === 'peer') return 'peer';
+  if (k === 'waiting') return 'wait';
+  if (k === 'relay') return 'relay';
+  return '';
+}
 function workingLine() { return `<div class="working">工作中 <span class="dots"><i></i><i></i><i></i></span></div>`; }
 // 分段进度条：只有分阶段的工作流功能才有，直接做的不画
 function segBar(s) {
@@ -595,12 +660,14 @@ function renderSide() {
   const pass = (k) => inFilter(k);
   // 麻薯：主脑（主对话，管项目）+ 每个项目一个子脑
   const aState = needOf(inboxOf(null)) || camState(a, 'off');
-  const aLive = liveBusy(MAIN) ? liveText(MAIN) : '';
+  const aLive = liveBusy(MAIN);
+  const aDet = formatStatusDetail(a?.detail || state.assistant_detail || '', a?.detail_since ?? state.assistant_detail_since, aState, MAIN);
+  const aTone = detailTone(aState, aLive);
   const boxHtml = `<div class="mashu-box">
     <div class="row main-row ${current === MAIN ? 'active' : ''}" data-go="${MAIN}" title="麻薯主脑：主对话">
       ${mashuAv('av')}
       <div class="meta"><div class="t">麻薯</div>
-        <div class="s st-line ${aLive ? 'live' : ''}">${sdot(aLive ? liveKey(MAIN) : aState)}<span class="st-t">${esc(aLive || ST[aState])}</span>${ctxChip(a)}</div></div>
+        <div class="s st-line ${aTone}" title="${esc(aDet)}">${sdot(aLive ? liveKey(MAIN) : aState)}<span class="st-t">${esc(aDet)}</span>${ctxChip(a)}</div></div>
       ${unreadBadge([MAIN])}</div>
     <button class="ghost-btn" data-theme-toggle title="切换主题"></button>
   </div>`;
@@ -618,18 +685,23 @@ function renderSide() {
     const bk = brainState(f);
     if ((q || sideFilter) && !seqs.length && !(pass(bk) && hit(f.title, f.id))) continue;
     const open = !collapsed[f.id] || !!sideFilter;
-    const nRun = all.filter(([, k]) => ['busy', 'relay', 'queued', 'waiting'].includes(k)).length;
+    const nRun = all.filter(([, k]) => ['busy', 'relay', 'queued', 'waiting', 'peer'].includes(k)).length;
     const nLive = all.filter(([, , k]) => k !== 'archived').length;   // 已归档的不计数、不算未读
     const subChs = all.filter(([, , k]) => k !== 'archived').map(([s]) => `${f.id}/${s.key}`);
     const fLive = liveBusy(f.id);
+    const fDet = formatStatusDetail(f.detail || f.producer?.detail || '', f.detail_since ?? f.producer?.detail_since, bk, f.id, f.waits);
+    const fTone = detailTone(bk, fLive);
     const inFilm = current === f.id || current.startsWith(f.id + '/');
     html.push(`<div class="film-card ${inFilm ? 'cur' : ''} ${open && (nLive || acctsOf(f)) ? 'open' : ''}">`);   // 一个项目一张卡：子脑标题 + 它的功能会话
     html.push(`<div class="film-head ${current === f.id ? 'active' : ''}" data-go="${esc(f.id)}" title="麻薯在 ${esc(f.title)} 的子脑 · ${esc(f.path)}">
-      <span class="caret ${open ? 'open' : ''}" data-toggle="${esc(f.id)}" title="${open ? '收起' : '展开'}功能">${icon('chev-r', 12)}</span>
-      ${sdot(fLive ? liveKey(f.id) : bk)}<span class="ft">${esc(f.title)}</span>
-      <span class="fc">${nLive || ''}${nRun ? ` · ${nRun} 在跑` : ''}${fLive ? ` · <span class="fl">${esc(liveText(f.id))}</span>` : ''}</span>
-      ${unreadBadge(open ? [f.id] : [f.id, ...subChs])}${ctxChip(f.producer)}${fLive && !['busy', 'stuck', 'apierr'].includes(bk) ? pill(liveKey(f.id)) : pill(bk)}
-      <button class="mini-btn" data-pitch="${esc(f.id)}" title="新功能">${icon('plus', 13)}</button></div>`);
+      <div class="fh-top">
+        <span class="caret ${open ? 'open' : ''}" data-toggle="${esc(f.id)}" title="${open ? '收起' : '展开'}功能">${icon('chev-r', 12)}</span>
+        ${sdot(fLive ? liveKey(f.id) : bk)}<span class="ft">${esc(f.title)}</span>
+        <span class="fc">${nLive || ''}${nRun ? ` · ${nRun} 在跑` : ''}</span>
+        ${unreadBadge(open ? [f.id] : [f.id, ...subChs])}${ctxChip(f.producer)}${fLive && !['busy', 'stuck', 'apierr'].includes(bk) ? pill(liveKey(f.id)) : pill(bk)}
+        <button class="mini-btn" data-pitch="${esc(f.id)}" title="新功能">${icon('plus', 13)}</button>
+      </div>
+      ${fDet ? `<div class="fh-detail ${fTone}" title="${esc(fDet)}">${esc(fDet)}</div>` : ''}</div>`);
     if (!open) { html.push('</div>'); continue; }
     const seqRow = ([s, , k]) => {
       const ch = `${f.id}/${s.key}`;
@@ -637,13 +709,15 @@ function renderSide() {
       const who = (c || s.last)?.name || '';
       const busy = k === 'busy' || liveBusy(ch);
       const fresh = k === 'done' && unseenDone(s);
+      const sDet = formatStatusDetail(s.detail || '', s.detail_since, k, ch, s.waits, s.waited_by);
+      const sTone = detailTone(k, busy);
       const act = ['done', 'blocked', 'idle', 'off'].includes(k) ? `<button class="row-act" data-cam="archive" data-ref="${esc(ch)}" title="归档：收进「已归档」">${icon('archive', 13)}</button>`
         : k === 'archived' ? `<button class="row-act" data-cam="unarchive" data-ref="${esc(ch)}" title="取消归档">${icon('undo', 13)}</button>` : '';
       html.push(`<div class="row seq-row ${current === ch ? 'active' : ''} ${busy ? 'is-busy' : ''} ${fresh ? 'fresh' : ''}" data-go="${esc(ch)}" title="${esc(f.title)} #${esc(s.num ?? '')} ${esc(s.title)}">
         ${fresh ? '<span class="fresh-dot" title="已完成，还没看结果"></span>' : ''}
         <div class="meta"><div class="t-line"><span class="t">${esc(s.title)}</span>${busy && !['busy', 'stuck', 'apierr'].includes(k) ? pill(liveKey(ch)) : pill(k)}${k === 'archived' ? '' : unreadBadge([ch])}${act}</div>
           <div class="s3">${who ? `<span class="who">「${esc(who)}」</span>` : `<span class="who">#${esc(s.num ?? '')}</span>`}${segBar(s)}${ctxChip(c)}</div>
-          ${busy ? workingLine() : ''}</div></div>`);
+          ${sDet ? `<div class="st-detail ${sTone}" title="${esc(sDet)}">${busy ? '<span class="dots"><i></i><i></i><i></i></span>' : ''}<span class="st-dt">${esc(sDet)}</span></div>` : ''}</div></div>`);
     };
     const arch = seqs.filter((x) => x[1] === 'archived').sort((x, y) => (y[0].archived_at || 0) - (x[0].archived_at || 0));   // 归档越晚越靠上
     const cur = seqs.filter((x) => x[1] !== 'archived');
@@ -861,9 +935,11 @@ ${esc(pl.label)} 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。�
     ${buttons ? `<button class="btn" data-sess="handoff" title="交接：让它整理交接文档（handoff.md），然后在原窗格换新会话接着做" ${cam && cam.alive ? '' : 'disabled'}>${icon('swap', 15)}<span class="bt">交接</span></button>
       <button class="btn" data-sess="new-session" title="新会话：选择预设并新开一个会话，不带上一段对话、不读交接">${icon('sparkle', 15)}<span class="bt">新会话</span></button>` : ''}</div>`;
 }
-function headStatus(ch, k, extra = '') {
-  const lt = liveBusy(ch) ? liveText(ch) : '';
-  return `<div class="s">${sdot(lt ? liveKey(ch) : k)}<span class="st-t ${lt ? 'live' : ''}">${esc(lt || ST[k])}</span>${extra}</div>`;
+function headStatus(ch, k, extra = '', detail = '') {
+  const isLive = liveBusy(ch);
+  const txt = detail || (isLive ? liveText(ch) : ST[k]);
+  const tone = detailTone(k, isLive);
+  return `<div class="s">${sdot(isLive ? liveKey(ch) : k)}<span class="st-t ${tone}" title="${esc(txt)}">${esc(txt)}</span>${extra}</div>`;
 }
 function renderProjectBoard(project) {
   let board = $('#projectBoard');
@@ -889,9 +965,11 @@ function renderHead() {
   const input = $('#input');
   if (current === MAIN) {
     const a = state.assistant;
+    const ak = needOf(inboxOf(null)) || camState(a, 'off');
+    const aDet = formatStatusDetail(a?.detail || state.assistant_detail || '', a?.detail_since ?? state.assistant_detail_since, ak, MAIN);
     el.innerHTML = `${mashuAv('av')}
       <div class="meta"><div class="t">麻薯 · 主脑</div>
-        ${headStatus(MAIN, needOf(inboxOf(null)) || camState(a, 'off'), '<span class="sub">· 主对话 · 项目管理</span>')}</div>
+        ${headStatus(MAIN, ak, '<span class="sub">· 主对话 · 项目管理</span>', aDet)}</div>
       <div class="head-acts">${sessCtl(MAIN, 'assistant', a, true)}</div>`;
     input.placeholder = '和麻薯说点什么… Enter 发送，Shift+Enter 换行';
     return;
@@ -900,9 +978,11 @@ function renderHead() {
   if (!f) { el.innerHTML = '<div class="meta"><div class="t">频道不存在</div></div>'; return; }
   if (!s) {
     const p = f.producer;
+    const bk = brainState(f);
+    const fDet = formatStatusDetail(f.detail || p?.detail || '', f.detail_since ?? p?.detail_since, bk, f.id, f.waits);
     el.innerHTML = `${mashuAv('av')}
       <div class="meta"><div class="t"><a class="crumb" data-go="${MAIN}">麻薯</a><span class="crumb-sep">${icon('chev-r', 14)}</span>${esc(f.title)}</div>
-        ${headStatus(f.id, brainState(f), `<span class="sub">· 子脑</span><span class="path">${esc(f.path)}</span>`)}</div>
+        ${headStatus(f.id, bk, `<span class="sub">· 子脑</span><span class="path">${esc(f.path)}</span>`, fDet)}</div>
       <div class="seg proj-mode" role="tablist"><button class="${projMode[f.id] === 'wf' ? '' : 'active'}" data-projmode="chat">${icon('chat', 14)}对话</button><button class="${projMode[f.id] === 'wf' ? 'active' : ''}" data-projmode="wf">${icon('board', 14)}工作流</button></div>
       <div class="head-acts">${sessCtl(f.id, 'producer', p, true)}
       ${p ? `<button class="btn" data-cam="producer-off" data-film="${esc(f.id)}" title="关掉子脑会话，有事会自动叫醒">${icon('moon', 15)}<span class="bt">休息</span></button>` :
@@ -915,12 +995,13 @@ function renderHead() {
   const ref = `${f.id}/${s.key}`;
   const who = (c || s.last)?.name || '';
   const k = seqStateKey(f, s);
+  const sDet = formatStatusDetail(s.detail || '', s.detail_since, k, ref, s.waits, s.waited_by);
   el.innerHTML = `<div class="av seq-av" style="background:hsl(${hue(s.key)} 42% 58%)">${esc(who ? [...who][0] : String(s.num ?? '·'))}</div>
     <div class="meta"><div class="t">${esc(seqLabel(f, s))} · ${esc(s.title)}</div>
       ${headStatus(ref, k, `${s.stages.length > 1 && s.stage ? `<span class="sub">· 阶段 ${s.stage.id} ${esc(stageName(s.stage.id, s.stage_defs))} · ${esc(s.stage.status)}</span>${behaviorLinks(((s.stage_defs || [])[s.stage.id - 1] || {}).behavior, f.id)}` : ''}
       ${segBar(s)}
       ${s.stages.length > 1 && s.playbook && s.playbook.name ? `<span class="tag">工作流 ${esc(s.playbook.name)} v${esc(s.playbook.version)}</span>` : ''}
-      ${c ? `<span class="sub">${esc(roleName(c.crew_role))}「${esc(c.name)}」</span>` : ''}`)}</div>
+      ${c ? `<span class="sub">${esc(roleName(c.crew_role))}「${esc(c.name)}」</span>` : ''}`, sDet)}</div>
     <div class="head-acts">${sessCtl(ref, 'crew', c, false)}
     ${k !== 'archived' ? `<button class="btn ${k === 'done' ? 'primary' : ''}" data-cam="archive" data-ref="${esc(ref)}" title="归档：左栏收进「已归档」，之后有新进展会自动回来">${icon('archive', 14)}<span class="bt">归档</span></button>` : ''}
     ${k === 'archived' ? `<button class="btn" data-cam="unarchive" data-ref="${esc(ref)}" title="移回左栏列表">${icon('undo', 14)}<span class="bt">取消归档</span></button>` : ''}
