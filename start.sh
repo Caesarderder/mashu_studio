@@ -25,7 +25,10 @@ case "$MODE" in
     tmux kill-session -t "$SESSION" 2>/dev/null && echo "已停止 tmux 会话 $SESSION" || echo "$SESSION 未在运行"
     exit 0 ;;
   restart)
-    tmux kill-window -t "$SESSION:office" 2>/dev/null || true ;;
+    # 按窗口 id 逐个关：同名 office 窗口有两个时（两次启动撞车留下的），按名字找会报「找不到窗口」，重启就静默失效
+    for _w in $(tmux list-windows -t "$SESSION" -F '#{window_id} #{window_name}' 2>/dev/null | awk '$2=="office"{print $1}'); do
+      tmux kill-window -t "$_w" 2>/dev/null || true
+    done ;;
   auto)
     [[ -e "$STOPPED" ]] && exit 0
     NO_OPEN=1
@@ -33,7 +36,7 @@ case "$MODE" in
     if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx office \
        && ! curl -fsS -m 5 -o /dev/null "$URL" 2>/dev/null; then
       sleep 3
-      curl -fsS -m 5 -o /dev/null "$URL" 2>/dev/null || { echo "$(date '+%F %T') 网页服务无响应，重启"; tmux kill-window -t "$SESSION:office"; }
+      curl -fsS -m 5 -o /dev/null "$URL" 2>/dev/null || { echo "$(date '+%F %T') 网页服务无响应，重启"; for _w in $(tmux list-windows -t "$SESSION" -F '#{window_id} #{window_name}' | awk '$2=="office"{print $1}'); do tmux kill-window -t "$_w"; done; }
     fi ;;
   autostart)
     case "${2:-}" in
