@@ -2327,6 +2327,15 @@ async function sendText(text) {
 }
 async function answer(rid, text, el = null) {
   if (!text) return toast('先写点什么');
+  const rr0 = reports[rid] || {};
+  const opts0 = rr0.options || [];
+  // 发布类批准点「拒绝」要再确认：误点后只能重新发起，发布流程可能要再走一次验证码（自迭代 11-27 #42）
+  if (opts0.includes(text) && text !== opts0[0] && /拒绝|驳回|不批准|不同意|打回/.test(text)
+      && (rr0.gate || /发布|上线|部署|release|deploy/i.test(`${rr0.summary || ''}`))
+      && !window.confirm(`确定选「${text}」？\n\n${rr0.summary || ''}\n\n选了之后只能让对方重新发起。`)) return;
+  // 文字回复以逗号、冒号等结尾，多半是没写完就按了发送（自迭代 11-27 #37，#1143/req/4 只发出半句）
+  if (!opts0.includes(text) && /[，、：；（,:;(]\s*$/.test(text)
+      && !window.confirm(`这条回复好像没写完（结尾是「${text.trim().slice(-6)}」），仍然发送？`)) return;
   const card = el || document.getElementById(`card-${rid}`) || document.getElementById(`raised-${rid}`);
   card?.classList.add('busy');
   card?.querySelectorAll('button,input').forEach((x) => { x.disabled = true; });

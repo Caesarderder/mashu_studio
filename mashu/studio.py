@@ -6465,7 +6465,8 @@ def _hook_stop(payload, agy, fmt='claude'):
         conv = agy_note(conn, c, payload)
         conn.execute('UPDATE cameras SET state="idle", last_stop=? WHERE id=?', (time.time(), c['id']))
         conn.commit()
-        if payload.get('terminationReason') not in (None, '', 'model_stop'):
+        # NO_TOOL_CALL = 模型这一轮说完话、没再调工具，是正常收尾；只把其余原因记成告警（11-27 自迭代 #41：27 次 agy-stop 全是它）
+        if payload.get('terminationReason') not in (None, '', 'model_stop', 'NO_TOOL_CALL'):
             log_event(conn, 'agy-stop', c, level='warn', reason=payload.get('terminationReason'), err=(payload.get('error') or '')[:300])
         path = lp.resolve_agy_transcript(payload.get('transcriptPath'), conv or c['claude_sid'], GEMINI_HOME)
         text = agy_last_reply(path)
