@@ -157,7 +157,7 @@ Codex 也支持兼容 OpenAI Responses 的 API 号：在账号池点「加 API �
 
 ### 1. 主文件结构（`state/studio.json`，0600）
 
-- `settings`：全局设置（并发槽、扫描根目录、端口、价格 `prices`、平台版本 `platform_versions` 等 `DEFAULTS` 键）。
+- `settings`：全局设置（并发槽 `stages` = 每个账号同时跑的执行者上限、扫描根目录、端口、价格 `prices`、平台版本 `platform_versions` 等 `DEFAULTS` 键）。
 - `defaults`：各角色默认平台 / 模型 / 思考程度 / Code Mode（`providers`、`models`、`gemini_models`、`codex_models`、`opencode_models`、`efforts`、`code_modes`）。
 - `accounts`：账号池默认号（`defaults`）、账号清单及凭据（`items`：Gemini 的 RT/AT/过期时间，非本机 Codex 的 `auth.json` 内容；本机 Codex 号只记 `auth_ref: "local_cli"`，不复制 RT）、Gemini OAuth 客户端缓存（`gemini_clients`）。
 - `providers`：本机 CLI 引用标记与自定义 provider API key。

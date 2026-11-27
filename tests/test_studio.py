@@ -295,6 +295,27 @@ class TestStudio(Base):
         self.assertEqual(self.cam(a['id'])['state'], 'running')
         self.assertEqual(self.cam(b['id'])['state'], 'queued')
 
+    def test_stage_limit_is_per_account(self):
+        """并发槽按账号算：同一个号满了就排队，占着名额的换成别的号（Codex cx-9）后，Claude 这边空出来就能开。"""
+        studio.CONFIG_OVERRIDES['stages'] = 1
+        conf = json.loads(studio.film_file('builda').read_text())
+        conf['max_stages'] = 5
+        studio.film_file('builda').write_text(json.dumps(conf))
+        ka, kb = self.pitch('a')[0], self.pitch('b')[0]
+        a, b = self.writing(ka, ['src/a/**']), self.writing(kb, ['src/b/**'])
+        self.tick()
+        self.assertEqual(self.cam(a['id'])['state'], 'running')
+        self.assertEqual(self.cam(b['id'])['state'], 'queued')
+        self.assertEqual(studio.crew_by_account(self.conn), {'claude': 1})
+        studio.meta_set(self.conn, f'camprov:{a["id"]}', 'codex')
+        studio.meta_set(self.conn, f'camacct:{a["id"]}', 'cx-9')
+        self.tick()
+        self.assertEqual(self.cam(b['id'])['state'], 'running')
+        self.assertEqual(studio.crew_by_account(self.conn), {'claude': 1, 'codex:cx-9': 1})
+        st = studio.status_data(self.conn)['stages']
+        self.assertEqual((st['used'], st['max']), (2, 1))
+        self.assertEqual([x['label'] for x in st['by_account']], ['Claude', 'Codex cx-9'])
+
     def test_report_chain_up_to_executive_and_answer_back(self):
         key, crew = self.pitch('export-csv')
         self.tick()

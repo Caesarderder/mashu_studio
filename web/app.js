@@ -685,7 +685,9 @@ function renderSide() {
   }
   const setH = (sel, h) => { const e = $(sel); if (e._html !== h) { e.innerHTML = h; e._html = h; } };
   setH('#slate', html.join(''));
-  setH('#sideFoot', `${quotaHtml()}<div class="run-stat"><span title="执行者并发槽">执行 ${state.stages.used}/${state.stages.max}</span>
+  const byAcct = state.stages.by_account || [];
+  const execTxt = byAcct.length ? byAcct.map((x) => `${esc(x.label)} ${x.used}/${state.stages.max}`).join(' · ') : `0（每号≤${state.stages.max}）`;
+  setH('#sideFoot', `${quotaHtml()}<div class="run-stat"><span title="执行者并发槽：每个账号（Claude、每个 Codex 号…）各自最多同时 ${state.stages.max} 个，总数不限">执行 ${execTxt}</span>
     ${state.reads && state.reads.used ? `<span title="只读阶段（分阶段工作流里的方案等）并发槽">只读 ${state.reads.used}/${state.reads.max}</span>` : ''}
     <span title="同时在岗的子脑">子脑 ${state.desks.used}/${state.desks.max}</span></div>`);
   const tr = $('#tabsRight');
@@ -1371,7 +1373,7 @@ function panelInto(p) {
         <div style="margin-top:6px"><button class="btn" data-cam="digest-now">现在就要一份</button></div></div>
       <h3>今天</h3>
       <div class="kv"><span class="k">项目</span><div class="v">${state.films.length} 个项目，${state.films.reduce((n, f) => n + f.sequences.length, 0)} 个功能</div></div>
-      <div class="kv"><span class="k">并发槽</span><div class="v">${live} 个执行者在运行 · 上限 ${state.stages.max}</div></div>`;
+      <div class="kv"><span class="k">并发槽</span><div class="v">${live} 个执行者在运行 · 每个账号上限 ${state.stages.max}（总数不限）</div></div>`;
     return;
   }
   const [f, s] = seqOf(current);

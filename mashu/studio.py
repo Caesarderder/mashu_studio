@@ -53,7 +53,7 @@ ACTIVE = ('queued', 'running', 'idle')
 LIVE = ('running', 'idle')
 
 DEFAULTS = dict(
-    stages=3,                     # 并发槽：全局同时启动的执行者上限
+    stages=3,                     # 并发槽：每个账号（Claude、Codex 每个号、Gemini、OpenCode 各算一个）同时跑的写代码执行者上限；总数不封顶
     producer_desks=3,             # 子脑并发：同时运行中的子脑上限
     max_stages_per_film=2,        # 每个项目默认最多占几个并发槽
     scan_roots=['~/workspace'],   # 扫描未登记项目的根目录
@@ -1987,8 +1987,9 @@ def vendor_info():
     return out
 
 
-def choose_account(conn, c, prov):
+def choose_account(conn, c, prov, exclude=()):
     """新会话用池里哪个号：对话里指定的 > 功能开工时定的（exec.account）> 自动（额度剩得最多）。
+    exclude：自动选时先避开的号（执行者已满并发槽的号）；都满了就照常选，由 launch_queue 排队等。指定的号不避开（满了就等它）。
     返回 (号 或 None, 原因)；池里这个平台没有号就是 (None, '')，按以前的单号行为开会话。"""
     if prov not in ACCT_KEY:
         return None, ''
@@ -1998,6 +1999,10 @@ def choose_account(conn, c, prov):
     ex = feature_exec(conn, c)
     want = get_pref(conn, channel_of(c)).get(ACCT_KEY[prov]) or (ex.get('account') if (ex.get('cli') or 'claude') == prov else '')
     d = pool().default(prov)
+    if exclude and not want:
+        rest = [a for a in accs if a['id'] not in exclude]
+        if any(acct.usable(a) for a in rest):
+            accs = rest
     return acct.pick(accs, want or None, d and d['id'])
 
 
@@ -2703,7 +2708,7 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
         a = next((x for x in pool().list('codex') if h and codex_acct_home(x) == h), None)
         home_dir = h or codex_home()
     else:
-        a, why = choose_account(conn, c, 'codex')
+        a, why = choose_account(conn, c, 'codex', full_accounts(conn, 'codex') if c['role'] == 'crew' else ())
         home_dir = codex_acct_home(a) if a else codex_home()
     meta_set(conn, f'camacct:{c["id"]}', a['id'] if a else '')
     if a and not sid:
@@ -4076,7 +4081,7 @@ def crew_linger_guard(conn):
         if f and not seq_done(seq_state(f, c['seq_key'])):
             continue
         archived = f and meta_get(conn, f'archive:{f["id"]}/{c["seq_key"]}')
-        yield_ = c['film_id'] in queued or (queued and crew_slots(conn)[0] >= cfg('stages'))   # 有新功能在排队就让位
+        yield_ = c['film_id'] in queued or (queued and crew_by_account(conn).get(cam_account_key(conn, c), 0) >= cfg('stages'))   # 有新功能在排队就让位
         if not f or archived or yield_ or time.time() - c['last_stop'] > limit:
             why = '功能已归档' if archived else '让位给排队的新功能' if yield_ else f'完成后空闲超过 {limit / 60:g} 分钟'
             end_camera(conn, c['id'], 'wrap', why)
@@ -4235,6 +4240,63 @@ def crew_slots(conn, film_id=None):
     return w, r
 
 
+def account_key(prov, aid=''):
+    """并发槽按账号算：Claude / OpenCode 各一个；Codex、Gemini 池里每个号各一个（没进池的单号就是平台名）。"""
+    return f'{prov}:{aid}' if aid else prov
+
+
+def account_key_label(k):
+    prov, _, aid = k.partition(':')
+    return f'{PROV_LABEL.get(prov, prov)}{" " + aid if aid else ""}'
+
+
+def cam_account_key(conn, c):
+    """在跑的会话占的是哪个账号的并发槽（launch 时记的 camprov / camacct）。"""
+    return account_key(cam_provider(conn, c), meta_get(conn, f'camacct:{c["id"]}') or '')
+
+
+def crew_by_account(conn):
+    """在跑的写代码执行者按账号计数：{账号键: 个数}。只读阶段的执行者另算（read_slots），不占这里。"""
+    alive = alive_panes()
+    out = {}
+    for c in rows(conn, 'SELECT * FROM cameras WHERE role="crew" AND state IN ("running","idle")'):
+        if c['pane'] not in alive:
+            continue
+        f = film(conn, c['film_id'])
+        if f and stage_writes(f, c['seq_key'], c['stage_no']):
+            k = cam_account_key(conn, c)
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
+def full_accounts(conn, prov):
+    """这个平台里执行者已占满并发槽的号（自动选号时先避开）。"""
+    cap = cfg('stages')
+    return {k.split(':', 1)[1] for k, n in crew_by_account(conn).items() if n >= cap and k.startswith(prov + ':')}
+
+
+def queued_account_key(conn, c):
+    """排队的执行者启动后会占哪个账号：和 launch 的选法一致（恢复会话沿用原来的那家、那个号）。"""
+    sid = c['resume_sid']
+    prov = provider_of_sid(conn, sid) if sid else provider_pref(conn, c)
+    if not sid and not platform_status(prov)['ok']:
+        prov = 'claude'                 # launch 会退回 Claude
+    aid = ''
+    if prov == 'codex':
+        if sid:
+            _, h = plat.find_codex_session(codex_homes(), sid)
+            a = next((x for x in pool().list('codex') if h and codex_acct_home(x) == h), None)
+        else:
+            a, _ = choose_account(conn, c, 'codex', full_accounts(conn, 'codex'))
+        aid = a['id'] if a else ''
+    elif prov == 'gemini':
+        aid = next((a['id'] for a in cli_accounts('gemini') if a.get('active')), '')
+    return account_key(prov, aid)
+
+
+_acct_full_noted = set()
+
+
 def launch_queue(conn):
     for c in rows(conn, 'SELECT * FROM cameras WHERE state="queued" AND role="assistant" ORDER BY id'):
         launch(conn, c['id'])
@@ -4251,12 +4313,18 @@ def launch_queue(conn):
         f = film(conn, c['film_id'])
         if not f:
             continue
-        w, r = crew_slots(conn)
+        _, r = crew_slots(conn)
         if not stage_writes(f, c['seq_key'], c['stage_no']):      # 只读阶段：单独的名额
             if r < cfg('read_slots'):
                 launch(conn, c['id'])
             continue
-        if w >= cfg('stages') or crew_slots(conn, f['id'])[0] >= (f.get('max_stages') or cfg('max_stages_per_film')):
+        if crew_slots(conn, f['id'])[0] >= (f.get('max_stages') or cfg('max_stages_per_film')):
+            continue
+        k = queued_account_key(conn, c)
+        if crew_by_account(conn).get(k, 0) >= cfg('stages'):
+            if c['id'] not in _acct_full_noted:
+                _acct_full_noted.add(c['id'])
+                notice(conn, f'{f["id"]}/{c["seq_key"]}', f'排队：{account_key_label(k)} 已有 {cfg("stages")} 个执行者在跑（每个账号上限），等它空出来')
             continue
         clash = scope_conflicts(conn, f, c['seq_key'])
         if clash:
@@ -6908,7 +6976,9 @@ def status_data(conn):
             for c in rows(conn, 'SELECT * FROM cameras WHERE state IN ("queued","running","idle") ORDER BY role="crew", role="producer", id')]
     return dict(
         assistant=cam_view_bg(conn, active_assistant(conn), alive), films=out_films, cameras=cams,
-        stages=dict(used=crew_slots(conn)[0], max=cfg('stages')), reads=dict(used=crew_slots(conn)[1], max=cfg('read_slots')),
+        stages=dict(used=crew_slots(conn)[0], max=cfg('stages'),
+                    by_account=[dict(key=k, label=account_key_label(k), used=n) for k, n in sorted(crew_by_account(conn).items())]),
+        reads=dict(used=crew_slots(conn)[1], max=cfg('read_slots')),
         desks=dict(used=live_count(conn, 'producer'), max=cfg('producer_desks')),
         inbox=[dict(r, origin=' · '.join(report_origin(conn, r))) for r in open_reports(conn, 'executive')],
         decisions_pending=one(conn, 'SELECT COUNT(*) n FROM decisions WHERE status="待追认"')['n'],
@@ -7070,7 +7140,9 @@ def cmd_playbook(args):
 def cmd_callsheet(args):
     conn = db()
     data = status_data(conn)
-    print(f'状态总览 {today()}：并发槽 {data["stages"]["used"]}/{data["stages"]["max"]}，子脑并发 '
+    st = data['stages']
+    per = '、'.join(f'{x["label"]} {x["used"]}' for x in st['by_account'])
+    print(f'状态总览 {today()}：执行者 {st["used"]} 个（每个账号上限 {st["max"]}{"：" + per if per else ""}），子脑并发 '
           f'{data["desks"]["used"]}/{data["desks"]["max"]}，待用户处理 {len(data["inbox"])} 件，决策记录待追认 {data["decisions_pending"]} 条')
     for f in data['films']:
         if args.film and f['id'] != args.film:
