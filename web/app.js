@@ -748,7 +748,7 @@ function renderSide() {
         : k === 'archived' ? `<button class="row-act" data-cam="unarchive" data-ref="${esc(ch)}" title="取消归档">${icon('undo', 13)}</button>` : '';
       html.push(`<div class="row seq-row ${current === ch ? 'active' : ''} ${busy ? 'is-busy' : ''} ${fresh ? 'fresh' : ''}" data-go="${esc(ch)}" title="${esc(rowTip)}">
         ${fresh ? '<span class="fresh-dot" title="已完成，还没看结果"></span>' : ''}
-        <div class="meta"><div class="t-line"><span class="t">${esc(s.title)}</span>${busy && !['busy', 'stuck', 'apierr'].includes(k) ? pill(liveKey(ch)) : pill(k)}${k === 'archived' ? '' : unreadBadge([ch])}${act}</div>
+        <div class="meta"><div class="t-line">${s.num != null ? `<span class="seq-num">#${esc(s.num)}</span>` : ''}<span class="t">${esc(s.title)}</span>${busy && !['busy', 'stuck', 'apierr'].includes(k) ? pill(liveKey(ch)) : pill(k)}${k === 'archived' ? '' : unreadBadge([ch])}${act}</div>
           <div class="st-detail ${sDet.text ? sTone : 'dim'}" title="${esc(sDet.full || fallback)}">${busy ? '<span class="dots"><i></i><i></i><i></i></span>' : ''}<span class="st-dt">${esc(subTxt)}</span>${segBar(s)}${ctxChip(c)}${sDet.age ? `<span class="st-age">${esc(sDet.age)}</span>` : ''}</div></div></div>`);
     };
     const arch = seqs.filter((x) => x[1] === 'archived').sort((x, y) => (y[0].archived_at || 0) - (x[0].archived_at || 0));   // 归档越晚越靠上
