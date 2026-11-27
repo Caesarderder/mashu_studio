@@ -1291,11 +1291,13 @@ function renderCard(m) {
   else if (!open) foot = closedLine(r);
   if (isStale) {
     const sumTitle = r.summary || firstLine(r.text, 70);
+    const tailWhy = superseded ? '' : (r.stale_reason || '');
+    const metaHead = `<div class="ch"><span class="origin">${esc(r.origin)}</span><span class="time">${timeText(m.ts)}</span></div>`;
     return `<div class="card stale ${kindCls} ${open ? '' : 'closed'}" id="${domId}">${cardAv(r)}
       <div class="card-main">
         <details class="card-stale-fold" data-dkey="st${r.id}" ${detailsOpen(`st${r.id}`)}>
-          <summary>${stTag}${typeTag}<span class="rid">#${r.id}</span><span class="stale-sum">${esc(sumTitle)}</span>${staleLabel ? `<span class="stale-why">${esc(staleLabel)}</span>` : ''}</summary>
-          <div class="stale-body">${head}<div class="ct">${md(r.text)}</div>
+          <summary>${stTag}${typeTag}<span class="rid">#${r.id}</span><span class="stale-sum">${esc(sumTitle)}</span>${tailWhy ? `<span class="stale-why">${esc(tailWhy)}</span>` : ''}</summary>
+          <div class="stale-body">${metaHead}<div class="ct">${md(r.text)}</div>
           ${chips.length ? `<div class="chips">${chips.join('')}</div>` : ''}
           ${acBox}${recLine}${route ? `<div class="route"><div class="route-h">各级意见</div>${route}</div>` : ''}${foot}</div>
         </details>
