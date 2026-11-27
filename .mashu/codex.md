@@ -8,7 +8,7 @@
 
 | 功能 | 执行者 | 交付 / 状态 | 方案 |
 | --- | --- | --- | --- |
-| #15 左栏状态细化 + 点对点等待 | 雨天（运行中） | 改 `seq_status`/`status_data`/`bg_tasks_of`/`cam_view_bg`/`launch_queue`（记排队原因）/`cmd_collaboration`（peer 等待）/`collaboration_context`、新表 `peer_waits`、web 左栏与对话头部 | `.mashu/plans/status-detail.md` |
+| #15 左栏状态细化 + 点对点等待 | 雨天（2e81a8b 已提交，等用户确认截图） | 改 `seq_status`/`status_data`/`bg_tasks_of`/`cam_view_bg`/`launch_queue`（记排队原因）/`cmd_collaboration`（peer 等待）/`collaboration_context`、新表 `peer_waits`、web 左栏与对话头部 | `.mashu/plans/status-detail.md` |
 | #14 模型池（预设 + 备选预设） | 日落（已完成 1fb06e9、1694bfd，待重启服务） | 改 `session_pref`/`code_pref`/`choose_account`/`set_pref`/launch 取配置/defaults 动作/`pitch`、`config_file.py` 迁移、web 模型池页与各选择器 | `.mashu/plans/model-pool.md` |
 | #13 caesar-docs 治理 | 很好 | 已完成（d2a859a），待用户点「重启服务」生效 | `.mashu/plans/docs-governance.md`，依据 `.mashu/drafts/caesar-docs-audit-2026-11-27.md` |
 | #11 并行调度 + 法典 + 协作板 + 点对点 | — | 已完成（6e00cb8），服务 04:05 重启后已生效 | `.mashu/plans/parallel-codex.md` |
@@ -54,6 +54,7 @@
 | --- | --- | --- |
 | 2026-11-27 | #11 | 新增 `mashu sync "…"`（写协作板 `.mashu/board.jsonl`，其他会话下一轮注入）、`mashu peer <编号> "…"`（点对点，子脑抄送）、`mashu codex [note]`（查看 / 记录法典）；启动不再因范围重叠排队，热点改为写入时短租约（6e00cb8） |
 | 2026-11-27 | #13 | `mashu skills status [--json]`：列出 caesar-docs 各安装位置的版本和指纹；`mashu skills sync [--apply]`：默认只预览，`--apply` 才写（用户级、麻薯级做成软链接，工程副本按锁文件同步）。`mashu handoff --docs "…"` 写入 `handoff.docs`，结单时核验 docs 回写。SessionStart 只注入 docs 入口和索引的路径。实现在 `mashu/skill_sync.py`、`mashu/docs_governance.py`（d2a859a） |
+| 2026-11-27 | #15 | 新表 `peer_waits`、配置 `peer_wait_minutes=30`；`mashu peer <编号> "…" [--fyi]`（默认记为等待对方回复）；`/api/state` 每个 sequence 加 `detail`/`detail_since`/`waits`/`waited_by` 和 `peer` 状态，子脑 / 主脑加 `detail`/`detail_since`（`assistant_detail`），`cam_view_bg` 加 `bg_tasks`（保留 `bg`）（2e81a8b） |
 | 2026-11-27 | 子脑 | `hook_camera(conn, fmt)`：prompt / stop / session / notify 这几个 hook 改用它，嵌套子会话（平台和 camprov 不一致，或进程链上有两层以上 agent CLI）不认机位；pretool 安全拦截仍用 `env_camera`（2f15519） |
 
 ## 当前并行功能
