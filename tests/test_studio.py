@@ -284,7 +284,8 @@ class TestStudio(Base):
         studio.save_state(f, key, data)
         return studio.request_crew(self.conn, f, key, 'go')[0]
 
-    def test_per_film_limit(self):
+    def test_no_per_film_limit(self):
+        """项目不限并发（用户 2026-11-27）：film.json 里旧的 max_stages=1 不再生效，只按账号限。"""
         studio.CONFIG_OVERRIDES['stages'] = 5
         conf = json.loads(studio.film_file('builda').read_text())
         conf['max_stages'] = 1
@@ -293,7 +294,7 @@ class TestStudio(Base):
         a, b = self.writing(ka, ['src/a/**']), self.writing(kb, ['src/b/**'])
         self.tick()
         self.assertEqual(self.cam(a['id'])['state'], 'running')
-        self.assertEqual(self.cam(b['id'])['state'], 'queued')
+        self.assertEqual(self.cam(b['id'])['state'], 'running')
 
     def test_stage_limit_is_per_account(self):
         """并发槽按账号算：同一个号满了就排队，占着名额的换成别的号（Codex cx-9）后，Claude 这边空出来就能开。"""

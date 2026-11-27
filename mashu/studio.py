@@ -59,7 +59,7 @@ LIVE = ('running', 'idle')
 DEFAULTS = dict(
     stages=3,                     # 并发槽：每个账号（Claude、Codex 每个号、Gemini、OpenCode 各算一个）同时跑的写代码执行者上限；总数不封顶
     producer_desks=3,             # 子脑并发：同时运行中的子脑上限
-    max_stages_per_film=2,        # 每个项目默认最多占几个并发槽
+    max_stages_per_film=0,        # 已废弃：项目不再限并发，只按账号限（stages）；留着兼容旧配置
     hotspot_lease_minutes=15,
     peer_wait_minutes=30,         # 点对点等待超时分钟数：超时先提示已超时，再过一拍自动清除
     scan_roots=['~/workspace'],   # 扫描未登记项目的根目录
@@ -5487,11 +5487,7 @@ def launch_queue(conn):
             else:
                 meta_set(conn, f'qreason:{c["id"]}', f'只读名额已满 {r}/{r_max}')
             continue
-        f_used = crew_slots(conn, f['id'])[0]
-        f_max = f.get('max_stages') or cfg('max_stages_per_film')
-        if f_used >= f_max:
-            meta_set(conn, f'qreason:{c["id"]}', f'本项目已有 {f_used} 个在跑')
-            continue
+        # 项目不设并发上限（用户 2026-11-27）：只按账号限（每个订阅 / API 号同时最多 stages 个执行者）
         k = queued_account_key(conn, c)
         a_used, a_max = crew_by_account(conn).get(k, 0), cfg('stages')
         if a_used >= a_max:

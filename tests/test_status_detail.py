@@ -174,23 +174,11 @@ class StatusDetailTests(Base):
         self.assertIn('空闲 6 分钟 · 上次：idleit 第一步完成', cli_out)
 
     def test_queue_reasons_three_kinds_and_clear_on_launch(self):
-        # 1) 项目并发满（项目默认 max_stages=2，stages=5）
-        studio.CONFIG_OVERRIDES.update(stages=5, read_slots=1)
+        # 1) 项目不限并发（用户 2026-11-27）；2) 账号满（账号上限 stages=2）
+        studio.CONFIG_OVERRIDES.update(stages=2, read_slots=1)
         self._pitch_live('q1', '先跑1', idle=False)
         self._pitch_live('q2', '先跑2', idle=False)
-        _, k3, c3 = studio.pitch(self.conn, 'demo', 'q3', '等项目并发', title='项目满')
-        studio.launch_queue(self.conn)
-        data = studio.status_data(self.conn)
-        s3 = self._seq_of(data, k3)
-        self.assertEqual(s3['status'], 'queued')
-        self.assertIn('排队：本项目已有 2 个在跑', s3['detail'])
-
-        # 2) 账号满（放宽项目并发到 5，但账号上限 stages=2）
-        fp = studio.film_file('demo')
-        fcfg = json.loads(fp.read_text())
-        fcfg['max_stages'] = 5
-        fp.write_text(json.dumps(fcfg, ensure_ascii=False, indent=2))
-        studio.CONFIG_OVERRIDES.update(stages=2)
+        _, k3, c3 = studio.pitch(self.conn, 'demo', 'q3', '等账号', title='账号满')
         studio.launch_queue(self.conn)
         data = studio.status_data(self.conn)
         s3 = self._seq_of(data, k3)

@@ -1699,7 +1699,7 @@ function panelInto(p) {
       <div class="kv"><span class="k">工程文件夹</span><div class="v path">${esc(f.path)}</div></div>
       <div class="kv"><span class="k">子脑</span><div class="v">${camText(f.producer, '休息中')}${f.producer ? ` · 上下文 ${pct(f.producer.context_pct)}` : ''}</div></div>
       <div class="kv"><span class="k">今日 token</span><div class="v">${num(b.today_tokens)}${b.today_cost != null ? ` · $${b.today_cost.toFixed(2)}` : ''}</div></div>
-      <div class="kv"><span class="k">同时运行上限</span><div class="v">${f.max_stages} 个功能（共用同一个文件夹）</div></div>
+      <div class="kv"><span class="k">同时运行上限</span><div class="v">项目不限；只按账号限（每个订阅 / API 号同时最多 ${num((state.stages && state.stages.max) || 5)} 个）</div></div>
       <h3>功能</h3>${(acctsOf(f) ? acctGroups(f, f.sequences) : [[null, f.sequences]]).map(([a, list]) => (a ? `<div class="acct-sub">${acctDot(f, a.id)}${esc(a.name)}<b>${list.length}</b></div>` : '')
         + list.map((x) => `<div class="inbox-item" data-go="${esc(f.id)}/${esc(x.key)}">
         <div class="o">#${esc(x.num)} · ${esc(statusName(x))}</div>${strip(x.stages)} ${esc(x.title)}</div>`).join('')).join('') || '<div class="kv"><span class="k">还没有</span></div>'}
