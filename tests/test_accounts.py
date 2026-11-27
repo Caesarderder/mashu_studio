@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
+import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_studio import studio, wait_for  # noqa: E402
@@ -30,6 +32,28 @@ CX_RT = 'rt_FAKEcodexrefreshtokenABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
 
 class TestApiAccounts(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('MASHU9_CURL_CONFIG'), '未启用中转接口诊断')
+    def test_live_curl_responses(self):
+        raw = cfgfile.read_json(os.environ['MASHU9_CURL_CONFIG'], {})
+        account = next((a for a in (raw.get('accounts') or {}).get('items', []) if a.get('kind') == 'api' and a.get('label') == '赵老板'), {})
+        key = (account.get('credentials') or {}).get('OPENAI_API_KEY') or ''
+        base = account.get('base_url') or ''
+        self.assertTrue(key and base, '缺少 API 账号配置')
+        errors = []
+        for model in ('gpt-5.4-mini', 'gpt-6.1-terra'):
+            body = json.dumps({'model': model, 'input': '只回复 OK', 'max_output_tokens': 32})
+            config = ('url = ' + json.dumps(base.rstrip('/') + '/responses') + '\n'
+                      + 'header = ' + json.dumps('Authorization: Bearer ' + key) + '\n'
+                      + 'header = "Content-Type: application/json"\n'
+                      + 'data = ' + json.dumps(body) + '\n')
+            result = subprocess.run(['curl', '--silent', '--show-error', '--max-time', '45', '--config', '-',
+                                     '--output', os.devnull, '--write-out', '%{http_code}'], input=config,
+                                    capture_output=True, text=True, timeout=50)
+            print(f'中转诊断 {model}：HTTP {result.stdout.strip() or "000"}，curl 退出码 {result.returncode}', flush=True)
+            if result.returncode:
+                errors.append(model)
+        self.assertFalse(errors, 'curl 请求失败：' + '、'.join(errors))
+
     def test_migration_export_and_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -114,6 +138,61 @@ class TestApiAccounts(unittest.TestCase):
                                     cwd=tmp, env=env, capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, acct.redact(result.stderr[-1500:], [provider['api_key']]))
             self.assertTrue(result.stdout.strip(), 'Codex 未返回文字')
+
+
+@unittest.skipUnless(os.environ.get('MASHU9_SESSION_CONFIG'), '未启用真实会话验收')
+class TestApiLiveSession(PlatBase):
+    def test_real_session_web_and_terminal(self):
+        import server
+        from http.server import ThreadingHTTPServer
+        source = cfgfile.read_json(os.environ['MASHU9_SESSION_CONFIG'], {})
+        account = next((a for a in (source.get('accounts') or {}).get('items', []) if a.get('kind') == 'api' and a.get('label') == '赵老板'), {})
+        key = (account.get('credentials') or {}).get('OPENAI_API_KEY') or ''
+        self.assertTrue(key and account.get('base_url'), '缺少 API 账号配置')
+        studio.CONFIG_OVERRIDES['codex'] = shutil.which('codex')
+        studio._PLAT_CACHE.clear()
+        self.assertTrue(studio.platform_status('codex')['ok'])
+        a = studio.pool().add('codex', kind='api', source='api', status='ok', label='赵老板', base_url=account['base_url'],
+                              credentials={'OPENAI_API_KEY': key})
+        studio.set_pref(self.conn, 'assistant', provider='codex')
+        studio.set_pref(self.conn, 'assistant', defer=True, xacct=a['id'], xmodel='gpt-6.2-sol')
+        cam = studio.create_camera(self.conn, 'assistant', None, None, '只回复“测试通过”，不要使用工具。', quiet=True)
+        original_build = plat.build_codex_home
+        def limited_build(*args, **kwargs):
+            home = original_build(*args, **kwargs)
+            cfg = home / 'config.toml'
+            cfg.write_text(cfg.read_text().replace('wire_api = "responses"\n',
+                           'wire_api = "responses"\nrequest_max_retries = 0\nstream_max_retries = 0\n'))
+            return home
+        with patch.object(plat, 'build_codex_home', side_effect=limited_build), patch.object(studio, 'system_prompt', return_value='只回复一行简短中文，不要使用工具。'):
+            studio.launch(self.conn, cam['id'])
+        cam = studio.camera(self.conn, cam['id'])
+        self.assertEqual(studio.meta_get(self.conn, f'camacct:{cam["id"]}'), a['id'])
+        self.assertTrue(cam['pane'], '隔离 tmux 未启动会话')
+        previous_token, previous_port = server.Handler.token, server.Handler.port
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        server.Handler.token, server.Handler.port = 'fixture-token', httpd.server_address[1]
+        worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+        worker.start()
+        try:
+            def reply():
+                r = studio.one(self.conn, 'SELECT text FROM messages WHERE camera_id=? AND kind="reply" ORDER BY id DESC', cam['id'])
+                return r['text'] if r else ''
+            text = wait_for(reply, timeout=120)
+            screen = studio.tmux('capture-pane', '-p', '-t', cam['pane'], '-S', '-100')
+            req = urllib.request.Request(f'http://127.0.0.1:{httpd.server_address[1]}/api/messages?tail=100', headers={'X-Mashu-Token': 'fixture-token'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                messages = json.load(response)['messages']
+            self.assertTrue(text, '隔离网页没有收到回复')
+            self.assertTrue(any(m.get('camera_id') == cam['id'] and m.get('text') == text for m in messages), '网页消息与会话不一致')
+            self.assertIn(text.strip(), screen, '终端与网页回复不一致')
+            self.assertEqual(studio.session_limits_for(self.conn, cam, 'codex')['billing'], 'usage')
+            self.assertFalse(key in json.dumps(messages, ensure_ascii=False), '网页消息泄露凭据')
+            print('真实会话：gpt-6.2-sol，网页与终端回复一致，额度按量', flush=True)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.Handler.token, server.Handler.port = previous_token, previous_port
 
 
 def jwt(claims):
@@ -456,6 +535,44 @@ class TestStudioPool(PlatBase):
         self.assertFalse((self.p.root / 'codex' / 'cx-1' / 'auth.json').exists())
         self.assertEqual(self.p.default('codex')['id'], 'cx-1')
 
+    @unittest.skipUnless(os.environ.get('MASHU9_AUDIT_CONFIG'), '未启用真实密钥脱敏检查')
+    def test_real_key_redacted_in_isolated_instance(self):
+        import server
+        from http.server import ThreadingHTTPServer
+        raw = cfgfile.read_json(os.environ['MASHU9_AUDIT_CONFIG'], {})
+        source = next((a for a in (raw.get('accounts') or {}).get('items', []) if a.get('kind') == 'api' and a.get('label') == '赵老板'), {})
+        key = (source.get('credentials') or {}).get('OPENAI_API_KEY') or ''
+        self.assertTrue(key, '缺少待检查的 API 账号')
+        a = self.p.add('codex', kind='api', source='api', status='ok', label='赵老板', base_url=source.get('base_url'),
+                       credentials={'OPENAI_API_KEY': key})
+        f, feature, cam = studio.pitch(self.conn, 'builda', 'api-audit', '隔离凭据检查')
+        studio.set_pref(self.conn, f'builda/{feature}', provider='codex')
+        studio.set_pref(self.conn, f'builda/{feature}', xacct=a['id'])
+        studio.tick(self.conn)
+        self.assertTrue(wait_for(lambda: self.flog('codex', feature)), '模拟会话未启动')
+        old_token, old_port = server.Handler.token, server.Handler.port
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        server.Handler.token, server.Handler.port = 'fixture-token', httpd.server_address[1]
+        worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+        worker.start()
+        try:
+            req = urllib.request.Request(f'http://127.0.0.1:{httpd.server_address[1]}/api/accounts', data=b'{"action":"list"}',
+                                         headers={'X-Mashu-Token': 'fixture-token', 'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                api_output = response.read().decode()
+            processes = subprocess.run(['ps', '-axww', '-o', 'command='], capture_output=True, text=True, check=True).stdout
+            panes = subprocess.run(['tmux', '-L', self.socket, 'list-panes', '-a', '-F', '#{pane_start_command}'],
+                                   capture_output=True, text=True, check=True).stdout
+            export = json.dumps(cfgfile._sanitize_config_for_export(self.p._read_cfg()), ensure_ascii=False)
+            logs = json.dumps(studio.rows(self.conn, 'SELECT * FROM events'), ensure_ascii=False) + self.flog('codex', feature)
+            for value in (api_output, processes, panes, export, logs):
+                self.assertFalse(key in value, '隔离实例输出包含 API key')
+            print('密钥检查：账号接口、进程、tmux、无密钥导出和事件日志均未出现原文', flush=True)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.Handler.token, server.Handler.port = old_token, old_port
+
     def test_api_account_launch_and_redaction(self):
         secret = 'fixture-api-secret-do-not-log'
         acct.HTTP = lambda *args, **kwargs: (200, {'data': [{'id': 'model-a'}]})
@@ -469,10 +586,36 @@ class TestStudioPool(PlatBase):
         log = wait_for(lambda: self.flog('codex', key))
         self.assertTrue(log)
         self.assertNotIn(secret, log)
+        processes = subprocess.run(['ps', '-axww', '-o', 'command='], capture_output=True, text=True, check=True).stdout
+        self.assertFalse(secret in processes, '进程参数暴露了 API key')
+        panes = subprocess.run(['tmux', '-L', self.socket, 'list-panes', '-a', '-F', '#{pane_start_command}'],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertFalse(secret in panes, 'tmux 启动命令暴露了 API key')
         self.assertEqual(studio.meta_get(self.conn, f'camacct:{cam["id"]}'), account['id'])
         runtime = studio.codex_acct_home(account)
         self.assertEqual(cfgfile.read_json(runtime / 'auth.json')['auth_mode'], 'apikey')
         self.assertEqual(studio.codex_acct_quota(account)['billing'], 'usage')
+
+    def test_api_health_restores_failed_status_and_populates_cache(self):
+        acct.HTTP = lambda *args, **kwargs: (200, {'data': [{'id': 'model-a'}]})
+        a = self.p.add('codex', kind='api', source='api', status='refresh_failed', last_check=time.time(),
+                       base_url='https://example.test/v1', credentials={'OPENAI_API_KEY': 'fixture-secret'})
+        studio._API_MODELS.pop(a['id'], None)
+        self.addCleanup(studio._API_MODELS.pop, a['id'], None)
+        self.assertEqual(acct.pick(self.p.view('codex'), default_id=self.local['id'])[0]['id'], self.local['id'])
+        studio.accounts_check(only=a['id'])
+        self.assertEqual(self.p.get(a['id'])['status'], 'ok')
+        self.assertEqual(studio._API_MODELS[a['id']], ['model-a'])
+        self.assertNotEqual(acct.pick(self.p.view('codex'), default_id=self.local['id'])[0]['id'], a['id'])
+
+    def test_new_session_preferences_can_be_deferred(self):
+        a = self.p.add('codex', kind='api', source='api', status='ok', base_url='https://example.test/v1',
+                       credentials={'OPENAI_API_KEY': 'fixture-secret'})
+        f, key, cam = studio.pitch(self.conn, 'builda', 'defer-test', '需求')
+        result = studio.set_pref(self.conn, f'builda/{key}', defer=True, xacct=a['id'], xmodel='gpt-5.4-mini')
+        self.assertIn('下次启动', result)
+        prefs = studio.get_pref(self.conn, f'builda/{key}')
+        self.assertEqual((prefs['xacct'], prefs['xmodel']), (a['id'], 'gpt-5.4-mini'))
 
     def test_launch_picks_account_home(self):
         rollout(studio.HOME / 'codex-home', '0199aaaa-0001', 80, 30)        # 本机号用了 80%

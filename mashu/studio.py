@@ -2046,14 +2046,15 @@ def accounts_check(force=False, only=None):
             continue
         if a.get('disabled') and not force:
             continue
-        if not force and time.time() - (a.get('last_check') or 0) < (600 if a['platform'] == 'gemini' else 1800):
+        if (not force and not (a.get('kind') == 'api' and a['id'] not in _API_MODELS)
+                and time.time() - (a.get('last_check') or 0) < (600 if a['platform'] == 'gemini' else 1800)):
             continue
         try:
             if a.get('kind') == 'api':
                 models = acct.api_models(a.get('base_url'), (a.get('credentials') or {}).get('OPENAI_API_KEY', ''))
                 _API_MODELS[a['id']] = models
                 p.update(a['id'], status='ok', error='', last_check=time.time())
-                res.append((a['id'], '正常（按量）'))
+                res.append((a['id'], 'ok（按量）'))
                 continue
             if a['platform'] == 'gemini':
                 if a.get('status') == 'revoked' and not force:
@@ -2088,6 +2089,8 @@ def accounts_check(force=False, only=None):
             res.append((a['id'], f'已撤销：{exc}'))
         except acct.AccountError as exc:
             if a['platform'] == 'codex':
+                if a.get('kind') == 'api':
+                    _API_MODELS.setdefault(a['id'], [])
                 p.update(a['id'], status='refresh_failed', error=str(exc), last_check=time.time())
             res.append((a['id'], f'失败：{exc}'))
         except Exception as exc:     # 体检出错不能挡调度器
@@ -2387,6 +2390,7 @@ def account_action(action, data=None):
         if accounts_in_use().get(aid):
             raise ValueError(f'{account_label(a)} 正在被会话使用，等会话结束再删')
         p.remove(aid)
+        _API_MODELS.pop(aid, None)
         _ACCT_Q.clear()
         _LIMITS_CACHE['at'] = 0
         return dict(result=f'已删除 {account_label(a)}' + ('（只是取消登记，~/.codex 里你自己的登录不动）' if a.get('source') == 'local' and a['platform'] == 'codex' else ''))
@@ -5132,7 +5136,7 @@ def code_mode_of(conn, sid):
     return bool(sid) and meta_get(conn, f'codemode:{sid}') == '1'
 
 
-def set_pref(conn, channel, **kw):
+def set_pref(conn, channel, defer=False, **kw):
     p = get_pref(conn, channel)
     for prov, k in ACCT_KEY.items():     # 账号池：指定这个对话用哪个号（空 = 自动），只对新会话生效，不触发重开
         if kw.get(k) is None:
@@ -5188,6 +5192,8 @@ def set_pref(conn, channel, **kw):
         else:
             p.pop(k, None)
     meta_set(conn, f'pref:{channel}', json.dumps(p, ensure_ascii=False))
+    if defer:
+        return '已记下，下次启动生效'
     c = camera_of_channel(conn, channel)
     if not c or c['state'] not in LIVE or c['pane'] not in alive_panes():
         return '已记下，下次启动生效'

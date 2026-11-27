@@ -504,6 +504,9 @@ class Handler(BaseHTTPRequestHandler):
         if action == 'handoff':
             return studio.request_handoff(conn, studio.camera_of_channel(conn, data.get('channel') or 'assistant'))
         if action == 'new-session':
+            if 'xacct' in data or 'xmodel' in data:
+                studio.set_pref(conn, data.get('channel') or 'assistant', defer=True,
+                                xacct=data.get('xacct'), xmodel=data.get('xmodel'))
             return studio.fresh_session(conn, data.get('channel') or 'assistant')
         if action == 'defaults':
             return studio.set_defaults(conn, models=data.get('models'), efforts=data.get('efforts'), codes=data.get('codes'),

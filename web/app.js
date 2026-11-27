@@ -910,7 +910,7 @@ document.addEventListener('change', (ev) => {
     const m = box.querySelector('[data-kick-model]'); if (m) m.innerHTML = kickModelOpts(s.value, '');
     const a = box.querySelector('[data-kick-acct]'); if (a) { a.innerHTML = acctOpts(s.value, ''); a.hidden = !(ACCT_PREF[s.value] && cliAccts(s.value).length); }
   }
-  if (s.dataset.kickAcct) { const m = box.querySelector('[data-kick-model]'); if (m) m.innerHTML = kickModelOpts(box.querySelector('[data-kick-cli]').value, m.value, s.value); }
+  if (s.dataset.kickAcct) { const m = box.querySelector('[data-kick-model]'), prov = box.querySelector('[data-kick-cli]').value; if (m) m.innerHTML = kickModelOpts(prov, modelsFor(prov, s.value).includes(m.value) ? m.value : '', s.value); }
   kickSel[box.dataset.kick] = kickExecOf(box.dataset.kick, box.parentElement);
 });
 function muteBtn(r) { return `<button class="btn ghost mute" data-mute="${r.id}" title="静默：不处理这件事、不叫醒任何人，维持现状">${icon('moon', 13)}静默</button>`; }
@@ -2473,11 +2473,13 @@ async function sessAction(btn) {
   const kind = btn.dataset.sess;
   if (kind === 'new-session' && chProvider(current) === 'codex' && cliAccts('codex').length) {
     const ch = current, selected = ((state.prefs || {})[ch] || {}).xacct || '';
-    openModal(`<h2>新会话</h2><div class="form api-form"><p>新会话不会带上当前对话上下文。</p><label>Codex 账号<select id="newSessionAccount">${acctOpts('codex', selected)}</select></label><div class="api-actions"><button class="btn" data-close>取消</button><button class="btn primary" id="newSessionGo">开始新会话</button></div></div>`);
+    const model = ((state.prefs || {})[ch] || {}).xmodel || '';
+    openModal(`<h2>新会话</h2><div class="form api-form"><p>新会话不会带上当前对话上下文。</p><label>Codex 账号<select id="newSessionAccount">${acctOpts('codex', selected)}</select></label><label>模型<select id="newSessionModel">${kickModelOpts('codex', model, selected)}</select></label><div class="api-actions"><button class="btn" data-close>取消</button><button class="btn primary" id="newSessionGo">开始新会话</button></div></div>`);
     $('#modalBox').classList.add('api-dialog');
+    $('#newSessionAccount').onchange = (ev) => { const m = $('#newSessionModel'); m.innerHTML = kickModelOpts('codex', modelsFor('codex', ev.target.value).includes(m.value) ? m.value : '', ev.target.value); };
     $('#newSessionGo').onclick = async () => {
       const button = $('#newSessionGo'); button.disabled = true;
-      try { await api('/api/camera', { action: 'pref', channel: ch, xacct: $('#newSessionAccount').value }); await api('/api/camera', { action: 'new-session', channel: ch }); closeModal(); await refresh(); }
+      try { await api('/api/camera', { action: 'new-session', channel: ch, xacct: $('#newSessionAccount').value, xmodel: $('#newSessionModel').value }); closeModal(); await refresh(); }
       catch (e) { toast(e.message); button.disabled = false; }
     };
     return;
