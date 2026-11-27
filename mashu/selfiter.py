@@ -16,7 +16,7 @@ import traceback
 import studio
 from studio import cfg, one, rows
 
-for _k, _v in dict(self_iterate_enabled=True, self_iterate_time='03:00', self_iterate_model='claude-haiku-5-5',
+for _k, _v in dict(self_iterate_enabled=True, self_iterate_time='03:00', self_iterate_model='claude-sonnet-5-5',
                    self_iterate_hours=24, self_iterate_max_chars=80000, self_iterate_budget_usd=1.0,
                    self_iterate_timeout_minutes=15).items():
     studio.DEFAULTS.setdefault(_k, _v)
@@ -163,12 +163,11 @@ def sec_sessions(conn, since, since_iso):
         f = studio.film(conn, c['film_id']) if c['film_id'] else None
         where = (f['title'] if f else c['film_id'] or '全局') + (f' #{studio.seq_num(c["seq_key"])}' if c['seq_key'] else '')
         role = studio.LEVEL_LABEL.get(c['role'], c['role']) + (f'·{c["crew_role"]} 阶段{c["stage_no"]}' if c['crew_role'] else '')
-        end = c['last_active'] or c['started_at'] or 0
         tokens = sum(c[k] or 0 for k in ('tokens_in', 'tokens_out', 'cache_read', 'cache_write'))
         out.append(f'\n### #{c["id"]}「{c["name"]}」{role} · {where}')
         out.append(f'- 状态：{c["state"]}' + (f'，结束原因 {c["ended_reason"]}' if c['ended_reason'] else '')
                    + (f'，交接原因 {clip(c["wrap_reason"], 120)}' if c['wrap_reason'] else '')
-                   + f'；开始 {hm(c["started_at"])}，时长 {max(0, end - (c["started_at"] or end)) / 60:.0f} 分钟'
+                   + f'；开始 {hm(c["started_at"])}，时长 {studio.camera_minutes(c) or 0:.0f} 分钟'
                    + f'；token {tokens:,}' + (f'，上下文 {c["context_pct"]:.0%}' if c['context_pct'] else '')
                    + (f'，模型 {c["model"]}' if c['model'] else '') + (f'；由 {c["last_from"]} 唤起' if c['last_from'] else ''))
         out.append('- 目的：' + clip((c['prompt'] or '').replace('\n', ' '), 300))

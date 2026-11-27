@@ -4,7 +4,7 @@ km_type: workflow
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-24
+last_verified: 2026-11-27
 source_of_truth:
   - mashu/studio.py
   - mashu/server.py
@@ -46,6 +46,17 @@ related:
 - 子脑维护本项目的全部资料，包括工作流和行为模板，直接改、直接提交，不用先报主脑。每次改动都有版本号，并记进决策记录，用户推翻就自动回滚。
 - 改麻薯通用模板、麻薯记忆、麻薯知识地图：`mashu report` 交给主脑。
 - 执行者不改工作流和模板，有建议 `mashu tell` 给子脑。
+
+## 新工程登记（主脑）
+
+1. 建工作区目录、克隆仓库；工作区本身也要记事时 `git init`，用 `.gitignore` 排除各工程仓库。
+2. 先把克隆下来缺的东西补齐再判断「能不能跑」：依赖（`npm ci` 等）、不进 git 的工具链产物（如 Builda SDK：`./.builda-agent/builda check` 后 `builda sdk install`）。缺 SDK 时类型检查会报找不到模块，不是代码坏了。
+3. 留意会自己改跟踪文件的工具：`builda check` 会把项目里的 Builda CLI 升到最新版，克隆后立刻出现 `.builda-agent/` 改动。这类改动单独提交或请用户定，不混进功能提交；SDK 版本是锁定的，只在用户要求时升级。
+4. `mashu add-project <路径> --title …`，再补 `.mashu/README.md`、`rules.md`、`check.sh`（跑 docs 验证和工程自检，失败行带 ERROR）、`hotspots.txt`，跑一遍 `check.sh` 确认通过。
+5. 用 caesar-docs 建或接上知识地图；多工程工作区用两级地图：工作区只放工程目录和跨工程约束，各工程保留自己的地图和六技能副本。
+6. `mashu decide` 记一笔，进度写进项目的 `producer-notes.md`。
+
+依据：2026-11-26 建 caesar_games（克隆 caesar_engine 后 tsc 报找不到 builda-sdk；builda check 把 CLI 从 0.4.156 升到 0.4.171）。
 
 ## 项目文档（docs/）
 
@@ -178,6 +189,7 @@ related:
 | 函数 | 什么时候调 | 返回 |
 | --- | --- | --- |
 | `on_new(ctx, feature)` | 开功能后、派执行者前 | 要并进 state.json 的字段，例如 `{"workdir": "issues/1069-ticket", "adapter": {...}}`；`workdir` 必须是工程里已存在的子目录 |
+| `kickoff_confirmed(ctx, feature)` | 子脑 / 主脑开功能、发开工审批卡前 | `{"confirmed": true, "ref": "#1153/req/2", "who": "…"}` = 方案已在项目系统里由用户确认，跳过开工审批卡直接开工；`None` 照常发卡。只在用户本人确认过时返回 confirmed |
 | `launch_env(ctx, feature, session)` | 启动执行者 | 追加的环境变量（不能改 `MASHU_*`、`PATH`）。`session["resume"]` 为真时 `session["env"]` 是这个会话上次的值，恢复会话要沿用 |
 | `launch_prompt(ctx, feature)` | 启动执行者 | 系统提示附加文本；或 `{"text": …, "replace": true, "first": …}`：`replace` 换掉默认的「怎么做」一节，`first` 接在开场「继续 …」后面 |
 | `pretool(ctx, feature, tool, input, risky)` | 执行者每次调工具（在麻薯自己的 git 规矩、写文件检查之后） | `None` 没意见（照麻薯的闸门）；字符串 = 拒绝原因；`True` = 适配器担保放行，跳过麻薯的 prod 审批（不可逆操作照样要用户审批）。`risky` 是麻薯的判定 `[闸门, 说明]` 或 `None`。hook 只有 10 秒，外部调用要更短 |

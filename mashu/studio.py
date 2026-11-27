@@ -291,13 +291,22 @@ def stop_reason_of(reason, detail):
             'exited': 'lost', 'handoff-forced': 'context'}.get(reason, reason)
 
 
+def camera_minutes(c):
+    """会话时长（分钟）：开始到最后一次活动；活动取收到消息（last_active）和干完一轮（last_stop）里较晚的。
+    只看 last_active 会把「收到一条指令后自己干几分钟就交班」的会话算成 0 分钟（自迭代 11-26 #22）。"""
+    if not c['started_at']:
+        return None
+    end = max(c['last_active'] or 0, c['last_stop'] or 0, c['started_at'])
+    return (end - c['started_at']) / 60
+
+
 def log_session_end(conn, cid, reason, detail=None):
     """会话结束：一行汇总，自迭代据此算各角色的时长、token、费用、结束原因分布。"""
     try:
         c = camera(conn, cid)
         if not c:
             return
-        dur = max(0, (c['last_active'] or c['started_at'] or 0) - (c['started_at'] or 0)) / 60 if c['started_at'] else None
+        dur = camera_minutes(c)
         log_event(conn, 'session-end', c, level='warn' if reason in ('exited', 'handoff-forced') else 'info',
                   value=round(dur, 1) if dur is not None else None, reason=reason, stop_reason=stop_reason_of(reason, detail),
                   detail=detail, name=c['name'], crew_role=c['crew_role'],
@@ -1343,7 +1352,15 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
             else '直接做，不分阶段')
     notice(conn, channel, f'{seq_label(f, key)}已创建：{title or slug}。{flow}。')
     post(conn, 'system', channel, 'brief', brief)
-    if by:
+    pre = adapter_call(conn, f, 'kickoff_confirmed', feature_view(conn, f, key)) if by else None
+    if by and isinstance(pre, dict) and pre.get('confirmed'):
+        # 方案已在项目自己的系统（如工单）里由用户确认过：不再发一张重复的开工审批卡（自迭代 11-25 #11）
+        where = pre.get('ref') or '项目系统'
+        grant_kickoff(conn, f, key, f'项目已确认（{where}）')
+        add_note = f'方案已在 {where} 确认' + (f'（{pre["who"]}）' if pre.get('who') else '') + '，跳过开工审批，直接开工'
+        notice(conn, f['id'], f'{LEVEL_LABEL.get(by["role"], by["role"])}「{by["name"]}」开了#{num}：{title or slug}；{add_note}')
+        notice(conn, channel, add_note)
+    elif by:
         notice(conn, f['id'], f'{LEVEL_LABEL.get(by["role"], by["role"])}「{by["name"]}」开了#{num}：{title or slug}，等用户批准开工')
         ex = kickoff_exec(conn, f, key)
         text = (f'申请开工 {seq_label(f, key)}：{title or slug}\n\n执行者：{exec_label(ex["cli"], ex["model"], ex["effort"])}\n\n需求：{brief}'
@@ -4108,9 +4125,11 @@ def crew_linger_guard(conn):
         if c['last_stop'] < c['last_active']:
             continue
         f = film(conn, c['film_id'])
-        if f and not seq_done(seq_state(f, c['seq_key'])):
+        data = seq_state(f, c['seq_key']) if f else None
+        # 归档优先：没做完就归档的功能（暂停、并入别的功能）也要放掉执行者，否则一直占着并发槽（11-27 麻薯 #6/#10）
+        archived = bool(f) and seq_flag(conn, f, c['seq_key'], 'archive', data)
+        if f and not archived and not seq_done(data):
             continue
-        archived = f and meta_get(conn, f'archive:{f["id"]}/{c["seq_key"]}')
         yield_ = c['film_id'] in queued or (queued and crew_by_account(conn).get(cam_account_key(conn, c), 0) >= cfg('stages'))   # 有新功能在排队就让位
         if not f or archived or yield_ or time.time() - c['last_stop'] > limit:
             why = '功能已归档' if archived else '让位给排队的新功能' if yield_ else f'完成后空闲超过 {limit / 60:g} 分钟'
@@ -7188,7 +7207,7 @@ def cmd_callsheet(args):
             crew = s['crew']
             who = f'{crew["crew_role"]}「{crew["name"]}」' if crew else '无执行者'
             print(f'  - #{s["num"]} {s["key"]}：{s["title"]}｜' + (f'{names.get(s["account"], s["account"])}｜' if names and s['account'] else '') +
-                  (f'阶段 {st["id"]} {st["name"]}·{st["status"]}' if st else s['status_label']) + f'｜{s["status_label"]}｜{who}' +
+                  (f'阶段 {st["id"]} {st["name"]}·{st["status"]}｜' if st and s['status'] != 'archived' else '') + f'{s["status_label"]}｜{who}' +
                   (f'｜阻塞：{s["blocker"]}' if s['blocker'] else '') +
                   (f'｜下一镜：{s["handoff"].get("next")}' if s['handoff'].get('next') else ''))
         if not f['sequences']:

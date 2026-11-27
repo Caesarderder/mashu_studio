@@ -50,7 +50,7 @@ related:
 | Claude / Gemini / Codex / OpenCode 怎么接、hooks 怎么注入、会话记录在哪、已知限制 | [平台说明](../references/platforms.md) |
 | 改麻薯的记忆 | [记忆索引](../memory/index.md)（记忆文件也是 docs 节点，保留 frontmatter，只改正文） |
 | 改提示词 / 调度器 | `mashu/prompts/`（只放身份 + 入口）、`mashu/studio.py` |
-| 项目的文档、工作流模板、行为模板、项目笔记怎么做、放哪 | [项目资料制作规范](../workflows/project-assets.md) |
+| 登记新工程；项目的文档、工作流模板、行为模板、项目笔记怎么做、放哪 | [项目资料制作规范](../workflows/project-assets.md) |
 | 工作流模板、每个阶段的行为模板 | 通用模板在麻薯 `playbooks/*.json`；只给某个项目用的工作流和行为模板放在那个工程里：`<工程>/.mashu/playbooks/*.json` + `behaviors/`（`do` 首句指向它；开功能时先找本项目的，`mashu playbook list` 全列出来）。项目数据一律放在工程文件夹内部 |
 
 

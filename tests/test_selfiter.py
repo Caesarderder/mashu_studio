@@ -20,8 +20,8 @@ for a in "$@"; do printf 'ARG:%s\\n' "$a" >> "$d/args"; done
 printf 'SESSION=%s\\n' "$MASHU_SESSION" >> "$d/args"
 cat > "$d/stdin"
 [ -n "$FAKE_SI_SLEEP" ] && sleep "$FAKE_SI_SLEEP"
-echo '[claude-code:unrecognized_model] {"model":"claude-haiku-5-5","query_source":"sdk"}' >&2
-echo 'Warning: model claude-haiku-5-5 not in catalog, assuming 200k context'
+echo '[claude-code:unrecognized_model] {"model":"claude-sonnet-5-5","query_source":"sdk"}' >&2
+echo 'Warning: model claude-sonnet-5-5 not in catalog, assuming 200k context'
 if [ -f "$d/raw" ]; then cat "$d/raw"; else
 python3 - "$d/result" "${FAKE_SI_ERROR:-}" <<'EOF'
 import json, sys
@@ -30,7 +30,7 @@ print(json.dumps({'type': 'result', 'subtype': 'error_max_budget_usd' if err els
                   'result': '' if err else open(sys.argv[1]).read(), 'total_cost_usd': 0.0123,
                   'usage': {'input_tokens': 1000, 'output_tokens': 200, 'cache_read_input_tokens': 30,
                             'cache_creation_input_tokens': 40},
-                  'modelUsage': {'claude-haiku-5-5': {}}}))
+                  'modelUsage': {'claude-sonnet-5-5': {}}}))
 EOF
 fi
 exit ${FAKE_SI_CODE:-0}
@@ -250,7 +250,7 @@ class TestCall(SelfIterBase):
         args = (self.si / 'args').read_text().splitlines()
         argv = [x[4:] for x in args if x.startswith('ARG:')]
         self.assertEqual(argv[0], '-p')
-        for a, b in (('--model', 'claude-haiku-5-5'), ('--output-format', 'json'), ('--tools', ''), ('--max-budget-usd', '1.0')):
+        for a, b in (('--model', 'claude-sonnet-5-5'), ('--output-format', 'json'), ('--tools', ''), ('--max-budget-usd', '1.0')):
             self.assertEqual(argv[argv.index(a) + 1], b)
         for a in ('--no-session-persistence', '--strict-mcp-config', '--system-prompt'):
             self.assertIn(a, argv)
@@ -268,7 +268,7 @@ class TestCall(SelfIterBase):
     def test_ac7_warning_ignored(self):
         res, err = selfiter.parse_cli_output(
             'Warning: model not in catalog\n{"type":"result","subtype":"success","is_error":false,"result":"{}"}\n',
-            '[claude-code:unrecognized_model] {"model":"claude-haiku-5-5"}', 0)
+            '[claude-code:unrecognized_model] {"model":"claude-sonnet-5-5"}', 0)
         self.assertIsNone(err)
         self.assertEqual(res['result'], '{}')
         # 多行美化的 JSON 也认
@@ -341,7 +341,7 @@ class TestReport(SelfIterBase):
         self.assertIn(f'#{items[0]["id"]}', (arch / 'report.md').read_text())
         u = studio.rows(self.conn, 'SELECT * FROM usage WHERE role="self-iterate"')
         self.assertEqual(len(u), 1)
-        self.assertEqual((u[0]['tokens_in'], u[0]['tokens_out'], u[0]['cost'], u[0]['model']), (1000, 200, 0.0123, 'claude-haiku-5-5'))
+        self.assertEqual((u[0]['tokens_in'], u[0]['tokens_out'], u[0]['cost'], u[0]['model']), (1000, 200, 0.0123, 'claude-sonnet-5-5'))
         self.assertEqual((r['tokens_in'], r['cache_read'], r['cache_write']), (1000, 30, 40))
         self.assertTrue(studio.rows(self.conn, 'SELECT * FROM messages WHERE target="web" AND text LIKE "%自迭代报告%好了%"'))
         self.assertIn(f'#{items[0]["id"]}', out)
