@@ -14,6 +14,12 @@ SESSION="${MASHU_TMUX:-mashu-studio}"
 PORT="${MASHU_PORT:-8770}"
 URL="http://127.0.0.1:${PORT}/"
 HOME_DIR="${MASHU_HOME:-$ROOT/state}"
+case "$HOME_DIR" in
+  "$ROOT/state/runtime"|"$ROOT/state/runtime/"*)
+    # 继承了指向运行快照里的数据目录（旧快照起的进程带出来的）：改回真正的 state/，否则会读到空库
+    echo "忽略错误的 MASHU_HOME=$HOME_DIR，改用 $ROOT/state"
+    HOME_DIR="$ROOT/state" ;;
+esac
 STOPPED="$HOME_DIR/.stopped"   # 手动 stop 留下的标记，自动启动看到它就不拉起
 LABEL="${MASHU_LAUNCHD_LABEL:-com.mashu-studio}"   # launchd 标签；旧版装过的自动启动沿用旧标签
 for _old in "$HOME"/Library/LaunchAgents/com.*.mashu-studio.plist; do

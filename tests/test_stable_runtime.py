@@ -580,3 +580,45 @@ class TestStableRuntime(StableRuntimeBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRuntimeDataDirGuard(StableRuntimeBase):
+    """2026-11-27 事故：网页「重启服务」把快照切到 #17 之前的旧提交，旧代码把数据目录认成 state/runtime/state，新建空库。"""
+
+    def _legacy_commit(self):
+        _git(self.repo, 'checkout', '-q', '-b', 'legacy-base')
+        (self.repo / 'mashu' / 'studio.py').write_text(
+            'from pathlib import Path\nCODE = Path(__file__).resolve().parent.parent\nHOME = CODE / "state"\n')
+        (self.repo / 'mashu' / 'server.py').write_text('# legacy server\n')
+        legacy = _commit_all(self.repo, 'legacy pre-17')
+        _git(self.repo, 'checkout', '-q', 'main')
+        return legacy
+
+    def test_release_and_rollback_refuse_legacy_commit(self):
+        legacy = self._legacy_commit()
+        studio.release_runtime(self.conn, actor='executive', restart_fn=lambda: None)
+        with self.assertRaises(studio.MashuError) as cm:
+            studio.release_runtime(self.conn, sha=legacy, actor='executive', restart_fn=lambda: None)
+        self.assertEqual(cm.exception.code, 'runtime_incompatible')
+        # 上一版记录指向旧提交时，回滚也必须拒绝，快照保持不变
+        meta = studio.read_runtime_meta()
+        meta['prev_sha'] = legacy
+        studio.write_runtime_meta(meta)
+        restarts = []
+        with self.assertRaises(studio.MashuError) as cm2:
+            studio.release_runtime(self.conn, rollback=True, actor='executive', restart_fn=lambda: restarts.append(1))
+        self.assertEqual(cm2.exception.code, 'runtime_incompatible')
+        self.assertEqual(_git(self.home / 'runtime', 'rev-parse', 'HEAD'), self.v1)
+        self.assertEqual(restarts, [])
+
+    def test_home_inside_runtime_snapshot_is_redirected_to_real_state(self):
+        bad = self.repo / 'state' / 'runtime' / 'state'
+        bad.mkdir(parents=True)
+        env = self._clean_env({'MASHU_HOME': str(bad), 'MASHU_CONTENT': str(self.repo)})
+        r = subprocess.run(
+            [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import studio; print(studio.HOME)',
+             str(self.repo / 'mashu')],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertEqual(Path(r.stdout.strip()).resolve(), (self.repo / 'state').resolve())

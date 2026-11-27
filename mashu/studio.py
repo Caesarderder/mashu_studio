@@ -51,6 +51,11 @@ CONTENT = Path(os.environ.get('MASHU_CONTENT') or (
 PROMPTS = Path(__file__).resolve().parent / 'prompts'
 BIN = CONTENT / 'bin'
 HOME = Path(os.environ.get('MASHU_HOME') or CONTENT / 'state')
+_RUNTIME_SNAPSHOT = (CONTENT / 'state' / 'runtime').resolve()
+if HOME.resolve() == _RUNTIME_SNAPSHOT or _RUNTIME_SNAPSHOT in HOME.resolve().parents:
+    # 数据目录被误指到运行快照里（旧快照或继承了错误的 MASHU_HOME）：一律改回真正的 state/，绝不在快照里新建空库
+    HOME = CONTENT / 'state'
+    os.environ['MASHU_HOME'] = str(HOME)
 
 ASSISTANT_NAME = '麻薯'
 SCHEMA_VERSION = 2
@@ -9467,6 +9472,17 @@ def _checkout_runtime(repo, rdir, target_sha):
              fix='检查 git worktree list 并清理异常目录后重试', exit_code=EXIT_ERR)
 
 
+def _assert_runtime_compatible(repo, target_sha):
+    """目标提交必须支持「从 state/runtime 快照运行」（studio.py 认 MASHU_CONTENT、能定位真正的 state/），否则拒发。
+    旧提交跑在快照里会把数据目录认成 state/runtime/state、新建空库，看上去像数据全丢（2026-11-27 事故）。"""
+    rc, src, _ = _git_output(repo, 'show', f'{target_sha}:mashu/studio.py')
+    rc2, srv, _ = _git_output(repo, 'show', f'{target_sha}:mashu/server.py')
+    if rc != 0 or rc2 != 0 or 'MASHU_CONTENT' not in src or 'release_runtime' not in srv \
+            or "CODE.name == 'runtime'" not in src:
+        fail('runtime_incompatible', f'提交 {target_sha[:7]} 太旧，不支持从运行快照启动（会读到空数据目录）',
+             fix='发布 HEAD 或 #17 stable-runtime（59d21ba）之后的提交', exit_code=EXIT_RULE)
+
+
 def _run_release_check(repo, target_sha):
     import tempfile
     tmp_root = Path(tempfile.mkdtemp(prefix='mashu-release-check-')).resolve()
@@ -9537,6 +9553,8 @@ def release_runtime(conn, *, sha=None, rollback=False, same=False, dry_run=False
 
             if same:
                 info = runtime_info()
+                if info.get('sha') and is_git(repo):
+                    _assert_runtime_compatible(repo, info['sha'])
                 if dry_run:
                     return dict(mode='same', dry_run=True, sha=info['sha'], prev_sha=meta.get('prev_sha') or '',
                                 restarting=False, reason=reason or '')
@@ -9559,6 +9577,7 @@ def release_runtime(conn, *, sha=None, rollback=False, same=False, dry_run=False
                 if rc != 0 or not target_sha:
                     fail('invalid_sha', f'上一个发布版本不存在：{prev}（{err}）',
                          fix='使用 mashu release --sha <提交> 指定可用提交', exit_code=EXIT_NOT_FOUND)
+                _assert_runtime_compatible(repo, target_sha)
                 if dry_run:
                     return dict(mode='rollback', dry_run=True, sha=target_sha, prev_sha=cur_sha,
                                 check_skipped=True, restarting=False, reason=reason or '')
@@ -9581,6 +9600,7 @@ def release_runtime(conn, *, sha=None, rollback=False, same=False, dry_run=False
             if rc != 0 or not target_sha:
                 fail('invalid_sha', f'找不到提交：{ref}' + (f'（{err}）' if err else ''),
                      fix='检查提交号后重试，例如 git log -n 5 --oneline', exit_code=EXIT_NOT_FOUND)
+            _assert_runtime_compatible(repo, target_sha)
             chk = _run_release_check(repo, target_sha)
             if dry_run:
                 return dict(mode='release', dry_run=True, sha=target_sha, prev_sha=cur_sha,
