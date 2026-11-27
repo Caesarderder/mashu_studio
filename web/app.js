@@ -594,7 +594,10 @@ function geminiAgeLabel(at, force = false) {
   return mins >= 60 ? `${Math.floor(mins / 60)}h前` : `${mins}分前`;
 }
 function geminiQuotaTip(q, err = '') {
-  const lines = ((q && q.models) || []).map((m) => `${m.name} 剩 ${Math.round(m.remaining * 100)}%${m.reset ? `（${resetText(m.reset)}）` : ''}`);
+  const lines = ((q && q.models) || []).map((m) => {
+    const r = Math.round(m.remaining * 100), u = 100 - r;
+    return `${m.name} 已用 ${u}%（剩 ${r}%）${m.reset ? `，${resetText(m.reset)}` : ''}`;
+  });
   if (q && q.at) {
     const mins = Math.max(0, Math.round((Date.now() / 1000 - q.at) / 60));
     if (mins >= 1) lines.push(`更新于 ${mins} 分钟前`);
@@ -673,23 +676,36 @@ function slotCellsHtml(used, max, tip = '') {
   for (let i = 0; i < cap; i++) cells += `<i class="${i < fill ? 'on' : ''}"></i>`;
   return `<span class="qf-slots" title="${esc(tip || `在跑执行者 ${used}/${max}`)}"><span class="qf-cells">${cells}</span><span class="qf-sc">${used}/${max}</span></span>`;
 }
-function qfBarUsed(lbl, w, titlePrefix) {
-  if (!w || w.used_percentage == null) return `<span class="qf-w dim"><i class="qf-wl">${lbl}</i><span class="qf-na">-</span></span>`;
-  const used = Math.max(0, Math.min(100, Math.round(Number(w.used_percentage))));
+function nearestResetTs(...vals) {
+  let best = null;
+  const now = Date.now();
+  for (const v of vals) {
+    if (!v) continue;
+    const t = typeof v === 'number' ? (v > 1e12 ? v : v * 1000) : Date.parse(v);
+    if (!Number.isFinite(t) || t <= 86400000) continue;
+    if (best == null || Math.abs(t - now) < Math.abs(best - now)) best = t;
+  }
+  return best ? best / 1000 : null;
+}
+function qfNearestResetHtml(...vals) {
+  const ts = nearestResetTs(...vals);
+  if (!ts) return '';
+  return `<i class="qf-rt" title="最近重置：${esc(resetText(ts))}">${esc(resetCompact(ts))}</i>`;
+}
+function qfBarPct(lbl, usedRaw, resetTs, titlePrefix) {
+  if (usedRaw == null) return `<span class="qf-w dim"><i class="qf-wl">${lbl}</i><span class="qf-na">-</span></span>`;
+  const used = Math.max(0, Math.min(100, Math.round(Number(usedRaw))));
   const rem = 100 - used;
   const cls = quotaRemTone(rem);
-  const rst = w.resets_at ? resetCompact(w.resets_at) : '';
-  const tip = `${titlePrefix} ${lbl === '5h' ? '5 小时' : '每周'}已用 ${used}%（剩 ${rem}%）${w.resets_at ? `，${resetText(w.resets_at)}` : ''}`;
-  return `<span class="qf-w ${cls}" title="${esc(tip)}"><i class="qf-wl">${lbl}</i><i class="qf-bar"><i style="width:${used}%"></i></i><b>${used}%</b>${rst ? `<i class="qf-rt">${rst}</i>` : ''}</span>`;
+  const tip = `${titlePrefix} ${lbl === '5h' ? '5 小时' : '每周'}已用 ${used}%（剩 ${rem}%）${resetTs ? `，${resetText(resetTs)}` : ''}`;
+  return `<span class="qf-w ${cls}" title="${esc(tip)}"><i class="qf-wl">${lbl}</i><i class="qf-bar"><i style="width:${used}%"></i></i><b>${used}%</b></span>`;
 }
-function qfBarRem(lbl, b, titlePrefix) {
-  if (!b || b.remaining == null) return `<span class="qf-w dim"><i class="qf-wl">${lbl}</i><span class="qf-na">-</span></span>`;
-  const rem = Math.max(0, Math.min(100, Math.round(Number(b.remaining) * 100)));
-  const used = 100 - rem;
-  const cls = quotaRemTone(rem);
-  const rst = b.reset ? resetCompact(b.reset) : '';
-  const tip = `${titlePrefix} ${lbl === '5h' ? '5 小时' : '每周'}剩 ${rem}%（已用 ${used}%）${b.reset ? `，${resetText(b.reset)}` : ''}`;
-  return `<span class="qf-w ${cls}" title="${esc(tip)}"><i class="qf-wl">${lbl}</i><i class="qf-bar"><i style="width:${rem}%"></i></i><b>剩${rem}%</b>${rst ? `<i class="qf-rt">${rst}</i>` : ''}</span>`;
+function qfBarUsed(lbl, w, titlePrefix) {
+  return qfBarPct(lbl, w && w.used_percentage != null ? w.used_percentage : null, w && w.resets_at, titlePrefix);
+}
+function qfBarGemini(lbl, b, titlePrefix) {
+  const used = b && b.remaining != null ? (1 - Number(b.remaining)) * 100 : null;
+  return qfBarPct(lbl, used, b && b.reset, titlePrefix);
 }
 function qfBarCost(lbl, amount, refMax, tip) {
   const v = Number(amount || 0);
@@ -739,7 +755,7 @@ function renderClaudeCard(data) {
     data.at ? `更新于 ${quotaAgeLong(data.at)}` : '',
     '点击查看完整详情',
   ].filter(Boolean).join('\n');
-  const body = `<div class="qf-row">${qfBarUsed('5h', f5, 'Claude')}${qfBarUsed('周', fw, 'Claude')}</div>`;
+  const body = `<div class="qf-row">${qfBarUsed('5h', f5, 'Claude')}${qfBarUsed('周', fw, 'Claude')}${qfNearestResetHtml(f5 && f5.resets_at, fw && fw.resets_at)}</div>`;
   const mini = `<span class="qf-w ${quotaRemTone(100 - worstUsed)}"><i class="qf-bar"><i style="width:${worstUsed}%"></i></i><b>${p5 != null ? `5h ${p5}%` : ''}${p5 != null && pw != null ? ' · ' : ''}${pw != null ? `周 ${pw}%` : ''}</b></span>`;
   return qfCard('claude', 'Claude', slots, age, data.at ? `更新于 ${quotaAgeLong(data.at)}` : '', body, mini, tip);
 }
@@ -773,7 +789,7 @@ function renderCodexCard(data) {
       if (!has) return `<div class="qf-row">${lbl}<span class="qf-empty">等会话报上来</span></div>`;
       const u = Math.max(f5?.used_percentage ?? 0, fw?.used_percentage ?? 0);
       worstUsed = worstUsed == null ? u : Math.max(worstUsed, u);
-      return `<div class="qf-row">${lbl}${qfBarUsed('5h', f5, acctName(a))}${qfBarUsed('周', fw, acctName(a))}</div>`;
+      return `<div class="qf-row">${lbl}${qfBarUsed('5h', f5, acctName(a))}${qfBarUsed('周', fw, acctName(a))}${qfNearestResetHtml(f5 && f5.resets_at, fw && fw.resets_at)}</div>`;
     });
     const tip = `${acctTip({ account: data && data.account, accounts: accList })}${latestAt ? `\n更新于 ${quotaAgeLong(latestAt)}` : ''}\n点击查看全部账号详情`;
     const mini = worstUsed != null
@@ -787,7 +803,7 @@ function renderCodexCard(data) {
     return qfCard('codex', 'Codex', slots, '', '', '<div class="qf-empty">等会话报上来</div>', '<span class="qf-empty">等会话报上来</span>', 'Codex：等会话报上额度（点开看详情）');
   }
   const worstUsed = Math.max(f5?.used_percentage ?? 0, fw?.used_percentage ?? 0);
-  const body = `<div class="qf-row">${qfBarUsed('5h', f5, 'Codex')}${qfBarUsed('周', fw, 'Codex')}</div>`;
+  const body = `<div class="qf-row">${qfBarUsed('5h', f5, 'Codex')}${qfBarUsed('周', fw, 'Codex')}${qfNearestResetHtml(f5 && f5.resets_at, fw && fw.resets_at)}</div>`;
   const mini = `<span class="qf-w ${quotaRemTone(100 - worstUsed)}"><i class="qf-bar"><i style="width:${Math.round(worstUsed)}%"></i></i><b>${Math.round(worstUsed)}%</b></span>`;
   return qfCard('codex', 'Codex', slots, age, latestAt ? `更新于 ${quotaAgeLong(latestAt)}` : '', body, mini, `Codex：点击查看详情`);
 }
@@ -816,18 +832,19 @@ function renderGeminiCard(data) {
       const h5 = g.buckets.find((b) => b.window === '5h') || null;
       const wk = g.buckets.find((b) => b.window === 'weekly') || null;
       const gLabel = g.label || g.name || 'Gemini';
-      rows.push(`<div class="qf-row"><span class="qf-tag" title="${esc(g.description || gLabel)}">${esc(shortGroupLabel(g))}</span>${qfBarRem('5h', h5, gLabel)}${qfBarRem('周', wk, gLabel)}</div>`);
+      rows.push(`<div class="qf-row"><span class="qf-tag" title="${esc(g.description || gLabel)}">${esc(shortGroupLabel(g))}</span>${qfBarGemini('5h', h5, gLabel)}${qfBarGemini('周', wk, gLabel)}${qfNearestResetHtml(h5 && h5.reset, wk && wk.reset)}</div>`);
     }
   } else {
     const w = geminiPrimaryWindows(data);
-    rows.push(`<div class="qf-row">${qfBarRem('5h', w.h5, 'Gemini')}${qfBarRem('周', w.wk, 'Gemini')}</div>`);
+    rows.push(`<div class="qf-row">${qfBarGemini('5h', w.h5, 'Gemini')}${qfBarGemini('周', w.wk, 'Gemini')}${qfNearestResetHtml(w.h5 && w.h5.reset, w.wk && w.wk.reset)}</div>`);
   }
   const minRem = Math.max(0, Math.min(100, Math.round(Number(data.remaining) * 100)));
+  const maxUsed = 100 - minRem;
   const wMain = geminiPrimaryWindows(data);
   const miniTxt = (wMain.h5 || wMain.wk)
-    ? [wMain.h5 ? `5h剩${Math.round(wMain.h5.remaining * 100)}%` : '', wMain.wk ? `周剩${Math.round(wMain.wk.remaining * 100)}%` : ''].filter(Boolean).join(' · ')
-    : `剩${minRem}%`;
-  const mini = `<span class="qf-w ${quotaRemTone(minRem)}"><i class="qf-bar"><i style="width:${minRem}%"></i></i><b>${miniTxt}</b></span>`;
+    ? [wMain.h5 ? `5h ${100 - Math.round(wMain.h5.remaining * 100)}%` : '', wMain.wk ? `周 ${100 - Math.round(wMain.wk.remaining * 100)}%` : ''].filter(Boolean).join(' · ')
+    : `已用 ${maxUsed}%`;
+  const mini = `<span class="qf-w ${quotaRemTone(minRem)}"><i class="qf-bar"><i style="width:${maxUsed}%"></i></i><b>${miniTxt}</b></span>`;
   const tip = `${geminiQuotaTip(data, err)}\n点击查看各模型组完整额度`;
   return qfCard('gemini', 'Gemini', slots, ageTxt, ageTip, rows.join(''), mini, tip);
 }
@@ -869,7 +886,7 @@ function sideFootHtml() {
     renderOpenCodeCard(L.opencode),
   ].join('');
   const tu = todayUsageSummary();
-  const tokTxt = `今日 ${fmtTok(tu.tokens || 0)}${tu.cost ? ` · $${Number(tu.cost).toFixed(2)}` : ''}`;
+  const tokHtml = `今日 <b>${esc(fmtTok(tu.tokens || 0))}</b>${tu.cost ? ` · <b>$${Number(tu.cost).toFixed(2)}</b>` : ''}`;
   const tokTip = `今日 token 总数：${(tu.tokens || 0).toLocaleString()}${tu.cost ? `\n今日费用：$${Number(tu.cost).toFixed(4)}` : ''}`;
   const st = state.stages || { used: 0, max: 5, by_account: [] };
   const byAcct = st.by_account || [];
@@ -878,7 +895,7 @@ function sideFootHtml() {
   const reads = state.reads && state.reads.used ? ` · 只读 ${state.reads.used}/${state.reads.max}` : '';
   return `<div class="qf-wrap">${cards}</div>
     <div class="qf-sum">
-      <span class="qf-st" title="${esc(tokTip)}">${esc(tokTxt)}</span>
+      <span class="qf-st" title="${esc(tokTip)}">${tokHtml}</span>
       <span class="qf-st" title="${esc(execTip)}">执行 <b>${st.used || 0}</b>（每号≤${st.max}）</span>
       <span class="qf-st" title="同时在岗的子脑${reads ? `；${reads.slice(3)}` : ''}">子脑 <b>${desks.used}/${desks.max}</b></span>
     </div>`;
@@ -2429,17 +2446,17 @@ function acctQuota(a) {
     if (w.h5 || w.wk) {
       const parts = [];
       if (w.h5) {
-        const r = Math.round(w.h5.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
-        parts.push(`<span class="q-item ${cls}">5 小时剩 <b>${r}%</b></span>`);
+        const r = Math.round(w.h5.remaining * 100), u = 100 - r, cls = u > 85 ? 'hi' : u >= 70 ? 'mid' : '';
+        parts.push(`<span class="q-item ${cls}" title="5 小时已用 ${u}%（剩 ${r}%）${w.h5.reset ? `，${resetText(w.h5.reset)}` : ''}">5h <b>${u}%</b></span>`);
       }
       if (w.wk) {
-        const r = Math.round(w.wk.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
-        parts.push(`<span class="q-item ${cls}">周剩 <b>${r}%</b></span>`);
+        const r = Math.round(w.wk.remaining * 100), u = 100 - r, cls = u > 85 ? 'hi' : u >= 70 ? 'mid' : '';
+        parts.push(`<span class="q-item ${cls}" title="每周已用 ${u}%（剩 ${r}%）${w.wk.reset ? `，${resetText(w.wk.reset)}` : ''}">周 <b>${u}%</b></span>`);
       }
       return `<span class="q-gm-inline" title="${esc(tip)}">${parts.join('<span class="q-sep">·</span>')}${stale ? `<i class="q-rst">（${esc(stale)}）</i>` : ''}</span>`;
     }
-    const r = Math.round(q.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
-    return `<span class="q-item ${cls}" title="${esc(tip)}">最低剩 <b>${r}%</b>${q.low_model ? ` · ${esc(q.low_model)}` : ''}${stale ? `<i class="q-rst">（${esc(stale)}）</i>` : ''}</span>`;
+    const r = Math.round(q.remaining * 100), u = 100 - r, cls = u > 85 ? 'hi' : u >= 70 ? 'mid' : '';
+    return `<span class="q-item ${cls}" title="${esc(tip)}">已用 <b>${u}%</b>${q.low_model ? ` · ${esc(q.low_model)}` : ''}${stale ? `<i class="q-rst">（${esc(stale)}）</i>` : ''}</span>`;
   }
   const it = (label, w) => {
     if (!w || w.used_percentage == null) return '';
@@ -2494,9 +2511,11 @@ function quotaBars(rows) {
 function geminiQuotaBars(models) {
   return `<div class="vd-q">${models.map((m) => {
     if (m.remaining == null) return `<div class="vd-qr"><span>${esc(m.name)}</span><span class="q-dim vd-unk">额度未知</span></div>`;
-    const r = Math.max(0, Math.min(100, Math.round(m.remaining * 100))), cls = r < 15 ? 'hi' : r <= 30 ? 'mid' : '';
-    const tip = m.reset ? resetText(m.reset) : '';
-    return `<div class="vd-qr" title="${esc(tip || m.name)}"><span>${esc(m.name)}</span><i class="vd-bar ${cls}"><i style="width:${r}%"></i></i><b class="${cls}">剩 ${r}%</b><span class="q-dim">${esc(tip)}</span></div>`;
+    const r = Math.max(0, Math.min(100, Math.round(m.remaining * 100))), u = 100 - r;
+    const cls = u > 85 ? 'hi' : u >= 70 ? 'mid' : '';
+    const rst = m.reset ? resetText(m.reset) : '';
+    const note = rst ? `剩 ${r}% · ${rst}` : `剩 ${r}%`;
+    return `<div class="vd-qr" title="${esc(`${m.name}：已用 ${u}%（剩 ${r}%）${rst ? `，${rst}` : ''}`)}"><span>${esc(m.name)}</span><i class="vd-bar ${cls}"><i style="width:${u}%"></i></i><b class="${cls}">已用 ${u}%</b><span class="q-dim">${esc(note)}</span></div>`;
   }).join('')}</div>`;
 }
 function presetsSectionHtml() {
