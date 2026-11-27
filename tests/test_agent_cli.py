@@ -187,5 +187,123 @@ class AgentCliStage1Tests(Base):
         self.assertEqual(r2['id'], r1['id'])
 
 
+class AgentCliStage2Tests(Base):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo('builda')
+        self.film, _ = studio.greenlight(self.conn, self.repo, 'builda', 'Builda')
+
+    def run_bin(self, cam, *argv, stdin_text=None):
+        env = dict(os.environ, MASHU_HOME=str(studio.HOME), MASHU_MEMORY=str(studio.MEMORY),
+                   MASHU_TMUX_SOCKET=self.socket, MASHU_TMUX='t')
+        if cam:
+            env['MASHU_SESSION'] = str(cam['id'])
+        else:
+            env.pop('MASHU_SESSION', None)
+        return subprocess.run([str(BIN_MASHU), *argv], input=stdin_text, capture_output=True, text=True, env=env)
+
+    def test_ac6_schema_help_and_10_commands_structured_errors(self):
+        """AC6：mashu schema --json 列出全部命令；抽查 ≥10 个命令报错都带 code、error、fix 和准确退出码。"""
+        r = self.run_bin(None, 'schema', '--json')
+        self.assertEqual(r.returncode, 0)
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1)
+        data = json.loads(lines[0])
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['api_version'], 1)
+        names = {c['name'] for c in data['commands']}
+        for must in ('me', 'inbox', 'send', 'reply', 'forward', 'close', 'schema', 'help', 'status', 'stop', 'new-feature'):
+            self.assertIn(must, names)
+        self.assertEqual(set(data['exit_codes'].keys()), {'0', '1', '2', '3', '4', '5', '6'})
+
+        # help 带真实例子
+        rh = self.run_bin(None, 'help', 'send')
+        self.assertEqual(rh.returncode, 0)
+        self.assertIn('示例：', rh.stdout)
+        self.assertIn('mashu send', rh.stdout)
+
+        # 抽查 12 个不同命令报错，全部返回单行 JSON、带 code / error / fix 和正确退出码
+        f, key, crew = studio.pitch(self.conn, 'builda', 'err-case', '测报错', playbook='direct')
+        prod = studio.create_camera(self.conn, 'producer', 'builda', None, 'hi')
+        cases = [
+            (crew, ('send', 'user', '越级', '--json'), studio.EXIT_RULE, 'route_denied'),
+            (crew, ('send', 'nope-proj', '找不到', '--json'), studio.EXIT_NOT_FOUND, 'not_found'),
+            (prod, ('reply', '99999', 'ok', '--json'), studio.EXIT_NOT_FOUND, 'not_found'),
+            (prod, ('forward', '99999', 'user', '意见', '--json'), studio.EXIT_NOT_FOUND, 'not_found'),
+            (prod, ('close', '99999', '--why', '过时', '--json'), studio.EXIT_NOT_FOUND, 'not_found'),
+            (None, ('note', '16', '缺项目前缀', '--json'), studio.EXIT_USAGE, 'invalid_ref'),
+            (None, ('status', 'ghost-proj', '--json'), studio.EXIT_NOT_FOUND, 'not_found'),
+            (prod, ('stop', f'builda/{studio.seq_num(key)}', '--json'), studio.EXIT_USAGE, 'missing_reason'),
+            (None, ('ac', 'pass', 'AC-1', '--ref', f'builda/{studio.seq_num(key)}', '--json'), studio.EXIT_NOT_FOUND, 'not_found'),
+            (None, ('handoff', '--json'), studio.EXIT_RULE, 'session_required'),
+            (None, ('help', 'no-such-cmd', '--json'), studio.EXIT_NOT_FOUND, 'not_found'),
+            (None, ('playbook', 'show', '--json'), studio.EXIT_USAGE, 'usage_error'),
+        ]
+        # 让 crew 处于运行态以便 stop 检查到活跃机位
+        self.conn.execute('UPDATE cameras SET state="running", pane="%1" WHERE id=?', (crew['id'],))
+        self.conn.commit()
+        for cam, argv, want_rc, want_code in cases:
+            res = self.run_bin(cam, *argv)
+            self.assertEqual(res.returncode, want_rc, f'{argv} stdout={res.stdout!r} stderr={res.stderr!r}')
+            out_lines = [ln for ln in res.stdout.splitlines() if ln.strip()]
+            self.assertEqual(len(out_lines), 1, f'{argv} 非单行 JSON：{res.stdout!r}')
+            j = json.loads(out_lines[0])
+            self.assertFalse(j['ok'])
+            self.assertEqual(j['api_version'], 1)
+            self.assertEqual(j['code'], want_code, f'{argv} got {j}')
+            self.assertTrue(j['error'])
+            self.assertTrue(j['fix'])
+
+        # 非 --json 报错输出两行中文（错误： / 下一步：）
+        r_cn = self.run_bin(None, 'note', '16', 'hi')
+        self.assertEqual(r_cn.returncode, studio.EXIT_USAGE)
+        self.assertIn('错误：', r_cn.stderr)
+        self.assertIn('下一步：', r_cn.stderr)
+
+    def test_ac7_confirmation_envelopes(self):
+        """AC7：stop（有生效批准）、restart-server、close 用户卡、forward user 审批卡不带 --confirm 均返回退出码 4。"""
+        f, key, crew = studio.pitch(self.conn, 'builda', 'cfm-case', '测确认信封', playbook='direct')
+        self.conn.execute('UPDATE cameras SET state="running", pane="%1" WHERE id=?', (crew['id'],))
+        self.conn.execute('INSERT INTO approvals(film_id, seq_key, gate, granted_at, expires_at, granted_by) VALUES(?,?,?,?,?,?)',
+                          ('builda', key, 'prod', time.time(), time.time() + 3600, 'producer'))
+        prod = studio.create_camera(self.conn, 'producer', 'builda', None, 'hi')
+        asst = studio.create_camera(self.conn, 'assistant', None, None, 'hi')
+        self.conn.commit()
+
+        # 1) stop 有生效 prod 批准 → exit 4
+        r_stop = self.run_bin(prod, 'stop', f'builda/{studio.seq_num(key)}', '--reason', '需要中止', '--json')
+        self.assertEqual(r_stop.returncode, studio.EXIT_CONFIRM)
+        j_stop = json.loads(r_stop.stdout)
+        self.assertTrue(j_stop['confirm_required'])
+        self.assertIn('--confirm', j_stop['confirm_cmd'])
+        # 带 --confirm 放行
+        r_stop2 = self.run_bin(prod, 'stop', f'builda/{studio.seq_num(key)}', '--reason', '需要中止', '--confirm', '--json')
+        self.assertEqual(r_stop2.returncode, 0)
+        self.assertTrue(json.loads(r_stop2.stdout)['stopped'])
+
+        # 2) restart-server 不带 --confirm → exit 4
+        r_rs = self.run_bin(asst, 'restart-server', '--reason', '新版本', '--json')
+        self.assertEqual(r_rs.returncode, studio.EXIT_CONFIRM)
+        self.assertIn('--confirm', json.loads(r_rs.stdout)['confirm_cmd'])
+
+        # 3) forward user 审批类卡不带 --confirm → exit 4
+        ap_card = studio.create_report(self.conn, 'gate', crew, 'builda', key, '删旧表', gate='irreversible',
+                                       holder='producer', msg_type='approve')
+        r_fwd = self.run_bin(prod, 'forward', str(ap_card['id']), 'user', '建议审批', '--json')
+        self.assertEqual(r_fwd.returncode, studio.EXIT_CONFIRM)
+        self.assertIn('--confirm', json.loads(r_fwd.stdout)['confirm_cmd'])
+        r_fwd2 = self.run_bin(prod, 'forward', str(ap_card['id']), 'user', '建议审批', '--confirm', '--json')
+        self.assertEqual(r_fwd2.returncode, 0)
+        self.assertEqual(studio.report(self.conn, ap_card['id'])['holder'], 'executive')
+
+        # 4) 全局 --json 在命令前后均可，且 status / preset / platforms 均返回单行 JSON
+        for argv in (('--json', 'status'), ('status', '--json'), ('platforms', '--json'), ('scan', '--json')):
+            ro = self.run_bin(None, *argv)
+            self.assertEqual(ro.returncode, 0, f'{argv}: {ro.stderr}')
+            j = json.loads(ro.stdout.strip())
+            self.assertTrue(j['ok'])
+            self.assertEqual(j['api_version'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -9132,7 +9132,8 @@ def retro_text(conn, film_id=None, days=14):
 
 
 def cmd_retro(args):
-    print(retro_text(db(), args.film, args.days))
+    txt = retro_text(db(), args.film, args.days)
+    out_ok(dict(film=args.film, days=args.days, text=txt), txt, as_json=getattr(args, 'json', False))
 
 
 def cmd_logs(args):
@@ -9144,26 +9145,38 @@ def cmd_logs(args):
             vals.append(v)
     w = ' AND '.join(where)
     if args.stats:
-        for r in rows(conn, f'SELECT kind, level, COUNT(*) n, AVG(value) avg, MAX(value) mx FROM events WHERE {w} '
-                            'GROUP BY kind, level ORDER BY n DESC', *vals):
-            print(f'{r["kind"]:<16}{r["level"]:<6}{r["n"]:>5}' + (f'  均值 {r["avg"]:.2f}  最大 {r["mx"]:.2f}' if r['avg'] is not None else ''))
+        items = rows(conn, f'SELECT kind, level, COUNT(*) n, AVG(value) avg, MAX(value) mx FROM events WHERE {w} '
+                           'GROUP BY kind, level ORDER BY n DESC', *vals)
+        lines = [f'{r["kind"]:<16}{r["level"]:<6}{r["n"]:>5}' + (f'  均值 {r["avg"]:.2f}  最大 {r["mx"]:.2f}' if r['avg'] is not None else '')
+                 for r in items]
+        out_ok(dict(stats=items), '\n'.join(lines), as_json=getattr(args, 'json', False))
         return
-    for r in reversed(rows(conn, f'SELECT * FROM events WHERE {w} ORDER BY id DESC LIMIT ?', *vals, args.limit)):
+    items = list(reversed(rows(conn, f'SELECT * FROM events WHERE {w} ORDER BY id DESC LIMIT ?', *vals, args.limit)))
+    lines = []
+    for r in items:
         at = datetime.datetime.fromtimestamp(r['ts']).strftime('%m-%d %H:%M:%S')
-        print(f'{at} {r["level"]:<5} {r["kind"]:<14} {r["film_id"] or "-"}/{r["seq_key"] or "-"} #{r["camera_id"] or "-"}'
-              + (f' value={r["value"]}' if r['value'] is not None else '') + f' {r["detail"]}')
+        lines.append(f'{at} {r["level"]:<5} {r["kind"]:<14} {r["film_id"] or "-"}/{r["seq_key"] or "-"} #{r["camera_id"] or "-"}'
+                     + (f' value={r["value"]}' if r['value'] is not None else '') + f' {r["detail"]}')
+    out_ok(dict(events=items), '\n'.join(lines), as_json=getattr(args, 'json', False))
 
 
 def cmd_playbook(args):
     conn = db()
     c = env_camera(conn)
+    as_json = getattr(args, 'json', False)
     if args.action == 'list':
+        gen = templates()
+        proj_ts = {f['id']: templates(f) for f in films(conn)}
+        proj_pbs = {f['id']: film_playbook(f) for f in films(conn)}
+        if as_json:
+            out_ok(dict(templates=gen, project_templates=proj_ts, project_playbooks=proj_pbs), as_json=True)
+            return
         print('通用工作流模板（麻薯 playbooks/）：')
-        for t in templates():
+        for t in gen:
             print(f'  - template:{t["id"]}  「{t["name"]}」v{t.get("version")}  {len(t["stages"])} 个阶段：'
                   f'{" → ".join(x["name"] for x in t["stages"])}\n      {t.get("summary", "")}')
         for f in films(conn):
-            ts = templates(f)
+            ts = proj_ts[f['id']]
             if ts:
                 print(f'{f["title"]}专用模板（{film_templates_dir(f)}/，行为模板在 behaviors/）：')
             for t in ts:
@@ -9171,50 +9184,68 @@ def cmd_playbook(args):
                       f'{" → ".join(x["name"] for x in t["stages"])}\n      {t.get("summary", "")}')
         print('各项目工作流（<工程>/.mashu/playbook.json）：')
         for f in films(conn):
-            pb = film_playbook(f)
+            pb = proj_pbs[f['id']]
             print(f'  - film:{f["id"]}  「{pb.get("name")}」v{pb.get("version")}  {" → ".join(x["name"] for x in pb["stages"])}'
                   f'  文件：{film_docs(f) / "playbook.json"}')
         return
     if not args.target:
-        raise SystemExit('要写目标：template:<id> 或 film:<id>')
+        fail('usage_error', '要写目标：template:<id> 或 film:<id>', fix='mashu playbook list', exit_code=EXIT_USAGE)
     if args.action == 'show':
         path, label = playbook_target(conn, args.target)
-        print(f'{label}：{path}\n')
-        print(path.read_text())
+        raw = path.read_text()
+        out_ok(dict(target=args.target, label=label, path=str(path), content=json.loads(raw)),
+               f'{label}：{path}\n\n{raw}', as_json=as_json)
         return
     if args.action == 'check':
         path, label = playbook_target(conn, args.target)
         errs = validate_playbook(json.loads(path.read_text()))
-        print('校验通过' if not errs else '校验没通过：\n- ' + '\n- '.join(errs))
+        out_ok(dict(target=args.target, valid=not errs, errors=errs),
+               '校验通过' if not errs else '校验没通过：\n- ' + '\n- '.join(errs), as_json=as_json)
         return
     if c and c['role'] == 'crew':
-        raise SystemExit('工作流由麻薯和子脑维护；有改进建议用 mashu tell 告诉子脑')
+        fail('permission_denied', '工作流由麻薯和子脑维护；有改进建议请发给子脑',
+             fix='mashu send up "工作流建议：…" --type fyi', exit_code=EXIT_RULE)
     if args.action == 'commit':
         if not args.note:
-            raise SystemExit('commit 要写 --note "改了什么、为什么"')
+            fail('usage_error', 'commit 要写 --note "改了什么、为什么"',
+                 fix=f'mashu playbook commit {args.target} --note "说明"', exit_code=EXIT_USAGE)
         pb = commit_playbook(conn, args.target, c, args.note)
-        print(f'已提交 {args.target} v{pb["version"]}（已记入决策记录，用户推翻会自动回滚）')
+        out_ok(dict(target=args.target, version=pb['version']),
+               f'已提交 {args.target} v{pb["version"]}（已记入决策记录，用户推翻会自动回滚）', as_json=as_json)
     elif args.action == 'apply':
         if not args.template:
-            raise SystemExit('apply 要写 --template <模板id>')
+            fail('usage_error', 'apply 要写 --template <模板id>',
+                 fix=f'mashu playbook apply {args.target} --template direct', exit_code=EXIT_USAGE)
         if not args.target.startswith('film:'):
-            raise SystemExit('apply 的目标是 film:<id>')
+            fail('usage_error', 'apply 的目标是 film:<id>', fix='mashu playbook list', exit_code=EXIT_USAGE)
         f = require_film(conn, args.target.split(':', 1)[1])
         pb = load_template(args.template.rpartition('/')[2], f)
         cur = film_playbook(f)
         pb.update(id=f'film:{f["id"]}', name=f'{f["title"]} 工作流', based_on=args.template, changelog=cur.get('changelog', []))
         pb = commit_playbook(conn, args.target, c, args.note or f'换成模板「{args.template}」', content=pb)
-        print(f'{f["title"]}工作流已换成「{args.template}」，v{pb["version"]}（新开的戏生效，在拍的戏不受影响）')
+        out_ok(dict(target=args.target, template=args.template, version=pb['version']),
+               f'{f["title"]}工作流已换成「{args.template}」，v{pb["version"]}（新开的戏生效，在拍的戏不受影响）', as_json=as_json)
     elif args.action == 'restore':
         if not args.version:
-            raise SystemExit('restore 要写 --version N')
+            fail('usage_error', 'restore 要写 --version N',
+                 fix=f'mashu playbook restore {args.target} --version 1', exit_code=EXIT_USAGE)
         pb = restore_playbook(conn, args.target, args.version, actor_label(c))
-        print(f'已回滚，现为 v{pb["version"]}')
+        out_ok(dict(target=args.target, version=pb['version']), f'已回滚，现为 v{pb["version"]}', as_json=as_json)
 
 
 def cmd_callsheet(args):
     conn = db()
     data = status_data(conn)
+    if args.film and not any(f['id'] == args.film for f in data['films']):
+        fail('not_found', f'项目列表里没有项目 {args.film}', fix='mashu status 查看已登记项目', exit_code=EXIT_NOT_FOUND)
+    if getattr(args, 'json', False):
+        films_out = [f for f in data['films'] if not args.film or f['id'] == args.film]
+        out_ok(dict(
+            date=today(), stages=data['stages'], reads=data['reads'], desks=data['desks'],
+            inbox=data['inbox'], decisions_pending=data['decisions_pending'],
+            films=films_out, open_reports=open_reports(conn),
+        ), as_json=True)
+        return
     st = data['stages']
     per = '、'.join(f'{x["label"]} {x["used"]}' for x in st['by_account'])
     print(f'状态总览 {today()}：执行者 {st["used"]} 个（每个账号上限 {st["max"]}{"：" + per if per else ""}），子脑并发 '
@@ -9257,9 +9288,11 @@ def cmd_callsheet(args):
 def my_camera(conn, roles=None):
     c = env_camera(conn)
     if not c:
-        raise SystemExit('不在麻薯电脑秘书管理的会话里（缺少 MASHU_SESSION）')
+        fail('session_required', '不在麻薯电脑秘书管理的会话里（缺少 MASHU_SESSION）',
+             fix='请在受管会话里运行，或使用 mashu status / mashu me', exit_code=EXIT_RULE)
     if roles and c['role'] not in roles:
-        raise SystemExit(f'这个命令只给{"、".join(LEVEL_LABEL[r] for r in roles)}用')
+        fail('permission_denied', f'这个命令只给{"、".join(LEVEL_LABEL[r] for r in roles)}用',
+             fix='mashu me 查看你的角色和可用命令', exit_code=EXIT_RULE)
     return c
 
 
@@ -9273,12 +9306,17 @@ def cmd_restart_server(args):
     conn = db()
     c = caller(conn)
     if c and c['role'] != 'assistant':
-        raise SystemExit('只有主脑能重启服务；子脑和执行者请让用户点网页右上角「重启服务」')
+        fail('permission_denied', '只有主脑能重启服务；子脑和执行者请让用户点网页右上角「重启服务」',
+             fix='在回复里提醒用户点网页右上角「重启服务」按钮', exit_code=EXIT_RULE)
+    cfm_cmd = 'mashu restart-server --confirm' + (f' --reason {shlex.quote(args.reason)}' if args.reason else '')
+    confirm_or_fail(args, 'confirm_required', '重启网页服务与调度器会断开网页连接数秒（各受管会话不受影响），请确认',
+                    cfm_cmd, changes=['重启网页服务与调度器进程'])
     audit(conn, 'assistant' if c else 'executive', 'restart-server', None, None, args.reason or '')
     import subprocess
     subprocess.Popen(['bash', '-c', 'sleep 1; NO_OPEN=1 ./start.sh restart'], cwd=str(CODE), start_new_session=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print('1 秒后重启网页服务与调度器（各会话不受影响），网页会断开几秒后自动连上。')
+    out_ok(dict(restarting=True, reason=args.reason or ''),
+           '1 秒后重启网页服务与调度器（各会话不受影响），网页会断开几秒后自动连上。', as_json=getattr(args, 'json', False))
 
 
 def cmd_greenlight(args):
@@ -9287,16 +9325,18 @@ def cmd_greenlight(args):
     c = caller(conn)
     if c and created:
         record_decision(conn, c, f['id'], None, f'登记项目{f["title"]}（{f["path"]}）')
-    print(f'{"已登记项目" if created else "已在项目列表"}：{f["title"]} id={f["id"]}'
-          f'\n配置：{film_file(f["id"])}')
+    out_ok(dict(id=f['id'], title=f['title'], path=f['path'], created=created, config=str(film_file(f['id']))),
+           f'{"已登记项目" if created else "已在项目列表"}：{f["title"]} id={f["id"]}\n配置：{film_file(f["id"])}',
+           as_json=getattr(args, 'json', False))
 
 
 def cmd_scan(args):
     conn = db()
     found = scan_candidates(conn)
-    print('未登记项目（未登记项目的工程文件夹）：' + ('无' if not found else ''))
+    lines = ['未登记项目（未登记项目的工程文件夹）：' + ('无' if not found else '')]
     for d in found:
-        print(f'  - {d["name"]}  {d["path"]}' + ('  (git)' if d['git'] else ''))
+        lines.append(f'  - {d["name"]}  {d["path"]}' + ('  (git)' if d['git'] else ''))
+    out_ok(dict(candidates=found), '\n'.join(lines), as_json=getattr(args, 'json', False))
 
 
 def cmd_pitch(args):
@@ -9305,16 +9345,21 @@ def cmd_pitch(args):
     plan = None
     if c:
         if not args.plan:
-            raise SystemExit('麻薯开功能要带方案：先和用户把需求、技术方案谈清楚，写成文件后 `--plan <文件>`；开好后等用户批准开工')
-        plan = Path(args.plan).expanduser().read_text()
+            fail('missing_plan', '麻薯开功能要带方案：先和用户把需求、技术方案谈清楚，写成文件后 --plan <文件>；开好后等用户批准开工',
+                 fix=f'mashu new-feature {args.film} {args.slug} --brief "…" --plan <方案文件>', exit_code=EXIT_RULE)
+        pfile = Path(args.plan).expanduser()
+        if not pfile.is_file():
+            fail('not_found', f'找不到方案文件：{pfile}', fix='检查 --plan 路径是否存在', exit_code=EXIT_NOT_FOUND)
+        plan = pfile.read_text()
     preset_arg = getattr(args, 'preset', None)
     if preset_arg and (args.cli or getattr(args, 'cli_account', None)):
-        raise SystemExit('--preset 不能和 --cli / --cli-account 同时使用')
+        fail('usage_error', '--preset 不能和 --cli / --cli-account 同时使用',
+             fix='只传 --preset <id> 或只传 --cli <cli>', exit_code=EXIT_USAGE)
     if preset_arg:
         ensure_migrated()
         pr = find_preset(preset_arg)
         if not pr:
-            raise SystemExit(f'找不到预设：{preset_arg}（用 mashu preset list 查看可用预设）')
+            fail('not_found', f'找不到预设：{preset_arg}', fix='mashu preset list', exit_code=EXIT_NOT_FOUND)
         ex = dict(preset=pr['id'], cli=pr['cli'], model=args.model or pr['model'], effort=args.effort or pr['effort'])
         if pr['account']:
             ex['account'] = pr['account']
@@ -9326,13 +9371,17 @@ def cmd_pitch(args):
         f, key, cam = pitch(conn, args.film, args.slug, args.brief, args.title, by=c, playbook=args.playbook, workflow=args.workflow,
                             touches=args.touches, plan=plan, account=args.account, workdir=args.workdir, exec_cfg=ex or None)
     except ValueError as exc:
-        raise SystemExit(str(exc))
+        fail('pitch_failed', str(exc), fix='mashu help new-feature', exit_code=EXIT_ERR)
     if c:
         record_decision(conn, c, f['id'], key, f'开新功能 {seq_label(f, key)}：{args.title or args.slug}（等用户批准开工）')
+    payload = dict(film=f['id'], key=key, label=seq_label(f, key), kickoff_pending=not cam,
+                   camera=dict(id=cam['id'], name=cam['name'], state=cam['state']) if cam else None)
     if not cam:
-        print(f'已开 {seq_label(f, key)}（{key}），已向用户申请批准开工；批准后执行者自动启动，在此之前不要 start / note')
+        out_ok(payload, f'已开 {seq_label(f, key)}（{key}），已向用户申请批准开工；批准后执行者自动启动，在此之前不要 start / note',
+               as_json=getattr(args, 'json', False))
         return
-    print(f'已开 {seq_label(f, key)}（{key}），执行者「{cam["name"]}」{"排队中" if cam["state"] == "queued" else cam["state"]}')
+    out_ok(payload, f'已开 {seq_label(f, key)}（{key}），执行者「{cam["name"]}」{"排队中" if cam["state"] == "queued" else cam["state"]}',
+           as_json=getattr(args, 'json', False))
 
 
 def cmd_preset(args):
@@ -9355,7 +9404,7 @@ def cmd_preset(args):
             roles=role_of.get(p['id'], []),
         ))
     if getattr(args, 'json', False):
-        print(json.dumps(dict(presets=items, role_presets=rp, fallback_pct=cfg('preset_fallback_pct')), ensure_ascii=False, indent=2))
+        out_ok(dict(presets=items, role_presets=rp, fallback_pct=cfg('preset_fallback_pct')), as_json=True)
         return
     if not items:
         print('还没有预设：在网页「模型池」页新增预设。')
@@ -9377,9 +9426,11 @@ def cmd_action(args):
     conn = db()
     f, s = resolve_ref(conn, args.ref)
     if seq_done(seq_state(f, s['key'])):
-        raise SystemExit(f'{seq_label(f, s["key"])} 已完成')
+        fail('already_done', f'{seq_label(f, s["key"])} 已完成', fix=f'mashu status {f["id"]}', exit_code=EXIT_CONFLICT)
     cam, created = request_crew(conn, f, s['key'], continue_prompt(f, s['key'], args.prompt or ''))
-    print(f'{seq_label(f, s["key"])}：{"新" if created else "已有"}执行者「{cam["name"]}」（{cam["state"]}）')
+    out_ok(dict(film=f['id'], key=s['key'], created=created, camera=dict(id=cam['id'], name=cam['name'], state=cam['state'])),
+           f'{seq_label(f, s["key"])}：{"新" if created else "已有"}执行者「{cam["name"]}」（{cam["state"]}）',
+           as_json=getattr(args, 'json', False))
 
 
 def cmd_cut(args):
@@ -9387,28 +9438,32 @@ def cmd_cut(args):
     f, s = resolve_ref(conn, args.ref)
     cam = active_crew(conn, f['id'], s['key'])
     if not cam:
-        print('这功能没有在拍的执行者')
+        out_ok(dict(stopped=False, film=f['id'], key=s['key']), '这功能没有在拍的执行者', as_json=getattr(args, 'json', False))
         return
     who_c = caller(conn)
     why = (args.reason or '').strip()
     if who_c and not why:
-        raise SystemExit('停执行者要写原因：mashu stop <功能> --reason "一句话：为什么停、接下来等谁"（会显示在功能频道）')
+        fail('missing_reason', '停执行者要写原因（会显示在功能频道）',
+             fix=f'mashu stop {args.ref} --reason "一句话：为什么停、接下来等谁"', exit_code=EXIT_USAGE)
     why = why or '用户在命令行停止'
-    if who_c and not getattr(args, 'force', False):
-        # 自迭代：子脑曾在执行者刚拿到上线批准时把它停掉，打断正式发布；有生效中的 prod / 不可逆批准就先拦住
+    if who_c and not (getattr(args, 'confirm', False) or getattr(args, 'force', False)):
+        # 自迭代：子脑曾在执行者刚拿到上线批准时把它停掉，打断正式发布；有生效中的 prod / 不可逆批准就走确认信封（退出码 4）
         ap = one(conn, "SELECT * FROM approvals WHERE film_id=? AND seq_key IS ? AND gate IN ('prod','irreversible') AND expires_at>? "
                        'ORDER BY id DESC LIMIT 1', f['id'], s['key'], time.time())
         if ap:
             left = int((ap['expires_at'] - time.time()) / 60)
-            raise SystemExit(f'「{cam["name"]}」有生效中的{GATES.get(ap["gate"], ap["gate"])}批准（还剩 {left} 分钟），可能正在做正式步骤。'
-                             '先等它做完，或 mashu stop <功能> --force --reason "为什么必须现在停"')
+            cfm_cmd = f'mashu stop {args.ref} --confirm --reason {shlex.quote(why)}'
+            confirm_or_fail(args, 'confirm_required',
+                            f'「{cam["name"]}」有生效中的{GATES.get(ap["gate"], ap["gate"])}批准（还剩 {left} 分钟），可能正在做正式步骤',
+                            cfm_cmd, changes=[f'停止执行者「{cam["name"]}」（当前存在生效中的 {ap["gate"]} 批准）'])
     if not seq_done(seq_state(f, s['key'])) and not wrote_handoff(cam):
         auto_handoff(conn, cam, f'执行者被停止前没写 handoff.md；停止原因：{why}')   # 功能没做完就停：留一份最小交接，下一个人不用从 diff 猜
     end_camera(conn, cam['id'], 'cut', why)
     who = actor_label(who_c)
     notice(conn, f'{f["id"]}/{s["key"]}', f'{who}停止「{cam["name"]}」：{why}')
     audit(conn, who, 'cut', f['id'], s['key'], f'{cam["name"]}：{why}')
-    print(f'已停止：「{cam["name"]}」（原因已发到功能频道）')
+    out_ok(dict(stopped=True, film=f['id'], key=s['key'], camera=cam['name'], reason=why),
+           f'已停止：「{cam["name"]}」（原因已发到功能频道）', as_json=getattr(args, 'json', False))
 
 
 def retake(conn, f, key, who):
@@ -9424,7 +9479,8 @@ def cmd_retake(args):
     conn = db()
     f, s = resolve_ref(conn, args.ref)
     row = retake(conn, f, s['key'], actor_label(caller(conn)))
-    print(f'新执行者「{row["name"]}」（{row["state"]}）')
+    out_ok(dict(film=f['id'], key=s['key'], camera=dict(id=row['id'], name=row['name'], state=row['state'])),
+           f'新执行者「{row["name"]}」（{row["state"]}）', as_json=getattr(args, 'json', False))
 
 
 def cmd_me(args):
@@ -9651,8 +9707,11 @@ def cmd_answer(args):
 def cmd_decide(args):
     conn = db()
     c = my_camera(conn, ['producer', 'assistant'])
-    record_decision(conn, c, args.film or c['film_id'], args.seq, args.text, args.why or '', ratify=args.ratify)
-    print('已记入决策记录，' + ('等用户追认或推翻' if args.ratify else '记为已执行，简报里会列出，用户可随时推翻'))
+    text = read_text_arg(args.text, label='决策内容')
+    record_decision(conn, c, args.film or c['film_id'], args.seq, text, args.why or '', ratify=args.ratify)
+    out_ok(dict(film=args.film or c['film_id'], seq=args.seq, text=text, why=args.why or '', ratify=bool(args.ratify)),
+           '已记入决策记录，' + ('等用户追认或推翻' if args.ratify else '记为已执行，简报里会列出，用户可随时推翻'),
+           as_json=getattr(args, 'json', False))
 
 
 BROWSER_PROMPT = """你是麻薯派出的浏览器助手：发起者的会话开着 Code Mode，用不了浏览器，由你用 Claude in Chrome 完成下面这件事。
@@ -9698,17 +9757,19 @@ def cmd_finish(args):
     conn = db()
     c = my_camera(conn)
     msg = ''
+    as_json = getattr(args, 'json', False)
     if c['role'] == 'crew':
         ok, msg = finish_checks(conn, c)
         if not ok:
-            raise SystemExit('不能交接：' + msg)
+            fail('finish_blocked', '不能交接：' + msg,
+                 fix='补齐交接或修复检查项后再运行 mashu finish --reason "完成"', exit_code=EXIT_RULE)
         f = film(conn, c['film_id'])
         data = seq_state(f, c['seq_key'])
         st = next((x for x in (data or {}).get('stages', []) if x['id'] == (c['stage_no'] or 1)), None)
         if st and st['status'] == '已完成':
             action, info = advance_crew(conn, c)       # 阶段之间不换人；'hold'（功能阻塞）直接收工
             if action not in ('done', 'hold') and not c['context_warned']:
-                print((f'{msg}。' if msg else '') + info)
+                out_ok(dict(action=action, info=info, note=msg), (f'{msg}。' if msg else '') + info, as_json=as_json)
                 return
             if action != 'done':
                 msg = (f'{msg}；' if msg else '') + info
@@ -9717,14 +9778,19 @@ def cmd_finish(args):
         tip = f'还没写 {handoff_path(conn, c)}：本轮结束时会自动生成最小交接，最好先 `mashu handoff --now … --next …`。'
     conn.execute('UPDATE cameras SET wrap_reason=? WHERE id=?', (args.reason, c['id']))
     conn.commit()
-    print('已登记：本轮结束后处理（做完就收工，没做完就同一个你换新会话接着做）。' + (f'{msg}。' if msg else '') + tip + '现在结束本轮。')
+    out_ok(dict(wrap_reason=args.reason, note=msg, tip=tip),
+           '已登记：本轮结束后处理（做完就收工，没做完就同一个你换新会话接着做）。' + (f'{msg}。' if msg else '') + tip + '现在结束本轮。',
+           as_json=as_json)
 
 
 def cmd_handoff(args):
     conn = db()
     c = my_camera(conn)
     if args.file:
-        secs = parse_handoff(Path(args.file).read_text())
+        pfile = Path(args.file)
+        if not pfile.is_file():
+            fail('not_found', f'找不到交接文件：{pfile}', fix='检查 --file 路径', exit_code=EXIT_NOT_FOUND)
+        secs = parse_handoff(pfile.read_text())
     else:
         secs = {'现状': args.now or '', '下一步': args.next or '', '未决事项': args.open or '', '关键文件': args.files or ''}
     if args.docs is not None:
@@ -9734,7 +9800,8 @@ def cmd_handoff(args):
     if args.risk:
         secs['未决事项'] = (secs.get('未决事项') or '') + f'\n\n风险：{args.risk}'
     if not (secs.get('现状') or '').strip() or not (secs.get('下一步') or '').strip():
-        raise SystemExit('现状和下一步必填：mashu handoff --now "…" --next "…" [--open "…" --files "…"]')
+        fail('usage_error', '现状和下一步必填',
+             fix='mashu handoff --now "…" --next "…" [--open "…" --files "…"]', exit_code=EXIT_USAGE)
     mirror = None
     if c['role'] == 'crew':
         mirror = {k: v for k, v in dict(progress=args.now, next=args.next, confirm=args.open, context=args.files,
@@ -9743,7 +9810,9 @@ def cmd_handoff(args):
             mirror['docs'] = secs['文档回写']
     p = write_handoff(conn, c, secs, mirror=mirror)
     notice(conn, channel_of(c), f'「{c["name"]}」写好交接：{p}')
-    print(f'已写 {p}。' + ('现在 `mashu finish --reason "上下文交接"`。' if c['context_warned'] else ''))
+    out_ok(dict(path=str(p), context_warned=bool(c['context_warned'])),
+           f'已写 {p}。' + ('现在 `mashu finish --reason "上下文交接"`。' if c['context_warned'] else ''),
+           as_json=getattr(args, 'json', False))
 
 
 def cmd_ac(args):
@@ -9751,48 +9820,52 @@ def cmd_ac(args):
     f, s = my_seq(conn, args)
     key = s['key']
     items = load_ac(f, key)
-    c = env_camera(conn)
+    as_json = getattr(args, 'json', False)
     if args.action == 'list':
-        if not items:
-            print('还没有验收标准')
-        for i in items:
-            print(f'{"✓" if i.get("passes") else "✗"} {i["id"]} {i["text"]}' + (f'  —— {i["evidence"]}' if i.get('evidence') else ''))
+        lines = [f'{"✓" if i.get("passes") else "✗"} {i["id"]} {i["text"]}' + (f'  —— {i["evidence"]}' if i.get('evidence') else '')
+                 for i in items] or ['还没有验收标准']
+        out_ok(dict(film=f['id'], key=key, items=items), '\n'.join(lines), as_json=as_json)
         return
     if args.action == 'add':
         if not args.arg:
-            raise SystemExit('写上验收标准内容：mashu ac add "WHEN … THE system SHALL …"')
+            fail('usage_error', '写上验收标准内容', fix='mashu ac add "WHEN … THE system SHALL …"', exit_code=EXIT_USAGE)
         n = max([int(i['id'].split('-')[1]) for i in items] + [0]) + 1
         text = re.sub(r'^\s*AC-\d+\s*[:：.、)）-]?\s*', '', args.arg, flags=re.I) or args.arg
-        items.append(dict(id=f'AC-{n}', text=text, passes=False, evidence='', updated_at=now_iso()))
+        item = dict(id=f'AC-{n}', text=text, passes=False, evidence='', updated_at=now_iso())
+        items.append(item)
         save_ac(f, key, items)
-        print(f'已添加 AC-{n}')
+        out_ok(dict(item=item), f'已添加 AC-{n}', as_json=as_json)
         return
     it = next((i for i in items if i['id'].lower() == (args.arg or '').lower()), None)
     if not it:
-        raise SystemExit(f'没有 {args.arg}（mashu ac list）')
+        fail('not_found', f'没有 {args.arg}', fix='mashu ac list', exit_code=EXIT_NOT_FOUND)
     if args.action == 'pass' and not args.evidence:
-        raise SystemExit('标记通过要附证据：--evidence "跑了什么、结果是什么"')
+        fail('usage_error', '标记通过要附证据',
+             fix=f'mashu ac pass {it["id"]} --evidence "跑了什么、结果是什么"', exit_code=EXIT_USAGE)
     it.update(passes=args.action == 'pass', evidence=args.evidence or it.get('evidence', ''), updated_at=now_iso())
     save_ac(f, key, items)
-    print(f'{it["id"]} → {"通过" if it["passes"] else "未通过"}（{sum(1 for i in items if i.get("passes"))}/{len(items)}）')
+    passed = sum(1 for i in items if i.get('passes'))
+    out_ok(dict(item=it, passed=passed, total=len(items)),
+           f'{it["id"]} → {"通过" if it["passes"] else "未通过"}（{passed}/{len(items)}）', as_json=as_json)
 
 
 def cmd_collaboration(args):
     conn = db()
     cam = my_camera(conn, ['producer'] if args.command == 'codex' and args.action else ['crew', 'producer'])
     f = require_film(conn, cam['film_id'])
-    author = f'#{seq_num(cam["seq_key"])}' if cam['seq_key'] else '子脑'
     if args.command == 'codex':
         if args.action:
             if not (args.text or '').strip():
-                raise ValueError('请填写法典变更')
+                fail('empty_text', '请填写法典变更', fix='mashu codex note "约定内容"', exit_code=EXIT_USAGE)
             path = film_docs(f) / 'codex.md'
             with path.open('a+') as stream:
                 fcntl.flock(stream, fcntl.LOCK_EX)
                 if not stream.tell():
                     stream.write(CODEX_TEMPLATE)
                 stream.write(f'\n- {now_iso()} · {args.text.strip()}\n')
-        print(project_codex(f) + '\n' + parallel_roster(conn, f))
+        txt = project_codex(f) + '\n' + parallel_roster(conn, f)
+        out_ok(dict(film=f['id'], codex=project_codex(f), roster=parallel_roster(conn, f)), txt,
+               as_json=getattr(args, 'json', False))
     elif args.command == 'sync':
         if args.text is None:
             items = board_page(f)[0]
@@ -9803,7 +9876,10 @@ def cmd_collaboration(args):
             res = send_message(conn, cam, '@crew', txt, msg_type='fyi')
             out_ok(res, '已同步到项目协作板', as_json=getattr(args, 'json', False))
     else:
-        seq = find_seq(conn, f, args.ref.lstrip('#'))
+        try:
+            seq = find_seq(conn, f, args.ref.lstrip('#'))
+        except ValueError as exc:
+            fail('not_found', str(exc), fix=f'mashu status {f["id"]}', exit_code=EXIT_NOT_FOUND)
         txt = read_text_arg(args.text, label='消息内容')
         fyi = bool(getattr(args, 'fyi', False))
         res = send_peer_message(conn, cam, f, seq, txt, fyi=fyi)
@@ -9822,9 +9898,12 @@ def cmd_claim(args):
     cl['touches'] = list(dict.fromkeys((cl.get('touches') or []) + args.globs)) if args.add else list(args.globs)
     cl['declared_at'] = now_iso()
     save_state(f, s['key'], data)
-    print('改动范围：' + ', '.join(cl['touches']))
-    for other, why in scope_conflicts(conn, f, s['key']):
-        print(f'与 {seq_label(f, other)} 并行，{why}。请按工程法典分工。')
+    conflicts = [dict(other=other, why=why) for other, why in scope_conflicts(conn, f, s['key'])]
+    lines = ['改动范围：' + ', '.join(cl['touches'])]
+    for c_it in conflicts:
+        lines.append(f'与 {seq_label(f, c_it["other"])} 并行，{c_it["why"]}。请按工程法典分工。')
+    out_ok(dict(film=f['id'], key=s['key'], touches=cl['touches'], conflicts=conflicts), '\n'.join(lines),
+           as_json=getattr(args, 'json', False))
 
 
 def cmd_waive(args):
@@ -9835,30 +9914,35 @@ def cmd_waive(args):
                  (f['id'], s['key'], 'check-waiver', time.time(), time.time() + 7200, c['role']))
     conn.commit()
     record_decision(conn, c, f['id'], s['key'], f'豁免 {seq_label(f, s["key"])} 一次自动检查', args.reason)
-    print('已豁免（2 小时内有效，已记入决策记录）')
+    out_ok(dict(film=f['id'], key=s['key'], reason=args.reason, ttl_seconds=7200),
+           '已豁免（2 小时内有效，已记入决策记录）', as_json=getattr(args, 'json', False))
 
 
 def cmd_digest(args):
     conn = db()
     if args.send:
         send_digest(conn)
-        print('已把简报数据发给麻薯')
+        out_ok(dict(sent=True), '已把简报数据发给麻薯', as_json=getattr(args, 'json', False))
     else:
-        print(digest_text(conn, float(meta_get(conn, 'digest_last', time.time() - 86400))))
+        txt = digest_text(conn, float(meta_get(conn, 'digest_last', time.time() - 86400)))
+        out_ok(dict(sent=False, text=txt), txt, as_json=getattr(args, 'json', False))
 
 
 def cmd_reports(args):
     conn = db()
     c = env_camera(conn)
     level = c['role'] if c else None
+    items = []
+    blocks = []
     for r in open_reports(conn):
         if level == 'producer' and (r['holder'] != 'producer' or r['film_id'] != c['film_id']):
             continue
         if level == 'assistant' and r['holder'] != 'assistant':
             continue
-        print(report_text_for(conn, r, r['holder']) if level in ('producer', 'assistant') else
-              f'#{r["id"]} [{KIND_LABEL.get(r["kind"])}] 在{LEVEL_LABEL[r["holder"]]}手上：{r["summary"]}')
-        print()
+        items.append(_format_inbox_report(conn, r, level or 'executive'))
+        blocks.append(report_text_for(conn, r, r['holder']) if level in ('producer', 'assistant') else
+                      f'#{r["id"]} [{KIND_LABEL.get(r["kind"])}] 在{LEVEL_LABEL[r["holder"]]}手上：{r["summary"]}')
+    out_ok(dict(items=items), '\n\n'.join(blocks), as_json=getattr(args, 'json', False))
 
 
 def cmd_priority(args):
@@ -9869,7 +9953,7 @@ def cmd_priority(args):
     c = caller(conn)
     if c:
         record_decision(conn, c, f['id'], s['key'], f'把 {seq_label(f, s["key"])} 的优先级调为 {args.value}')
-    print('已调整排队优先级')
+    out_ok(dict(film=f['id'], key=s['key'], priority=args.value), '已调整排队优先级', as_json=getattr(args, 'json', False))
 
 
 # ---- 状态文件 ----
@@ -9879,7 +9963,8 @@ def my_seq(conn, args):
         return resolve_ref(conn, args.ref)
     c = env_camera(conn)
     if not c or not c['seq_key']:
-        raise SystemExit('要写 --ref <项目>/<功能编号>，或在执行者会话里运行')
+        fail('usage_error', '要写 --ref <项目>/<功能编号>，或在执行者会话里运行',
+             fix='mashu feature status --ref <项目>/<编号>', exit_code=EXIT_USAGE)
     f = film(conn, c['film_id'])
     return f, find_seq(conn, f, c['seq_key'])
 
@@ -9887,21 +9972,27 @@ def my_seq(conn, args):
 def cmd_seq(args):
     conn = db()
     f, s = my_seq(conn, args)
+    as_json = getattr(args, 'json', False)
     if args.action == 'status':
-        print(status_text(f, s['key']))
+        txt = status_text(f, s['key'])
+        out_ok(dict(film=f['id'], key=s['key'], state=seq_state(f, s['key']), text=txt), txt, as_json=as_json)
         return
     data = seq_state(f, s['key']) or new_seq_state(s['key'], s['title'], s.get('brief') or '')
     if args.action == 'set':
         if args.status not in STATUSES:
-            raise SystemExit(f'状态只能是：{" / ".join(STATUSES)}')
+            fail('usage_error', f'状态只能是：{" / ".join(STATUSES)}',
+                 fix=f'mashu feature set {args.stage or 1} 已完成', exit_code=EXIT_USAGE)
         st = next((x for x in data['stages'] if x['id'] == args.stage), None)
         if not st:
-            raise SystemExit(f'阶段号 1-{len(data["stages"])}')
+            fail('usage_error', f'阶段号范围 1-{len(data["stages"])}',
+                 fix='mashu feature status 查看阶段列表', exit_code=EXIT_USAGE)
         need = stage_def(data, args.stage).get('entry') if args.stage <= len(data['stages']) else None
         if need and args.status in ('进行中', '已完成') and st['status'] in ('未开始', '待确认') and \
                 not has_approval(conn, f['id'], s['key'], f'stage-{args.stage}'):
-            raise SystemExit(f'进入{stage_text_of(data, args.stage)}要{LEVEL_LABEL[need]}批准：'
-                             f'先把上一阶段标为已完成并 `mashu finish`（调度器会自动申请），或 `mashu ask --confirm-stage {args.stage} "…"`')
+            fail('approval_required',
+                 f'进入{stage_text_of(data, args.stage)}要{LEVEL_LABEL[need]}批准：'
+                 f'先把上一阶段标为已完成并 mashu finish（调度器会自动申请），或 mashu send up --type approve --confirm-stage {args.stage} "…"',
+                 fix=f'mashu send up "申请进入阶段 {args.stage}" --type approve --confirm-stage {args.stage}', exit_code=EXIT_RULE)
         st.update(status=args.status, updated_at=now_iso(), note=args.note or st.get('note', ''))
     elif args.action == 'handoff':        # 旧写法：同时写状态文件镜像和 handoff.md
         h = data.setdefault('handoff', {})
@@ -9922,15 +10013,20 @@ def cmd_seq(args):
     elif args.action == 'block':
         data['blocker'] = '' if args.clear else (args.text or '')
     save_state(f, s['key'], data)
-    print(status_text(f, s['key']))
+    txt = status_text(f, s['key'])
+    out_ok(dict(film=f['id'], key=s['key'], state=data, text=txt), txt, as_json=as_json)
 
 
 def cmd_gemini_models(args):
+    as_json = getattr(args, 'json', False)
     if args.refresh:
-        print(refresh_gemini_models())
+        res = refresh_gemini_models()
+        out_ok(dict(refreshed=True, result=res, models=gemini_models()), res, as_json=as_json)
         return
     src = '（agy models 缓存）' if (HOME / 'gemini-models.json').exists() else '（兜底列表，登录 agy 后用 --refresh 更新）'
-    print('Gemini 可选模型' + src + '：\n' + '\n'.join(gemini_models()))
+    ms = gemini_models()
+    out_ok(dict(cached=(HOME / 'gemini-models.json').exists(), models=ms),
+           'Gemini 可选模型' + src + '：\n' + '\n'.join(ms), as_json=as_json)
 
 
 def platform_selfcheck(prov):
@@ -9979,8 +10075,12 @@ def fmt_account(a):
 def cmd_account(args):
     """mashu account：账号池（Codex / Gemini 多账号）。RT 只从文件或标准输入读，不从命令行参数传（会进 shell 历史）。"""
     act = args.action
+    as_json = getattr(args, 'json', False)
     if act == 'list':
         accs = cli_accounts(args.target if args.target in acct.PLATFORMS else None)
+        if as_json:
+            out_ok(dict(accounts=accs), as_json=True)
+            return
         if not accs:
             print('模型池里还没有账号：mashu account import-local codex|gemini 登记本机登录，mashu account add codex 加 Codex 号')
             return
@@ -9996,11 +10096,12 @@ def cmd_account(args):
                 if args.key_file:
                     path = Path(args.key_file)
                     if path.stat().st_mode & 0o077:
-                        raise ValueError('密钥文件权限须为 0600')
+                        fail('permission_denied', '密钥文件权限须为 0600', fix=f'chmod 600 {path}', exit_code=EXIT_RULE)
                     key = path.read_text().strip()
                 else:
                     key = sys.stdin.readline().strip()
-                print(account_action('add-codex-api', dict(name=args.name, base_url=args.base_url, api_key=key))['result'])
+                res = account_action('add-codex-api', dict(name=args.name, base_url=args.base_url, api_key=key))
+                out_ok(res, res['result'], as_json=as_json)
                 return
             ensure_local_account('codex')
             p = pool()
@@ -10015,70 +10116,90 @@ def cmd_account(args):
             except acct.AccountError as exc:
                 if (pool().get(a['id']) or {}).get('status') == 'pending':
                     pool().remove(a['id'])
-                raise ValueError(f'{exc}（codex login 退出码 {r.returncode}）')
-            print(f'已加号：{account_label(b)}')
+                fail('login_failed', f'{exc}（codex login 退出码 {r.returncode}）',
+                     fix='mashu account add codex', exit_code=EXIT_ERR)
+            out_ok(dict(account=b), f'已加号：{account_label(b)}', as_json=as_json)
             return
         if args.target == 'gemini':
-            raise ValueError(GEMINI_SINGLE + '；登记本机当前登录用 mashu account import-local gemini')
-        raise ValueError('mashu account add codex [--device]（Gemini 只登记本机当前登录：mashu account import-local gemini）')
+            fail('usage_error', GEMINI_SINGLE, fix='mashu account import-local gemini', exit_code=EXIT_USAGE)
+        fail('usage_error', '请指定账号类型：codex（Gemini 只登记本机当前登录）',
+             fix='mashu account add codex [--device]', exit_code=EXIT_USAGE)
     if act == 'import-local':
-        print(account_action('import-local', dict(platform=args.target))['result'])
+        res = account_action('import-local', dict(platform=args.target))
+        out_ok(res, res['result'], as_json=as_json)
         return
     if act == 'check' and not args.target:
         res = accounts_check(force=True)
-        print('\n'.join(f'{x}：{r}' for x, r in res) or '模型池里还没有账号')
+        out_ok(dict(results=[dict(id=x, result=r) for x, r in res]),
+               '\n'.join(f'{x}：{r}' for x, r in res) or '模型池里还没有账号', as_json=as_json)
         return
-    print(account_action(act, dict(id=args.target or ''))['result'])
+    res = account_action(act, dict(id=args.target or ''))
+    out_ok(res, res['result'], as_json=as_json)
 
 
 def cmd_platforms(args):
+    as_json = getattr(args, 'json', False)
+    items = []
+    lines = []
     for prov in PROVIDERS:
         st = platform_status(prov)
         models = platform_models(prov)
+        checks = platform_selfcheck(prov) if (args.check and prov in ('codex', 'opencode')) else []
+        items.append(dict(id=prov, label=PROV_LABEL[prov], ok=st['ok'], version=st['version'],
+                          reason=st['reason'], models=list(models),
+                          checks=[dict(label=l, ok=o) for l, o in checks]))
         line = f'{PROV_LABEL[prov]:<9}{"可用" if st["ok"] else "不可用"}' + (f' · {st["version"]}' if st['version'] else '') + \
             (f' · {st["reason"]}' if st['reason'] else '') + (f' · 模型 {len(models)} 个' if models else '')
-        print(line)
-        if args.check and prov in ('codex', 'opencode'):
-            for label, ok in platform_selfcheck(prov):
-                print(f'    {"✓" if ok else "✗"} {label}')
+        lines.append(line)
+        for label, ok in checks:
+            lines.append(f'    {"✓" if ok else "✗"} {label}')
     if args.check:
-        print('（自检只验证输入格式的转换和判定；真实会话实测见 docs/references/platforms.md）')
+        lines.append('（自检只验证输入格式的转换和判定；真实会话实测见 docs/references/platforms.md）')
+    out_ok(dict(platforms=items), '\n'.join(lines), as_json=as_json)
 
 
 def cmd_opencode_models(args):
+    as_json = getattr(args, 'json', False)
+    refreshed = ''
     if args.refresh or not opencode_model_info():
-        print(refresh_opencode_models())
-    for k, v in opencode_model_info().items():
-        print(f'{k}  思考档位：{" / ".join(v.get("variants") or []) or "无"}  窗口：{v.get("context") or "?"}{"  免费" if v.get("free") else ""}')
+        refreshed = refresh_opencode_models()
+    info = opencode_model_info()
+    lines = ([refreshed] if refreshed else []) + [
+        f'{k}  思考档位：{" / ".join(v.get("variants") or []) or "无"}  窗口：{v.get("context") or "?"}{"  免费" if v.get("free") else ""}'
+        for k, v in info.items()
+    ]
+    out_ok(dict(models=info, refreshed=bool(refreshed)), '\n'.join(lines), as_json=as_json)
 
 
 def cmd_init(args):
     """首次安装：检查依赖、建 state/ 和 studio.json、确认记忆和 docs skill 就位。已有的文件不覆盖。"""
     import shutil
     ok = True
-    print('麻薯 Studio 初始化')
+    lines = ['麻薯 Studio 初始化']
+    deps = []
     for exe, need, tip in (('python3', True, ''), ('tmux', True, 'brew install tmux'),
                            (cfg('claude'), True, 'npm install -g @anthropic-ai/claude-code，再运行 claude 登录一次'),
                            ('git', False, ''), (cfg('agy'), False, '可选：Gemini（Antigravity CLI）'),
                            (cfg('codex'), False, '可选：Codex CLI（npm install -g @openai/codex，再 codex login）'),
                            (cfg('opencode'), False, '可选：OpenCode CLI（npm install -g opencode-ai）')):
         found = shutil.which(exe)
-        print(f'  {"✓" if found else ("✗" if need else "-")} {exe}{"：" + found if found else ("（" + tip + "）" if tip else "")}')
+        deps.append(dict(exe=exe, required=need, found=found or ''))
+        lines.append(f'  {"✓" if found else ("✗" if need else "-")} {exe}{"：" + found if found else ("（" + tip + "）" if tip else "")}')
         ok = ok and (bool(found) or not need)
     if sys.version_info < (3, 9):
-        print('  ✗ 需要 python3 ≥ 3.9'); ok = False
+        lines.append('  ✗ 需要 python3 ≥ 3.9'); ok = False
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     mig = ensure_migrated()
     conf = HOME / 'studio.json'
     if conf.exists():
-        print(f'  · 已有主配置 {conf}' + (f'（已迁移：{", ".join(mig["files"])}）' if mig.get('migrated') else '（不覆盖）'))
+        lines.append(f'  · 已有主配置 {conf}' + (f'（已迁移：{", ".join(mig["files"])}）' if mig.get('migrated') else '（不覆盖）'))
     else:
         example = CODE / 'studio.json.example'
         data = json.loads(example.read_text()) if example.exists() else {}
         if args.scan_root:
             data['scan_roots'] = args.scan_root
         cfgfile.write_config(conf, data)
-        print(f'  ✓ 写入主配置 {conf}（0600，字段说明见 mashu/studio.py 的 DEFAULTS）')
+        lines.append(f'  ✓ 写入主配置 {conf}（0600，字段说明见 mashu/studio.py 的 DEFAULTS）')
     conn = db()
     for project in films(conn):
         directory = film_docs(project)
@@ -10086,23 +10207,26 @@ def cmd_init(args):
             (directory / 'codex.md').write_text(CODEX_TEMPLATE)
     sync_project_skills(conn)
     conn.close()
-    print(f'  ✓ 数据目录 {HOME}')
+    lines.append(f'  ✓ 数据目录 {HOME}')
     missing = [n for n in ('index.md', '用户.md', '方针.md', '在办.md', '复盘.md', '守则.md') if not (MEMORY / n).exists()]
-    print(f'  {"✗ 记忆缺文件：" + "、".join(missing) if missing else "✓ 记忆 " + str(MEMORY)}')
+    lines.append(f'  {"✗ 记忆缺文件：" + "、".join(missing) if missing else "✓ 记忆 " + str(MEMORY)}')
     host = skill_host()
-    print(f'  {"✓ docs skill 已挂载，可用 mashu skills status 检查安装位置" if host else "- docs skill 未启用，知识地图照常可读"}')
-    print('\n下一步：' + ('./start.sh 启动，然后在网页主对话里跟麻薯说话。想定制自己的麻薯：改 docs/memory/（用户、方针、守则）'
-                        '和 mashu/prompts/，详见 README。' if ok else '先装好上面标 ✗ 的依赖，再跑一次 mashu init。'))
+    lines.append(f'  {"✓ docs skill 已挂载，可用 mashu skills status 检查安装位置" if host else "- docs skill 未启用，知识地图照常可读"}')
+    lines.append('\n下一步：' + ('./start.sh 启动，然后在网页主对话里跟麻薯说话。想定制自己的麻薯：改 docs/memory/（用户、方针、守则）'
+                             '和 mashu/prompts/，详见 README。' if ok else '先装好上面标 ✗ 的依赖，再跑一次 mashu init。'))
+    out_ok(dict(ready=ok, deps=deps, home=str(HOME), config=str(conf), missing_memory=missing, skill_host=bool(host)),
+           '\n'.join(lines), as_json=getattr(args, 'json', False))
 
 
 def cmd_skills(args):
+    as_json = getattr(args, 'json', False)
     with db() as conn:
         if args.action == 'status':
-            rows = skill_inventory(conn)
-            if args.json:
-                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            items = skill_inventory(conn)
+            if as_json:
+                out_ok(dict(items=items), as_json=True)
             else:
-                for row in rows:
+                for row in items:
                     print(f'{row["status"]}\t{row["version"] or "—"}\t{(row["fingerprint"] or "—")[:8]}\t{row["path"]}')
             return
         projects = films(conn)
@@ -10110,15 +10234,11 @@ def cmd_skills(args):
             projects = [require_film(conn, args.project)]
         changes, errors = skills_dist.sync(HOME, Path.home(), codex_homes(), projects,
                                            apply=args.apply, managed_only=args.managed_only)
-    print('已同步' if args.apply else '预览（加 --apply 执行）')
-    for change in changes:
-        print(f'- {change}')
-    if not changes:
-        print('无需更改')
-    for error in errors:
-        print(f'ERROR {error}', file=sys.stderr)
     if errors:
-        raise SystemExit(1)
+        fail('skills_sync_error', '；'.join(errors), fix='解决冲突后重试 mashu skills sync --apply',
+             exit_code=EXIT_CONFLICT, data=dict(changes=changes, errors=errors))
+    lines = ['已同步' if args.apply else '预览（加 --apply 执行）'] + [f'- {c}' for c in changes] + ([] if changes else ['无需更改'])
+    out_ok(dict(applied=bool(args.apply), changes=changes, errors=[]), '\n'.join(lines), as_json=as_json)
 
 
 def _prompt_passphrase(prompt, confirm=False):
@@ -10150,34 +10270,41 @@ def _fmt_import_preview(preview):
 def cmd_config(args):
     """mashu config：导出 / 导入 / 迁移主配置文件 state/studio.json。口令只走交互输入，不进命令行参数和日志。"""
     act = args.action
+    as_json = getattr(args, 'json', False)
     if act == 'migrate':
         r = ensure_migrated()
-        if r.get('migrated'):
-            print(f'迁移完成：{", ".join(r["files"])}\n旧文件已备份到：{r["backup_dir"]}')
-        else:
-            print(f'已是最新主配置格式（{HOME / "studio.json"}），无需迁移')
+        txt = (f'迁移完成：{", ".join(r["files"])}\n旧文件已备份到：{r["backup_dir"]}'
+               if r.get('migrated') else f'已是最新主配置格式（{HOME / "studio.json"}），无需迁移')
+        out_ok(r, txt, as_json=as_json)
         return
     if act == 'export':
         if not args.out:
-            raise ValueError('请用 --out <文件路径> 指定导出位置')
+            fail('usage_error', '请用 --out <文件路径> 指定导出位置',
+                 fix='mashu config export --out /path/to/studio.json', exit_code=EXIT_USAGE)
         pw = _prompt_passphrase('设置加密口令（不显示）：', confirm=True) if args.with_secrets else None
         res = cfgfile.export_to_file(HOME, args.out, with_secrets=bool(args.with_secrets), passphrase=pw)
-        print(f'已导出到：{res["path"]}（{"加密 · 含密钥" if res["with_secrets"] else "明文 · 密钥已省略"}）')
+        txt = f'已导出到：{res["path"]}（{"加密 · 含密钥" if res["with_secrets"] else "明文 · 密钥已省略"}）'
         if res.get('warning'):
-            print(f'⚠ {res["warning"]}')
+            txt += f'\n⚠ {res["warning"]}'
+        out_ok(res, txt, as_json=as_json)
         return
     if act == 'import':
         if not args.file:
-            raise ValueError('请指定要导入的配置文件路径')
+            fail('usage_error', '请指定要导入的配置文件路径', fix='mashu config import <文件> --dry-run', exit_code=EXIT_USAGE)
         raw = cfgfile.read_json(args.file)
         if not isinstance(raw, dict):
-            raise ValueError(f'读不到或格式不对：{args.file}')
+            fail('invalid_file', f'读不到或格式不对：{args.file}', fix='检查文件是否为合法 JSON', exit_code=EXIT_USAGE)
         pw = _prompt_passphrase('输入解密口令（不显示）：', confirm=False) if raw.get('encrypted') else None
         preview = cfgfile.preview_import(HOME, raw, passphrase=pw)
-        print(_fmt_import_preview(preview))
         if args.dry_run:
+            out_ok(dict(dry_run=True, preview=preview), _fmt_import_preview(preview), as_json=as_json)
             return
-        if not args.yes:
+        if not args.yes and not getattr(args, 'confirm', False):
+            if as_json:
+                confirm_or_fail(args, 'confirm_required', '导入主配置将覆盖本地设置，请确认',
+                                f'mashu config import {shlex.quote(args.file)} --yes --json',
+                                changes=[c['summary'] for c in preview.get('changes') or []])
+            print(_fmt_import_preview(preview))
             ans = (input('确认写入主配置？[y/N] ') if sys.stdin.isatty() else sys.stdin.readline()).strip().lower()
             if ans not in ('y', 'yes', '是'):
                 print('已取消，未改动任何文件。')
@@ -10186,24 +10313,145 @@ def cmd_config(args):
         _cfg_cache['mtime'] = None
         _ACCT_Q.clear()
         _LIMITS_CACHE['at'] = 0
-        print(f'已导入主配置 {HOME / "studio.json"}' + (f'（写入前已备份到：{res["backup_path"]}）' if res.get('backup_path') else ''))
+        txt = f'已导入主配置 {HOME / "studio.json"}' + (f'（写入前已备份到：{res["backup_path"]}）' if res.get('backup_path') else '')
+        out_ok(res, txt, as_json=as_json)
         return
 
 
 def cmd_tick(args):
     tick(db())
+    out_ok(dict(ticked=True), '' if not getattr(args, 'json', False) else None, as_json=getattr(args, 'json', False))
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(prog='mashu', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+class MashuArgumentParser(argparse.ArgumentParser):
+    """把 argparse 报错转成结构化 MashuError（退出码 2，带 code 和 fix）。"""
+
+    def error(self, message):
+        cmd = self.prog.split()[-1] if self.prog and self.prog != 'mashu' else ''
+        fix = f'mashu help {cmd}' if cmd else 'mashu help'
+        fail('usage_error', message, fix=fix, exit_code=EXIT_USAGE)
+
+
+CMD_EXAMPLES = {
+    'me': ['mashu me', 'mashu me --json'],
+    'inbox': ['mashu inbox', 'mashu inbox --all --json'],
+    'send': [
+        'mashu send up "选方案 A 还是 B？" --type ask --options "方案A|方案B" --recommend A --why "改动小"',
+        'mashu send up "已完成阶段 1，46 项测试全过" --type done --key stage1-done',
+        'mashu send #15 "接口已改好" --type fyi',
+        'mashu send @crew "提交了阶段 1 代码" --type fyi',
+        'printf "价格 $100\\n" | mashu send up - --type fyi',
+        'mashu send user "申请开工" --type approve --gate kickoff --ref mashu/16 --supersedes 380',
+    ],
+    'reply': [
+        'mashu reply 380 --choice A',
+        'mashu reply 380 --choice A "按方案一继续推进"',
+        'mashu reply 380 "放 tests/ 目录下"',
+    ],
+    'forward': [
+        'mashu forward 380 user "涉及对外接口，建议方案 A" --recommend A --why "改动小"',
+        'mashu forward 380 user "请审批不可逆操作" --confirm',
+        'mashu forward 380 boss "跨项目冲突请协调"',
+    ],
+    'close': [
+        'mashu close 337 --why "过时：已被 #338 取代" --silent',
+        'mashu close 337 --why "过时：功能已归档" --silent --confirm',
+    ],
+    'schema': ['mashu schema --json', 'mashu schema'],
+    'help': ['mashu help', 'mashu help send'],
+    'status': ['mashu status', 'mashu status mashu --json'],
+    'stop': [
+        'mashu stop mashu/16 --reason "暂停等待接口定稿"',
+        'mashu stop mashu/16 --reason "必须立即中止" --confirm',
+    ],
+    'new-feature': ['mashu new-feature mashu my-feat --brief "需求说明" --plan .mashu/plans/my-feat.md --preset p-4'],
+    'feature': ['mashu feature status', 'mashu feature set 1 已完成', 'mashu feature block --text "等外部审批"'],
+    'handoff': ['mashu handoff --now "完成了什么" --next "下一步或无" --files "改了哪些文件" --docs "无文档变更"'],
+    'finish': ['mashu finish --reason "完成"', 'mashu finish --reason "上下文交接"'],
+    'ac': ['mashu ac list', 'mashu ac add "WHEN … THE system SHALL …"', 'mashu ac pass AC-1 --evidence "测试通过"'],
+    'note': ['mashu note mashu/16 "补充一条说明"'],
+    'restart-server': ['mashu restart-server --reason "新代码已提交" --confirm'],
+}
+
+CMD_ALIASES = {
+    'callsheet': 'status', 'greenlight': 'add-project', 'pitch': 'new-feature', 'workflow': 'playbook',
+    'action': 'start', 'cut': 'stop', 'retake': 'restart', 'wrap': 'finish', 'seq': 'feature',
+}
+
+
+def _describe_parser(sp):
+    args_list = []
+    for act in sp._actions:
+        if act.dest == 'help':
+            continue
+        if isinstance(act, argparse._SubParsersAction):
+            sub_map = {}
+            for k, v in act.choices.items():
+                sub_map[k] = _describe_parser(v)
+            args_list.append(dict(name=act.dest, subcommands=sub_map, required=bool(act.required)))
+            continue
+        item = dict(
+            name=act.dest,
+            flags=list(act.option_strings),
+            positional=not act.option_strings,
+            required=bool(getattr(act, 'required', False)) or (not act.option_strings and act.nargs not in ('?', '*')),
+            help=(act.help or '').replace('%%', '%'),
+        )
+        if act.choices is not None:
+            item['choices'] = [str(x) for x in act.choices]
+        args_list.append(item)
+    return args_list
+
+
+def schema_data(p, sub_action):
+    """自省全部已注册 CLI 命令、参数、退出码、消息类型与地址约定。"""
+    seen = {}
+    aliases_of = {}
+    for name, sp in sub_action.choices.items():
+        canon = CMD_ALIASES.get(name, name)
+        if name != canon:
+            aliases_of.setdefault(canon, []).append(name)
+            continue
+        if canon in seen:
+            continue
+        seen[canon] = sp
+    help_map = {a.dest: a.help or '' for a in getattr(sub_action, '_choices_actions', [])}
+    commands = []
+    for name, sp in seen.items():
+        if name.startswith('hook-') or name == 'statusline':
+            continue
+        commands.append(dict(
+            name=name,
+            aliases=aliases_of.get(name, []),
+            help=help_map.get(name, ''),
+            args=_describe_parser(sp),
+            examples=CMD_EXAMPLES.get(name, []),
+        ))
+    return dict(
+        api_version=API_VERSION,
+        exit_codes={str(k): v for k, v in EXIT_CODES.items()},
+        msg_types=MSG_TYPE_LABEL,
+        addresses=['user', 'boss', 'lead', 'up', '#<编号>', '<项目>', '<项目>#<编号>', '@crew'],
+        core_commands=['me', 'inbox', 'send', 'reply', 'forward', 'close'],
+        commands=commands,
+    )
+
+
+def build_parser(include_selfiter=True):
+    jp = argparse.ArgumentParser(add_help=False)
+    jp.add_argument('--json', action='store_true', default=argparse.SUPPRESS, help='以单行 JSON 输出')
+    p = MashuArgumentParser(prog='mashu', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, parents=[jp])
     sub = p.add_subparsers(dest='command', required=True)
-    # 新统一通信面（6 个核心动词）
-    s = sub.add_parser('me', help='我是谁：角色、项目、功能、可发对象与手头待办')
-    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
-    s = sub.add_parser('inbox', help='收件箱：发给我的待处理、已过时与挂久提醒')
+
+    def add(name, **kw):
+        kw['parents'] = list(kw.get('parents') or []) + [jp]
+        return sub.add_parser(name, **kw)
+
+    # 新统一通信面（6 个核心动词）+ 自描述命令
+    add('me', help='我是谁：角色、项目、功能、可发对象与手头待办')
+    s = add('inbox', help='收件箱：发给我的待处理、已过时与挂久提醒')
     s.add_argument('--all', action='store_true', help='包含已结案、被取代和全部上报')
-    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
-    s = sub.add_parser('send', help='按对象地址发消息（支持 user/boss/lead/up/#N/<项目>/<项目>#N/@crew）')
+    s = add('send', help='按对象地址发消息（user/boss/lead/up/#N/<项目>/<项目>#N/@crew）')
     s.add_argument('to', help='发送对象地址')
     s.add_argument('text', help='消息正文（写 - 从标准输入读取）')
     s.add_argument('--type', choices=MSG_TYPES, help='消息类型：ask/approve/fyi/done/blocked/handoff')
@@ -10221,33 +10469,33 @@ def main(argv=None):
     s.add_argument('--re', help='关联/回复某条旧卡编号')
     s.add_argument('--supersedes', help='取代某条旧卡编号并自动将其结案')
     s.add_argument('--key', help='去重键（重试安全，同键不重复建卡）')
-    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
-    s = sub.add_parser('reply', help='回答 / 批复一条上报（支持 --choice A）')
+    s = add('reply', help='回答 / 批复一条上报（支持 --choice A）')
     s.add_argument('id', help='上报编号（如 380 或 #380）')
     s.add_argument('text', nargs='?', default='', help='回复文本或补充说明（写 - 从标准输入读取）')
     s.add_argument('--choice', help='按选项编号作答（A/B/1/2 或选项文本）')
-    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
     reply_parser = s
-    s = sub.add_parser('forward', help='转交上报给上级或主脑（原 pass）')
+    s = add('forward', help='转交上报给上级或主脑（原 pass）')
     s.add_argument('id', help='上报编号')
     s.add_argument('to', help='转交对象：user / up / boss')
     s.add_argument('note', nargs='?', default='', help='一句意见（写 - 从标准输入读取）')
     s.add_argument('--recommend', help='推荐选项（可写 A/B 或选项文本）')
     s.add_argument('--why', help='推荐理由')
     s.add_argument('--confirm', action='store_true', help='确认执行')
-    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
     forward_parser = s
-    s = sub.add_parser('close', help='结案一条待处理上报（含过时清理与静默结案）')
+    s = add('close', help='结案一条待处理上报（含过时清理与静默结案）')
     s.add_argument('id', help='上报编号')
     s.add_argument('--why', required=True, help='结案原因（如 "过时：已合并"）')
     s.add_argument('--silent', action='store_true', help='静默结案，不唤醒发起者')
     s.add_argument('--confirm', action='store_true', help='确认结案用户手上的卡片')
-    s.add_argument('--json', action='store_true', help='以单行 JSON 输出')
-    s = sub.add_parser('status', aliases=['callsheet'], help='状态总览'); s.add_argument('film', nargs='?')
-    s = sub.add_parser('add-project', aliases=['greenlight'], help='登记项目'); s.add_argument('path'); s.add_argument('--id')
+    add('schema', help='输出全部命令、参数、退出码与地址约定（推荐 --json）')
+    s = add('help', help='查看命令帮助与真实例子')
+    s.add_argument('target', nargs='?', help='命令名（留空显示总览）')
+
+    s = add('status', aliases=['callsheet'], help='状态总览'); s.add_argument('film', nargs='?')
+    s = add('add-project', aliases=['greenlight'], help='登记项目'); s.add_argument('path'); s.add_argument('--id')
     s.add_argument('--title')
-    sub.add_parser('scan', help='未登记的工程文件夹')
-    s = sub.add_parser('new-feature', aliases=['pitch'], help='新建功能'); s.add_argument('film'); s.add_argument('slug')
+    add('scan', help='未登记的工程文件夹')
+    s = add('new-feature', aliases=['pitch'], help='新建功能'); s.add_argument('film'); s.add_argument('slug')
     s.add_argument('--brief', required=True); s.add_argument('--title'); s.add_argument('--playbook', help='用哪个工作流模板（先找本项目 .mashu/playbooks/，再找麻薯通用模板）')
     s.add_argument('--workflow', action='store_true', help='按项目的专门工作流分阶段（默认直接做，不分阶段）')
     s.add_argument('--touches', nargs='+', help='预计改动范围（glob），重叠时通知双方与子脑协调分工')
@@ -10259,81 +10507,84 @@ def main(argv=None):
     s.add_argument('--cli-account', help='执行者用模型池里哪个 Codex 号（cx-2…；要配 --cli codex，不写 = 自动选号）')
     s.add_argument('--model', help='执行者的模型（该 CLI 的模型名，mashu platforms 可查；不写 = 默认）')
     s.add_argument('--effort', choices=EFFORTS, help='执行者的思考程度（不写 = 默认）')
-    s = sub.add_parser('playbook', aliases=['workflow'], help='工作流（可复用流程）')
+    s = add('playbook', aliases=['workflow'], help='工作流（可复用流程）')
     s.add_argument('action', choices=['list', 'show', 'check', 'commit', 'apply', 'restore'])
     s.add_argument('target', nargs='?', help='template:<id> 或 film:<id>'); s.add_argument('--note'); s.add_argument('--template')
     s.add_argument('--version', type=int)
-    s = sub.add_parser('logs', help='运行日志（结构化事件）'); s.add_argument('--kind'); s.add_argument('--level')
+    s = add('logs', help='运行日志（结构化事件）'); s.add_argument('--kind'); s.add_argument('--level')
     s.add_argument('--hours', type=float, default=24); s.add_argument('--limit', type=int, default=40); s.add_argument('--film')
     s.add_argument('--stats', action='store_true', help='按类型汇总')
-    s = sub.add_parser('retro', help='复盘数据'); s.add_argument('film', nargs='?'); s.add_argument('--days', type=int, default=14)
+    s = add('retro', help='复盘数据'); s.add_argument('film', nargs='?'); s.add_argument('--days', type=int, default=14)
     for name, alias, h in (('start', 'action', '启动执行者'), ('stop', 'cut', '停止执行者'), ('restart', 'retake', '换新执行者')):
-        s = sub.add_parser(name, aliases=[alias], help=h); s.add_argument('ref')
+        s = add(name, aliases=[alias], help=h); s.add_argument('ref')
         if name == 'start':
             s.add_argument('--prompt')
         if name == 'stop':
             s.add_argument('--reason', help='为什么停、接下来等谁（agent 调用时必填，显示在功能频道）')
-            s.add_argument('--force', action='store_true', help='有生效中的上线 / 不可逆批准时仍然停（必须在 --reason 写清为什么）')
-    s = sub.add_parser('note', help='给执行者补充指令'); s.add_argument('ref'); s.add_argument('text')
-    s = sub.add_parser('memo', help='主脑给子脑的指示'); s.add_argument('film'); s.add_argument('text')
-    s = sub.add_parser('say', help='麻薯在主对话里说话'); s.add_argument('text')
-    s = sub.add_parser('ask', help='请示'); s.add_argument('question'); s.add_argument('--summary'); s.add_argument('--options')
+            s.add_argument('--confirm', action='store_true', help='确认停止（有生效中的上线 / 不可逆批准时必填）')
+            s.add_argument('--force', action='store_true', help='同 --confirm（兼容旧写法）')
+    s = add('note', help='给执行者补充指令（兼容别名，等价于 send <项目>#<编号>）'); s.add_argument('ref'); s.add_argument('text')
+    s = add('memo', help='主脑给子脑的指示（兼容别名，等价于 send <项目>）'); s.add_argument('film'); s.add_argument('text')
+    s = add('say', help='麻薯在主对话里说话'); s.add_argument('text')
+    s = add('ask', help='请示（兼容别名，等价于 send up --type ask）'); s.add_argument('question'); s.add_argument('--summary'); s.add_argument('--options')
     s.add_argument('--confirm-stage', type=int); s.add_argument('--gate'); s.add_argument('--recommend', help='你推荐的选项')
     s.add_argument('--why', help='推荐理由（一句话）'); s.add_argument('--impact', help='影响范围'); s.add_argument('--reversible', choices=['yes', 'no'])
     s.add_argument('--human', action='store_true', help='需要真人帮忙（登录、密钥、付款、线下操作），网页上归到「要你帮忙」')
     s.add_argument('--urgent', action='store_true', help='紧急且和自己上一条未回的请示无关时才用，否则一轮只发一条')
     s.add_argument('--ref', help='子脑/主脑用：挂到哪个功能上，写成 <项目>/<功能编号>（如重新申请开工 --gate kickoff --ref myapp/8）')
-    s = sub.add_parser('tell', help='通报'); s.add_argument('text'); s.add_argument('--summary')
-    s = sub.add_parser('report', help='子脑把跨项目的事交给主脑'); s.add_argument('text'); s.add_argument('--summary')
-    s = sub.add_parser('pass', help='上交上报'); s.add_argument('id'); s.add_argument('note', nargs='?')
+    s.add_argument('--re', help='关联某条旧卡编号')
+    s.add_argument('--supersedes', help='取代某条旧卡编号并自动结案')
+    s.add_argument('--key', help='去重键（重试安全）')
+    s = add('tell', help='通报（兼容别名，等价于 send up --type fyi）'); s.add_argument('text'); s.add_argument('--summary'); s.add_argument('--key')
+    s = add('report', help='子脑把跨项目的事交给主脑（兼容别名，等价于 send boss）'); s.add_argument('text'); s.add_argument('--summary'); s.add_argument('--key')
+    s = add('pass', help='上交上报（兼容别名，等价于 forward <id> up）'); s.add_argument('id'); s.add_argument('note', nargs='?')
     s.add_argument('--recommend'); s.add_argument('--why')
-    s = sub.add_parser('answer', help='批复上报'); s.add_argument('id'); s.add_argument('text')
-    s = sub.add_parser('browser', help='浏览器的活交给不开 Code Mode 的独立会话（Code Mode 下用不了 Chrome）')
+    s = add('answer', help='批复上报（兼容别名，等价于 reply）'); s.add_argument('id'); s.add_argument('text')
+    s = add('browser', help='浏览器的活交给不开 Code Mode 的独立会话（Code Mode 下用不了 Chrome）')
     s.add_argument('task'); s.add_argument('--model'); s.add_argument('--cwd'); s.add_argument('--timeout', type=int, default=20)
-    s = sub.add_parser('decide', help='记决策'); s.add_argument('text'); s.add_argument('--why'); s.add_argument('--film')
+    s = add('decide', help='记决策'); s.add_argument('text'); s.add_argument('--why'); s.add_argument('--film')
     s.add_argument('--seq'); s.add_argument('--ratify', action='store_true', help='要用户追认（默认记为已执行）')
-    s = sub.add_parser('finish', aliases=['wrap'], help='本阶段完成 / 交接'); s.add_argument('--reason', required=True)
-    s = sub.add_parser('handoff', help='写交接文档 handoff.md（上下文到 75%% 时用）')
+    s = add('finish', aliases=['wrap'], help='本阶段完成 / 交接'); s.add_argument('--reason', required=True)
+    s = add('handoff', help='写交接文档 handoff.md（上下文到 75%% 时用）')
     for k in ('now', 'next', 'open', 'files', 'evidence', 'risk', 'file', 'docs'):
         s.add_argument(f'--{k}')
-    sub.add_parser('reports', help='我手上的上报')
-    s = sub.add_parser('priority', help='调整排队优先级'); s.add_argument('ref'); s.add_argument('value', type=int)
-    s = sub.add_parser('feature', aliases=['seq'], help='功能状态文件'); s.add_argument('action', choices=['status', 'set', 'handoff', 'block'])
+    add('reports', help='我手上的上报（兼容别名，推荐使用 inbox）')
+    s = add('priority', help='调整排队优先级'); s.add_argument('ref'); s.add_argument('value', type=int)
+    s = add('feature', aliases=['seq'], help='功能状态文件'); s.add_argument('action', choices=['status', 'set', 'handoff', 'block'])
     s.add_argument('stage', nargs='?', type=int); s.add_argument('status', nargs='?'); s.add_argument('--note')
     s.add_argument('--ref')
     for k in ('progress', 'next', 'confirm', 'context', 'risk', 'evidence'):
         s.add_argument(f'--{k}')
     s.add_argument('--text'); s.add_argument('--clear', action='store_true')
-    s = sub.add_parser('ac', help='验收标准'); s.add_argument('action', choices=['add', 'pass', 'fail', 'list'])
+    s = add('ac', help='验收标准'); s.add_argument('action', choices=['add', 'pass', 'fail', 'list'])
     s.add_argument('arg', nargs='?', help='add：内容；pass/fail：AC 编号'); s.add_argument('--evidence'); s.add_argument('--ref')
-    s = sub.add_parser('claim', help='声明改动范围'); s.add_argument('globs', nargs='+'); s.add_argument('--add', action='store_true')
-    s = sub.add_parser('sync', help='查看或更新项目协作板'); s.add_argument('text', nargs='?')
-    s = sub.add_parser('skills', help='检查或同步 caesar-docs').add_subparsers(dest='action', required=True)
-    s.add_parser('status', help='查看版本和指纹').add_argument('--json', action='store_true')
-    s = s.add_parser('sync', help='预览或应用同步')
+    s = add('claim', help='声明改动范围'); s.add_argument('globs', nargs='+'); s.add_argument('--add', action='store_true')
+    s = add('sync', help='查看或更新项目协作板（兼容别名，发布等价于 send @crew）'); s.add_argument('text', nargs='?')
+    sk = add('skills', help='检查或同步 caesar-docs').add_subparsers(dest='action', required=True)
+    sk.add_parser('status', help='查看版本和指纹', parents=[jp])
+    s = sk.add_parser('sync', help='预览或应用同步', parents=[jp])
     s.add_argument('--apply', action='store_true')
     s.add_argument('--managed-only', action='store_true', help='跳过用户级目录')
     s.add_argument('--project', help='只同步指定工程的副本')
-    s = sub.add_parser('peer', help='联系同项目执行者'); s.add_argument('ref'); s.add_argument('text'); s.add_argument('--fyi', action='store_true', help='只通知，不等对方回复')
-    s = sub.add_parser('codex', help='查看工程法典或追加子脑约定'); s.add_argument('action', choices=['note'], nargs='?'); s.add_argument('text', nargs='?')
+    s = add('peer', help='联系同项目执行者（兼容别名，等价于 send #N）'); s.add_argument('ref'); s.add_argument('text'); s.add_argument('--fyi', action='store_true', help='只通知，不等对方回复')
+    s = add('codex', help='查看工程法典或追加子脑约定'); s.add_argument('action', choices=['note'], nargs='?'); s.add_argument('text', nargs='?')
     s.add_argument('--ref')
-    s = sub.add_parser('waive', help='豁免一次自动检查'); s.add_argument('ref'); s.add_argument('--reason', required=True)
-    s = sub.add_parser('digest', help='简报数据'); s.add_argument('--send', action='store_true')
-    s = sub.add_parser('restart-server', help='重启网页服务与调度器（只给主脑用）'); s.add_argument('--reason')
-    sub.add_parser('tick')
-    s = sub.add_parser('init', help='首次安装：检查依赖、建 state/、写默认配置（可重复跑）')
+    s = add('waive', help='豁免一次自动检查'); s.add_argument('ref'); s.add_argument('--reason', required=True)
+    s = add('digest', help='简报数据'); s.add_argument('--send', action='store_true')
+    s = add('restart-server', help='重启网页服务与调度器（只给主脑用）'); s.add_argument('--reason'); s.add_argument('--confirm', action='store_true', help='确认重启')
+    add('tick')
+    s = add('init', help='首次安装：检查依赖、建 state/、写默认配置（可重复跑）')
     s.add_argument('--scan-root', action='append', help='扫描未登记工程的根目录（可多次；默认 ~/workspace）')
-    s = sub.add_parser('gemini-models', help='Gemini（agy）可选模型；--refresh 跑 agy models 更新（要先登录 agy）')
+    s = add('gemini-models', help='Gemini（agy）可选模型；--refresh 跑 agy models 更新（要先登录 agy）')
     s.add_argument('--refresh', action='store_true')
     for h in ('statusline', 'hook-prompt', 'hook-stop', 'hook-notify', 'hook-pretool', 'hook-session'):
-        s = sub.add_parser(h)
+        s = add(h)
         s.add_argument('--agy', action='store_true', help='Gemini（agy）调用：输入输出用 agy 的格式')
         s.add_argument('--codex', action='store_true', help='Codex 调用（格式同 Claude，工具名不同）')
         s.add_argument('--opencode', action='store_true', help='麻薯的 OpenCode 插件调用')
-    s = sub.add_parser('preset', help='模型池预设（只读列出；增删改在网页模型池页做）')
+    s = add('preset', help='模型池预设（只读列出；增删改在网页模型池页做）')
     s.add_argument('action', choices=['list'])
-    s.add_argument('--json', action='store_true', help='以 JSON 格式输出')
-    s = sub.add_parser('account', help='模型池账号：Codex 多账号；Gemini 只管本机当前登录的一个号（list / add / import-local / check / refresh / default / disable / enable / remove）')
+    s = add('account', help='模型池账号：Codex 多账号；Gemini 只管本机当前登录的一个号（list / add / import-local / check / refresh / default / disable / enable / remove）')
     s.add_argument('action', choices=['list', 'add', 'import-local', 'check', 'refresh', 'default', 'disable', 'enable', 'remove'])
     s.add_argument('target', nargs='?', help='add / import-local：codex 或 gemini；其余：号 ID（cx-1、gm-2…）')
     s.add_argument('--device', action='store_true', help='Codex：用设备码登录（不在本机浏览器里登录时用）')
@@ -10341,33 +10592,118 @@ def main(argv=None):
     s.add_argument('--name', help='API 号名称')
     s.add_argument('--base-url', help='兼容 Responses 的 API 地址')
     s.add_argument('--key-file', help='读取密钥的 0600 文件')
-    s = sub.add_parser('platforms', help='各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型，--check 跑一遍安全拦截自检')
+    s = add('platforms', help='各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型，--check 跑一遍安全拦截自检')
     s.add_argument('--check', action='store_true')
-    s = sub.add_parser('opencode-models', help='OpenCode 可选模型；--refresh 跑 opencode models --verbose 更新缓存')
+    s = add('opencode-models', help='OpenCode 可选模型；--refresh 跑 opencode models --verbose 更新缓存')
     s.add_argument('--refresh', action='store_true')
-    s = sub.add_parser('config', help='主配置文件（state/studio.json）：export / import / migrate')
+    s = add('config', help='主配置文件（state/studio.json）：export / import / migrate')
     s.add_argument('action', choices=['export', 'import', 'migrate'])
     s.add_argument('file', nargs='?', help='import：要导入的配置文件路径')
     s.add_argument('--out', help='export：输出文件路径')
     s.add_argument('--with-secrets', action='store_true', help='export：带上密钥并交互输入口令加密（默认省略密钥）')
     s.add_argument('--dry-run', action='store_true', help='import：只预览差异，不写入')
     s.add_argument('-y', '--yes', action='store_true', help='import：跳过确认直接写入')
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if not next(iter(raw_argv), '').startswith(('hook-', 'statusline')):
+    s.add_argument('--confirm', action='store_true', help='同 --yes')
+    if include_selfiter:
         selfiter_call('add_parser', sub)          # 每日自迭代（hooks 和状态栏调用频繁，不加载）
-    if raw_argv and raw_argv[0] == 'reply' and '-h' not in raw_argv and '--help' not in raw_argv:
-        args = reply_parser.parse_intermixed_args(raw_argv[1:])
-        args.command = 'reply'
-    elif raw_argv and raw_argv[0] == 'forward' and '-h' not in raw_argv and '--help' not in raw_argv:
-        args = forward_parser.parse_intermixed_args(raw_argv[1:])
-        args.command = 'forward'
-    else:
-        args = p.parse_args(raw_argv)
-    alias = {'callsheet': 'status', 'greenlight': 'add-project', 'pitch': 'new-feature', 'workflow': 'playbook', 'action': 'start',
-             'cut': 'stop', 'retake': 'restart', 'wrap': 'finish', 'seq': 'feature'}
-    cmd = alias.get(args.command, args.command)
+        si = sub.choices.get('self-iterate')
+        if si and not any('--json' in a.option_strings for a in si._actions):
+            si.add_argument('--json', action='store_true', default=argparse.SUPPRESS, help='以单行 JSON 输出')
+    return p, sub, reply_parser, forward_parser
+
+
+def cmd_schema(args, p=None, sub=None):
+    if p is None or sub is None:
+        p, sub, _, _ = build_parser(include_selfiter=True)
+    data = schema_data(p, sub)
+    if getattr(args, 'json', False):
+        out_ok(data, as_json=True)
+        return
+    lines = [f'mashu CLI schema (api_version={API_VERSION}) — 共 {len(data["commands"])} 个命令']
+    lines.append('核心 6 动词：' + ' / '.join(data['core_commands']))
+    lines.append('地址：' + '、'.join(data['addresses']))
+    lines.append('类型：' + '、'.join(f'{k}({v})' for k, v in MSG_TYPE_LABEL.items()))
+    lines.append('退出码：' + '；'.join(f'{k}={v}' for k, v in EXIT_CODES.items()))
+    lines.append('\n全部命令（完整 JSON 用 mashu schema --json）：')
+    for c in data['commands']:
+        al = f'（别名：{", ".join(c["aliases"])}）' if c['aliases'] else ''
+        lines.append(f'  {c["name"]:<16} {c["help"]}{al}')
+    print('\n'.join(lines))
+
+
+def cmd_help(args, p=None, sub=None):
+    if p is None or sub is None:
+        p, sub, _, _ = build_parser(include_selfiter=True)
+    target = (getattr(args, 'target', None) or '').strip()
+    as_json = getattr(args, 'json', False)
+    if not target:
+        lines = [
+            'mashu CLI 常用命令（所有命令均支持 --json）：',
+            '  核心通信（6 动词）：',
+            '    mashu me                                  我是谁、可发给谁、手头待办',
+            '    mashu inbox [--all] [--json]              收件箱（自动分拣过时/挂久）',
+            '    mashu send <对象> "正文"|- [--type …]     按地址发消息（user/boss/lead/up/#N/<项目>/@crew）',
+            '    mashu reply <id> [--choice A] ["补充"]    回答 / 批复（支持选项编号）',
+            '    mashu forward <id> <对象> "意见"          转交（原 pass）',
+            '    mashu close <id> --why "…" [--silent]     结案（含过时清理）',
+            '  自描述：',
+            '    mashu help <命令>                         查看某个命令的用法与真实例子',
+            '    mashu schema --json                       全部命令、参数与退出码 JSON',
+            '  常用管理：status / new-feature / start / stop / feature / ac / handoff / finish / claim / codex',
+            '  退出码：0=成功 1=一般错误 2=用法错误 3=找不到 4=需确认 5=被规则拦截 6=冲突',
+        ]
+        out_ok(dict(commands=list(sub.choices.keys()), exit_codes=EXIT_CODES), '\n'.join(lines), as_json=as_json)
+        return
+    canon = CMD_ALIASES.get(target, target)
+    sp = sub.choices.get(canon) or sub.choices.get(target)
+    if not sp:
+        fail('not_found', f'没有命令「{target}」', fix='mashu help 查看全部命令', exit_code=EXIT_NOT_FOUND)
+    usage = sp.format_help().rstrip()
+    examples = CMD_EXAMPLES.get(canon, CMD_EXAMPLES.get(target, []))
+    txt = usage + ('\n\n示例：\n' + '\n'.join(f'  {ex}' for ex in examples) if examples else '')
+    out_ok(dict(command=canon, usage=usage, args=_describe_parser(sp), examples=examples), txt, as_json=as_json)
+
+
+def _emit_error(code, message, fix, exit_code, as_json=False, data=None):
+    payload = {'ok': False, 'api_version': API_VERSION, 'code': code, 'error': message, 'fix': fix}
+    if data:
+        payload.update(data)
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+        raise CliExit(message, exit_code=exit_code, payload=payload, printed=True)
+    msg = f'错误：{message}' + (f'\n下一步：{fix}' if fix else '')
+    raise CliExit(msg, exit_code=exit_code, payload=payload, printed=False)
+
+
+def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    as_json_pre = '--json' in raw_argv
+    first_non_flag = next((a for a in raw_argv if not a.startswith('-')), '')
+    include_si = not first_non_flag.startswith(('hook-', 'statusline'))
+    p, sub, reply_parser, forward_parser = build_parser(include_selfiter=include_si)
+    # 兼容把 --json 写在子命令前面（mashu --json status）或后面（mashu status --json）
+    parse_argv = raw_argv
+    if raw_argv and raw_argv[0] == '--json' and len(raw_argv) > 1:
+        parse_argv = raw_argv[1:] + ['--json']
+    try:
+        if parse_argv and parse_argv[0] == 'reply' and '-h' not in parse_argv and '--help' not in parse_argv:
+            args = reply_parser.parse_intermixed_args(parse_argv[1:])
+            args.command = 'reply'
+        elif parse_argv and parse_argv[0] == 'forward' and '-h' not in parse_argv and '--help' not in parse_argv:
+            args = forward_parser.parse_intermixed_args(parse_argv[1:])
+            args.command = 'forward'
+        else:
+            args = p.parse_args(parse_argv)
+    except MashuError as exc:
+        if first_non_flag.startswith(('hook-', 'statusline')):
+            return
+        _emit_error(exc.code, exc.message, exc.fix, exc.exit_code, as_json=as_json_pre, data=exc.data)
+    cmd = CMD_ALIASES.get(args.command, args.command)
+    as_json = bool(getattr(args, 'json', False) or as_json_pre)
+    args.json = as_json
     handler = {
         'me': cmd_me, 'inbox': cmd_inbox, 'send': cmd_send, 'reply': cmd_reply, 'forward': cmd_forward, 'close': cmd_close,
+        'schema': lambda a: cmd_schema(a, p, sub), 'help': lambda a: cmd_help(a, p, sub),
         'status': cmd_callsheet, 'add-project': cmd_greenlight, 'scan': cmd_scan, 'new-feature': cmd_pitch, 'start': cmd_action,
         'stop': cmd_cut, 'restart': cmd_retake, 'note': cmd_note, 'memo': cmd_memo, 'say': cmd_say, 'ask': cmd_ask,
         'tell': cmd_tell, 'report': cmd_report, 'pass': cmd_pass, 'answer': cmd_answer, 'decide': cmd_decide, 'browser': cmd_browser,
@@ -10379,28 +10715,23 @@ def main(argv=None):
         'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,
         'opencode-models': cmd_opencode_models, 'init': cmd_init, 'account': cmd_account, 'preset': cmd_preset, 'config': cmd_config,
         'self-iterate': lambda a: __import__('selfiter').cmd(a)}[cmd]
-    as_json = bool(getattr(args, 'json', False))
     try:
-        handler(args)
+        if cmd == 'self-iterate' and as_json:
+            import contextlib, io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                handler(args)
+            out_ok(dict(text=buf.getvalue().rstrip()), as_json=True)
+        else:
+            handler(args)
     except MashuError as exc:
         if cmd.startswith('hook-') or cmd == 'statusline':
             return
-        payload = {'ok': False, 'api_version': API_VERSION, 'code': exc.code, 'error': exc.message, 'fix': exc.fix}
-        if exc.data:
-            payload.update(exc.data)
-        if as_json:
-            print(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
-            raise CliExit(exc.message, exit_code=exc.exit_code, payload=payload, printed=True)
-        msg = f'错误：{exc.message}' + (f'\n下一步：{exc.fix}' if exc.fix else '')
-        raise CliExit(msg, exit_code=exc.exit_code, payload=payload, printed=False)
+        _emit_error(exc.code, exc.message, exc.fix, exc.exit_code, as_json=as_json, data=exc.data)
     except (ValueError, RuntimeError) as exc:
         if cmd.startswith('hook-') or cmd == 'statusline':
             return
-        payload = {'ok': False, 'api_version': API_VERSION, 'code': 'error', 'error': str(exc), 'fix': f'mashu {cmd} --help'}
-        if as_json:
-            print(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
-            raise CliExit(str(exc), exit_code=EXIT_ERR, payload=payload, printed=True)
-        raise CliExit(f'错误：{exc}\n下一步：mashu {cmd} --help', exit_code=EXIT_ERR, payload=payload, printed=False)
+        _emit_error('error', str(exc), f'mashu help {cmd}', EXIT_ERR, as_json=as_json)
 
 
 if __name__ == '__main__':
