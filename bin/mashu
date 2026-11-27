@@ -1,4 +1,20 @@
 #!/usr/bin/env bash
-# 麻薯电脑秘书 CLI 薄壳：mashu <命令>（会话里由 PATH 找到；hooks 也调用它）
+# 麻薯电脑秘书 CLI 分流器：mashu <命令>（会话里由 PATH 找到；hooks 也调用它）
+# 默认运行 state/runtime/ 下的已发布快照；设置 MASHU_DEV=1、快照不存在或快照版本过旧（不支持 MASHU_CONTENT）时回退到工作区代码。
+set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "$DIR/../mashu/studio.py" "$@"
+ROOT="$(cd "$DIR/.." && pwd)"
+if [[ "$(basename "$ROOT")" == "runtime" ]] && [[ "$(basename "$(dirname "$ROOT")")" == "state" ]] && [[ -e "$(dirname "$(dirname "$ROOT")")/.git" ]]; then
+  ROOT="$(cd "$ROOT/../.." && pwd)"
+fi
+HOME_DIR="${MASHU_HOME:-$ROOT/state}"
+CONTENT_DIR="${MASHU_CONTENT:-$ROOT}"
+RUNTIME_STUDIO="$HOME_DIR/runtime/mashu/studio.py"
+
+export MASHU_HOME="$HOME_DIR"
+export MASHU_CONTENT="$CONTENT_DIR"
+export MASHU_MEMORY="${MASHU_MEMORY:-$CONTENT_DIR/docs/memory}"
+if [[ "${MASHU_DEV:-}" != "1" ]] && [[ -f "$RUNTIME_STUDIO" ]] && grep -q 'MASHU_CONTENT' "$RUNTIME_STUDIO" 2>/dev/null; then
+  exec python3 "$RUNTIME_STUDIO" "$@"
+fi
+exec python3 "$ROOT/mashu/studio.py" "$@"

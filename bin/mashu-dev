@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# 麻薯电脑秘书开发入口：固定运行当前工作区代码（跳过 state/runtime/ 快照），供开发手测使用。
+# 手测请配合隔离的临时 MASHU_HOME（例如 MASHU_HOME=/tmp/mashu-dev bin/mashu-dev status），不要碰正式 state/。
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$DIR/.." && pwd)"
+if [[ "$(basename "$ROOT")" == "runtime" ]] && [[ "$(basename "$(dirname "$ROOT")")" == "state" ]] && [[ -e "$(dirname "$(dirname "$ROOT")")/.git" ]]; then
+  ROOT="$(cd "$ROOT/../.." && pwd)"
+fi
+export MASHU_DEV=1
+export MASHU_HOME="${MASHU_HOME:-$ROOT/state}"
+export MASHU_CONTENT="${MASHU_CONTENT:-$ROOT}"
+export MASHU_MEMORY="${MASHU_MEMORY:-$ROOT/docs/memory}"
+exec python3 "$ROOT/mashu/studio.py" "$@"

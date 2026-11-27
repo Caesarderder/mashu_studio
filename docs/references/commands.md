@@ -46,12 +46,14 @@ related:
 | --- | --- |
 | `mashu help [命令]` | 查看命令用法与真实例子 |
 | `mashu schema --json` | 输出全部命令、参数、退出码、消息类型与地址约定 |
-| `mashu status [项目]` | 全局或某个项目的状态（含每个会话的详细状态与点对点等待） |
+| `mashu status [项目]` | 全局或某个项目的状态（第一行显示线上快照版本与工作区领先提交数，含每个会话的详细状态与点对点等待） |
 | `mashu handoff --now … --next … [--open … --files … --evidence … --risk … --docs …]` / `--file PATH` | 写交接文档。`--docs` 记录回写节点或无需回写的理由 |
 | `mashu skills status [--json]` | 列出 caesar-docs 来源和各安装位置的版本、指纹及漂移 |
 | `mashu skills sync [--apply] [--managed-only] [--project ID]` | 默认预览。应用时备份并替换用户级链接，`--managed-only` 跳过用户级位置，`--project` 限定工程副本 |
 | `mashu finish --reason "…"` | 本阶段完成 / 交接 |
-| `mashu restart-server --reason "…" --confirm` | 重启网页服务与调度器（只给主脑，需确认信封 `--confirm`；各会话不受影响） |
+| `mashu release [--sha <提交>] [--rollback] [--same] [--dry-run] [--no-restart] [--reason "…"] [--json]` | 发布已提交版本到 `state/runtime/` 快照并重启服务（只给主脑和终端用户；先在临时 worktree 跑 `.mashu/check.sh`，失败拒绝发布返回 `code=check_failed`；`--rollback` 回滚上一版本跳过检查；`--same` 仅重启不换版本；`--no-restart` 只更新快照不重启；详见 [平台说明](platforms.md)） |
+| `mashu restart-server [--same] [--sha <提交>] [--dry-run] --reason "…" --confirm` | 走 `release` 流程发布并重启网页服务与调度器（只给主脑，需确认信封 `--confirm`；只想重启不换版本加 `--same`；各会话不受影响） |
+| `bin/mashu-dev <命令>` | 开发入口：固定跑工作区代码（设 `MASHU_DEV=1` 绕过 `state/runtime/` 快照）；手测须配合独立临时 `MASHU_HOME` |
 
 ### 兼容别名（旧通信命令全部保留）
 

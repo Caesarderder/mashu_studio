@@ -7,18 +7,39 @@
 #   ./start.sh auto     给 launchd 用：手动 stop 过就不拉起；网页服务没响应就重启它
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+if [[ "$(basename "$ROOT")" == "runtime" ]] && [[ "$(basename "$(dirname "$ROOT")")" == "state" ]] && [[ -e "$(dirname "$(dirname "$ROOT")")/.git" ]]; then
+  ROOT="$(cd "$ROOT/../.." && pwd)"
+fi
 SESSION="${MASHU_TMUX:-mashu-studio}"
 PORT="${MASHU_PORT:-8770}"
 URL="http://127.0.0.1:${PORT}/"
-STOPPED="$ROOT/state/.stopped"   # 手动 stop 留下的标记，自动启动看到它就不拉起
+HOME_DIR="${MASHU_HOME:-$ROOT/state}"
+STOPPED="$HOME_DIR/.stopped"   # 手动 stop 留下的标记，自动启动看到它就不拉起
 LABEL="${MASHU_LAUNCHD_LABEL:-com.mashu-studio}"   # launchd 标签；旧版装过的自动启动沿用旧标签
 for _old in "$HOME"/Library/LaunchAgents/com.*.mashu-studio.plist; do
   [[ -f "$_old" ]] && LABEL="$(basename "$_old" .plist)" && break
 done
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-SERVER_CMD="cd '$ROOT' && python3 mashu/server.py --port $PORT; echo '服务已退出，按回车关闭窗口'; read -r _"
-
+RUNTIME_SERVER="$HOME_DIR/runtime/mashu/server.py"
+RUNTIME_STUDIO="$HOME_DIR/runtime/mashu/studio.py"
 MODE="${1:-}"
+if [[ "$MODE" == "restart" ]] && [[ "${MASHU_DEV:-}" != "1" ]] && [[ -d "$HOME_DIR/runtime" ]]; then
+  if ! grep -q 'MASHU_CONTENT' "$RUNTIME_STUDIO" 2>/dev/null || ! grep -q 'release_runtime' "$RUNTIME_SERVER" 2>/dev/null; then
+    echo "检测到旧版运行快照（不支持 MASHU_CONTENT 或 release），先从工作区 HEAD 自动发布升级…"
+    MASHU_DEV=1 MASHU_HOME="$HOME_DIR" MASHU_CONTENT="$ROOT" MASHU_MEMORY="${MASHU_MEMORY:-$ROOT/docs/memory}" \
+      python3 "$ROOT/mashu/studio.py" release --no-restart --reason "start.sh restart 自动升级旧快照"
+  fi
+fi
+SERVER_SCRIPT="$ROOT/mashu/server.py"
+SERVER_CWD="$ROOT"
+if [[ "${MASHU_DEV:-}" != "1" ]] && [[ -f "$RUNTIME_SERVER" ]] && [[ -f "$RUNTIME_STUDIO" ]] \
+   && grep -q 'MASHU_CONTENT' "$RUNTIME_STUDIO" 2>/dev/null \
+   && grep -q 'release_runtime' "$RUNTIME_SERVER" 2>/dev/null; then
+  SERVER_SCRIPT="$RUNTIME_SERVER"
+  SERVER_CWD="$HOME_DIR/runtime"
+fi
+SERVER_CMD="cd '$SERVER_CWD' && MASHU_HOME='$HOME_DIR' MASHU_CONTENT='$ROOT' MASHU_MEMORY='${MASHU_MEMORY:-$ROOT/docs/memory}' python3 '$SERVER_SCRIPT' --port $PORT; echo '服务已退出，按回车关闭窗口'; read -r _"
+
 case "$MODE" in
   stop)
     mkdir -p "$ROOT/state" && touch "$STOPPED"

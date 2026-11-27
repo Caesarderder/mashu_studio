@@ -35,9 +35,7 @@ def code_stale():
 
 def restart_later():
     """网页上的「重启服务」按钮：先回应页面，1 秒后在独立进程组里跑 start.sh restart（会关掉本进程所在的 office 窗口再重开）。"""
-    import subprocess
-    subprocess.Popen(['bash', '-c', 'sleep 1; NO_OPEN=1 ./start.sh restart'], cwd=str(studio.CODE), start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    studio.schedule_server_restart()
 DASH_CACHE = {}           # 项目 id → (时间, 工作流面板数据)
 MSG_COLS = 'id, ts, sender, camera_id, camera_name, channel, film_id, seq_key, target, kind, text, report_id'
 
@@ -402,6 +400,32 @@ class Handler(BaseHTTPRequestHandler):
                 studio.log_event(studio.db(), 'error', level='error', where=f'POST {url.path}',
                                  err=studio.acct.redact(f'{type(exc).__name__}: {exc}')[:500])
                 return self.send_json({'error': studio.acct.redact(f'{type(exc).__name__}: {exc}')}, 500)
+        if url.path == '/api/restart-server':   # 发布快照并重启服务：要跑 check.sh，不占全局锁
+            try:
+                data = self.body() or {}
+                res = studio.release_runtime(
+                    studio.db(),
+                    sha=(data.get('sha') or '').strip() or None,
+                    rollback=bool(data.get('rollback')),
+                    same=bool(data.get('same')),
+                    dry_run=bool(data.get('dry_run')),
+                    actor='executive',
+                    reason=(data.get('reason') or '').strip() or '网页按钮重启服务',
+                    restart_fn=restart_later,
+                )
+                return self.send_json({'ok': True, **res})
+            except studio.MashuError as exc:
+                payload = {'ok': False, 'code': exc.code, 'error': exc.message, 'fix': exc.fix}
+                if exc.data:
+                    payload.update(exc.data)
+                return self.send_json(payload, 400)
+            except (ValueError, RuntimeError) as exc:
+                return self.send_json({'ok': False, 'code': 'release_failed', 'error': str(exc)}, 400)
+            except Exception as exc:
+                traceback.print_exc()
+                studio.log_event(studio.db(), 'error', level='error', where='POST /api/restart-server',
+                                 err=f'{type(exc).__name__}: {exc}', tb=traceback.format_exc()[-1500:])
+                return self.send_json({'ok': False, 'code': 'error', 'error': f'{type(exc).__name__}: {exc}'}, 500)
         try:
             data = self.body()
             conn = studio.db()
@@ -495,10 +519,6 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('这个文件已经不在了')
             plain_dir = p.is_dir() and p.suffix.lower() not in ('.app', '.bundle', '.pkg', '.framework', '.plugin')
             subprocess.run(['open', str(p)] if plain_dir else ['open', '-R', str(p)], timeout=10, check=False)
-            return {'ok': True}
-        if path == '/api/restart-server':
-            studio.audit(conn, 'executive', 'restart-server', None, None, '网页按钮重启服务')
-            restart_later()
             return {'ok': True}
         if path == '/api/priority':
             f, s = studio.resolve_ref(conn, data['ref'])
@@ -635,7 +655,7 @@ def quote_name(name):
 
 def viewable(conn, p):
     home = Path.home()
-    roots = [studio.HOME / 'uploads', studio.CODE, Path(tempfile.gettempdir()), Path('/tmp'), Path('/private/tmp'),
+    roots = [studio.HOME / 'uploads', studio.CONTENT, studio.CODE, Path(tempfile.gettempdir()), Path('/tmp'), Path('/private/tmp'),
              home / 'Desktop', home / 'Downloads', home / 'Pictures']
     roots += [Path(f['path']).expanduser() for f in studio.films(conn) if f.get('path')]
     if any(part.startswith('.') and part not in ('.mashu', '.claude-shots') for part in p.parts[:-1]) and \
@@ -701,7 +721,7 @@ def library(conn):
                 out.append(dict(path=str(rel), mtime=p.stat().st_mtime))
         return out
     # 按归属分区：麻薯自己的（mashu_studio 里）一块，每个项目一块（全在各自工程文件夹里），互不混放
-    owners = [dict(key='mashu', title='麻薯', path=str(studio.CODE))]
+    owners = [dict(key='mashu', title='麻薯', path=str(studio.CONTENT))]
     groups = [dict(key='memory', owner='mashu', title='记忆', files=files(studio.MEMORY)),
               dict(key='kmap', owner='mashu', title='知识地图（docs）', files=files(studio.KMAP, skip=('history', 'memory', 'reference'))),
               dict(key='playbooks', owner='mashu', title='通用工作流模板', files=files(studio.PLAYBOOKS, skip=('history', 'behaviors')))]

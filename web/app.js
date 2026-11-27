@@ -861,11 +861,27 @@ function renderSide() {
     <span title="同时在岗的子脑">子脑 ${state.desks.used}/${state.desks.max}</span></div>`);
   const tr = $('#tabsRight');
   const tmuxCmd = `tmux attach -t ${state.tmux || 'mashu-studio'}`;
-  const stale = !!state.server?.stale;
-  if (tr._cmd !== tmuxCmd + stale) {
-    tr._cmd = tmuxCmd + stale;
-    tr.innerHTML = `<button class="ghost-btn restart-btn ${stale ? 'stale' : ''}" data-restart title="${stale ? '麻薯的代码改过了，重启网页服务后生效（各会话不受影响）' : '重启网页服务和调度器（各会话不受影响）'}">${icon('restart', 14)}<span>${stale ? '有更新，重启生效' : '重启服务'}</span></button>
-      <span class="tmux" data-copy="${esc(tmuxCmd)}" title="点击复制">${icon('terminal', 13)}${esc(tmuxCmd)}</span>
+  const rt = state.runtime || null;
+  const shortSha = rt && rt.sha ? String(rt.sha).slice(0, 7) : '';
+  const ahead = Number((rt && rt.ahead) || 0);
+  const dirty = !!(rt && rt.dirty);
+  const stale = ahead > 0 || !!state.server?.stale;
+  const verText = shortSha ? (ahead > 0 ? `${shortSha} · +${ahead}` : `线上 ${shortSha}`) : '';
+  const verTitle = shortSha
+    ? `线上版本：${rt.sha}${rt.released_at ? `\n发布时间：${rt.released_at}` : ''}${rt.released_by ? `\n发布人：${rt.released_by}` : ''}${ahead > 0 ? `\n工作区已领先 ${ahead} 个提交` : ''}${dirty ? '\n工作区有未提交改动（不影响线上快照）' : ''}`
+    : '';
+  const btnText = restartBusy ? '检查发布中…' : (ahead > 0 ? `有 ${ahead} 个提交待发布` : (stale ? '有更新，重启生效' : '重启服务'));
+  const btnTitle = restartBusy
+    ? '正在对工作区 HEAD 运行检查并切换稳定快照…'
+    : (ahead > 0
+      ? `工作区已领先 ${ahead} 个提交，点击运行检查、发布新快照并重启服务（各会话不受影响）`
+      : '检查 HEAD、发布稳定快照并重启网页服务与调度器（各会话不受影响）');
+  const trKey = `${tmuxCmd}|${shortSha}|${ahead}|${dirty}|${stale}|${restartBusy}`;
+  if (tr._cmd !== trKey) {
+    tr._cmd = trKey;
+    tr.innerHTML = `${verText ? `<span class="runtime-ver${ahead > 0 ? ' ahead' : ''}" title="${esc(verTitle)}">${esc(verText)}</span>` : ''}
+      <button class="ghost-btn restart-btn ${stale ? 'stale' : ''}${restartBusy ? ' busy' : ''}" data-restart ${restartBusy ? 'disabled' : ''} title="${esc(btnTitle)}">${icon('restart', 14)}<span>${esc(btnText)}</span></button>
+      <span class="tmux" data-copy="${esc(tmuxCmd)}" title="点击复制：${esc(tmuxCmd)}">${icon('terminal', 13)}<span class="tmux-text">${esc(tmuxCmd)}</span></span>
       <button class="ghost-btn bell" data-feed title="动态：各项目的进展和交互">${icon('bell', 16)}<span id="feedBadge"></span></button>
       <button class="ghost-btn" data-palette title="跳转 / 命令（⌘K）"><span class="kbd">⌘K</span></button>
       <button class="ghost-btn" data-panel-toggle title="收起 / 展开右侧栏（⌘\\）">${icon('panel', 16)}</button>`;
@@ -3377,13 +3393,54 @@ function applyTheme() {
 }
 darkMQ?.addEventListener?.('change', applyTheme);
 function cycleTheme() { themePref = { auto: 'light', light: 'dark', dark: 'auto' }[themePref]; save('mashu.theme', themePref); applyTheme(); toast(`主题：${{ auto: '跟随系统', light: '浅色', dark: '深色' }[themePref]}`); }
-async function restartServer() {
-  try { await api('/api/restart-server', {}); } catch (e) { return toast(e.message); }
-  toast('正在重启网页服务，几秒后自动刷新…');
+let restartBusy = false;
+function showReleaseFailure(data, fallbackMsg) {
+  const msg = (data && data.error) || fallbackMsg || '发布或重启失败';
+  const detail = (data && data.check_output) || '';
+  const fix = (data && data.fix) || '';
+  toast(`重启发布失败：${msg.split('\n')[0]}`);
+  openModal(`<h2>发布 / 重启失败</h2>
+    <p style="margin:6px 0 0;color:var(--text-2)">${esc(msg.split('\n')[0])}</p>
+    ${detail ? `<pre class="release-err">${esc(detail)}</pre>` : (msg.includes('\n') ? `<pre class="release-err">${esc(msg)}</pre>` : '')}
+    ${fix ? `<p class="hint" style="margin-top:8px">建议：${esc(fix)}</p>` : ''}
+    <div class="api-actions" style="margin-top:12px">
+      <button class="btn" data-close>关闭</button>
+      <button class="btn" id="restartSameBtn">仅重启（不换版本）</button>
+    </div>`);
+  $('#modalBox').classList.add('wide');
+  const sb = $('#restartSameBtn');
+  if (sb) sb.onclick = () => { closeModal(); restartServer({ same: true }); };
+}
+async function restartServer(opts = {}) {
+  if (restartBusy) return;
+  restartBusy = true;
+  renderSide();
+  if (!opts.same) toast('正在检查并准备发布新快照…');
+  let res, data = {};
+  try {
+    res = await fetch('/api/restart-server', {
+      method: 'POST',
+      headers: { 'X-Mashu-Token': TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts || {}),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    restartBusy = false;
+    renderSide();
+    return showReleaseFailure(null, e.message);
+  }
+  if (!res.ok) {
+    restartBusy = false;
+    renderSide();
+    return showReleaseFailure(data, res.statusText);
+  }
+  const shortSha = data.sha ? String(data.sha).slice(0, 7) : '';
+  toast(opts.same ? '正在重启网页服务，几秒后自动刷新…' : `检查通过${shortSha ? `（${shortSha}）` : ''}，正在重启网页服务…`);
   const t0 = Date.now();
   const poll = async () => {      // 等新服务起来再刷新
     try { if (Date.now() - t0 > 2500 && (await fetch('/', { cache: 'no-store' })).ok) return location.reload(); } catch (e) {}
-    if (Date.now() - t0 < 60000) setTimeout(poll, 1000); else toast('重启超时，请手动刷新页面');
+    if (Date.now() - t0 < 60000) setTimeout(poll, 1000);
+    else { restartBusy = false; renderSide(); toast('重启超时，请手动刷新页面'); }
   };
   setTimeout(poll, 1500);
 }

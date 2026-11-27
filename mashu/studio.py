@@ -45,9 +45,12 @@ import docs_governance as docs  # noqa: E402
 import skill_sync as skills_dist  # noqa: E402
 
 CODE = Path(__file__).resolve().parent.parent
+CONTENT = Path(os.environ.get('MASHU_CONTENT') or (
+    CODE.parent.parent if CODE.name == 'runtime' and CODE.parent.name == 'state' and (CODE.parent.parent / '.git').exists() else CODE
+))
 PROMPTS = Path(__file__).resolve().parent / 'prompts'
-BIN = CODE / 'bin'
-HOME = Path(os.environ.get('MASHU_HOME') or CODE / 'state')
+BIN = CONTENT / 'bin'
+HOME = Path(os.environ.get('MASHU_HOME') or CONTENT / 'state')
 
 ASSISTANT_NAME = '麻薯'
 SCHEMA_VERSION = 2
@@ -108,13 +111,14 @@ DEFAULTS = dict(
 CONFIG_OVERRIDES = {}             # 测试用
 _cfg_cache = {'mtime': None, 'data': {}}
 
-PLAYBOOKS = CODE / 'playbooks'                     # 工作流模板库（可复用的工作流）
-KMAP = CODE / 'docs'                                # 麻薯的知识地图（入口 docs/indexes/docs.md）
+PLAYBOOKS = CONTENT / 'playbooks'                     # 工作流模板库（可复用的工作流）
+KMAP = CONTENT / 'docs'                                # 麻薯的知识地图（入口 docs/indexes/docs.md）
 MEMORY = Path(os.environ.get('MASHU_MEMORY') or KMAP / 'memory')   # 麻薯的记忆（docs 节点，入口 index.md）
 MEMORY_INDEX = MEMORY / 'index.md'
 DEFAULT_PLAYBOOK = 'direct'     # 默认不分阶段：一个执行者做到底；只有用项目的专门工作流时才分阶段
 # 阶段定义来自工作流（playbooks/*.json → 每个项目 .mashu/playbook.json → 每功能启动时快照进 state.json）
-STAGES = json.loads((PLAYBOOKS / 'standard.json').read_text())['stages']      # 老状态文件缺字段时的补齐来源
+_STD_PB = (PLAYBOOKS / 'standard.json') if (PLAYBOOKS / 'standard.json').is_file() else (CODE / 'playbooks' / 'standard.json')
+STAGES = json.loads(_STD_PB.read_text())['stages']      # 老状态文件缺字段时的补齐来源
 DONE = ('已完成', '跳过')
 STATUSES = ('未开始', '进行中', '待确认', '已完成', '跳过')
 ENTRY_LEVELS = (None, 'producer', 'assistant', 'executive')
@@ -504,7 +508,7 @@ def tmux_alive():
 
 def ensure_tmux():
     if not tmux_alive():
-        tmux('new-session', '-d', '-s', session_name(), '-n', 'office', '-c', str(CODE))
+        tmux('new-session', '-d', '-s', session_name(), '-n', 'office', '-c', str(CONTENT))
 
 
 def alive_panes():
@@ -637,7 +641,7 @@ def greenlight(conn, path, film_id=None, title=None):
                 commands={}, safety=dict(protected_branches=['main', 'master', 'release/*', 'staging/*', 'production'],
                                          extra_patterns=[]),
                 crew_prompt_extra='')
-    if path == CODE.resolve():
+    if path in (CODE.resolve(), CONTENT.resolve()):
         # 自我开发：执行者改的是正在运行的麻薯电脑秘书本身，停服务 / 杀会话会把所有人一起带走，必须用户审批
         conf['safety']['extra_patterns'] = [
             dict(regex=r'start\.sh\s+(stop|restart)|tmux\s+(-L\s+\S+\s+)?kill-(server|session)|pkill\b.*mashu|kill\b.*server\.py',
@@ -669,7 +673,7 @@ def scan_candidates(conn):
             continue
         for d in sorted(base.iterdir()):
             if d.is_dir() and not d.name.startswith('.') and str(d.resolve()) not in known \
-                    and d.resolve() not in (CODE, HOME):
+                    and d.resolve() not in (CODE.resolve(), CONTENT.resolve(), HOME.resolve()):
                 found.append(dict(path=str(d.resolve()), name=d.name, git=is_git(d)))
     return found
 
@@ -3136,7 +3140,7 @@ def launch(conn, cid, pane=None, no_prompt=False):
     cmd = ['/bin/sh', str(script)]
     f = film(conn, c['film_id']) if c['film_id'] else None
     env = dict(MASHU_SESSION=str(cid), MASHU_ROLE=c['role'], MASHU_NAME=c['name'], MASHU_FILM=c['film_id'] or '',
-               MASHU_SEQ=c['seq_key'] or '', MASHU_HOME=str(HOME), MASHU_TMUX=session_name(),
+               MASHU_SEQ=c['seq_key'] or '', MASHU_HOME=str(HOME), MASHU_CONTENT=str(CONTENT), MASHU_TMUX=session_name(),
                MASHU_TMUX_SOCKET=cfg('tmux_socket') or '',
                MASHU_SEQ_DIR=str(seq_dir(f, c['seq_key'])) if f and c['seq_key'] else '',
                PATH=f'{BIN}:{os.environ.get("PATH", "/usr/bin:/bin")}', **{CODE_ENV: '1' if code else '0'})
@@ -8400,7 +8404,7 @@ def record_docs_usage(conn, c, f, tool, ti):
         return
     key = f'docs-usage:{c["id"]}'
     summary = json.loads(meta_get(conn, key, '{}'))
-    root = Path(f['path']).resolve() if f else CODE
+    root = Path(f['path']).resolve() if f else CONTENT
     if docs.update_usage(summary, tool, ti, root, ti.get('workdir') or os.getcwd()):
         meta_set(conn, key, json.dumps(summary, ensure_ascii=False))
 
@@ -8488,7 +8492,7 @@ def session_context(conn, c):
                     f'{project["title"]} · {project["producer_name"]}' for project in films(conn)[:24]) + '\n'
                 f'在办（节选）：\n{tail(MEMORY / "在办.md", 3000)}\n\n'
                 f'你手上的上报：{len(open_reports(conn, "assistant"))} 个（mashu reports）；全局：mashu status'
-                + docs.routes(CODE) + handoff_context(conn, c))
+                + docs.routes(CONTENT) + handoff_context(conn, c))
     f = film(conn, c['film_id'])
     if not f:
         return ''
@@ -9128,7 +9132,8 @@ def status_data(conn):
         pref_defaults=pref_defaults,
         presets=ps, role_presets=rp, preset_fallback_pct=cfg('preset_fallback_pct'),
         model_choices=MODELS, effort_choices=EFFORTS, gemini_model_choices=gemini_models(), provider_choices=PROVIDERS,
-        gemini_models_cached=(HOME / 'gemini-models.json').exists(), platforms=platforms_view())
+        gemini_models_cached=(HOME / 'gemini-models.json').exists(), platforms=platforms_view(),
+        runtime=runtime_info())
 
 
 def platforms_view():
@@ -9304,7 +9309,7 @@ def cmd_callsheet(args):
     if getattr(args, 'json', False):
         films_out = [f for f in data['films'] if not args.film or f['id'] == args.film]
         out_ok(dict(
-            date=today(), stages=data['stages'], reads=data['reads'], desks=data['desks'],
+            date=today(), runtime=data['runtime'], stages=data['stages'], reads=data['reads'], desks=data['desks'],
             inbox=data['inbox'], decisions_pending=data['decisions_pending'],
             films=films_out, open_reports=open_reports(conn),
         ), as_json=True)
@@ -9312,6 +9317,7 @@ def cmd_callsheet(args):
     st = data['stages']
     per = '、'.join(f'{x["label"]} {x["used"]}' for x in st['by_account'])
     print(f'状态总览 {today()}：执行者 {st["used"]} 个（每个账号上限 {st["max"]}{"：" + per if per else ""}），子脑并发 '
+    print(_format_runtime_line(data.get('runtime')))
           f'{data["desks"]["used"]}/{data["desks"]["max"]}，待用户处理 {len(data["inbox"])} 件，决策记录待追认 {data["decisions_pending"]} 条')
     for f in data['films']:
         if args.film and f['id'] != args.film:
@@ -9364,22 +9370,309 @@ def caller(conn):
     return env_camera(conn)
 
 
-def cmd_restart_server(args):
-    """主脑（或终端里的用户）重启网页服务与调度器，和网页「重启服务」按钮同一做法；各会话不受影响。"""
-    conn = db()
+def runtime_dir():
+    return HOME / 'runtime'
+
+
+def runtime_meta_path():
+    return HOME / 'runtime.json'
+
+
+def read_runtime_meta():
+    p = runtime_meta_path()
+    if not p.is_file():
+        return {}
+    try:
+        d = json.loads(p.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_runtime_meta(data):
+    p = runtime_meta_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name('.runtime.json.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+    os.replace(tmp, p)
+
+
+def _git_output(repo, *args):
+    try:
+        r = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, timeout=15)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except (OSError, subprocess.SubprocessError):
+        return 1, '', ''
+
+
+def runtime_info():
+    """返回线上运行快照状态：{sha, released_at, released_by, ahead, dirty}。"""
+    repo = CONTENT
+    meta = read_runtime_meta()
+    rdir = runtime_dir()
+    active = rdir.is_dir() and (rdir / 'mashu' / 'studio.py').is_file()
+    head = git_head(repo) or ''
+    if active:
+        rc, out, _ = _git_output(rdir, 'rev-parse', 'HEAD')
+        sha = out if rc == 0 and out else (meta.get('sha') or '')
+    else:
+        sha = meta.get('sha') or head
+    ahead = 0
+    if sha and head and sha != head and is_git(repo):
+        rc, out, _ = _git_output(repo, 'rev-list', '--count', f'{sha}..{head}')
+        if rc == 0 and out.isdigit():
+            ahead = int(out)
+    dirty = False
+    if is_git(repo):
+        rc, out, _ = _git_output(repo, 'status', '--porcelain')
+        dirty = bool(rc == 0 and out)
+    return dict(
+        sha=sha,
+        released_at=meta.get('released_at') or '',
+        released_by=meta.get('released_by') or '',
+        ahead=ahead,
+        dirty=dirty,
+    )
+
+
+def _format_runtime_line(rt):
+    sha = (rt or {}).get('sha') or ''
+    short = sha[:7] if sha else '未知'
+    ahead = int((rt or {}).get('ahead') or 0)
+    dirty = bool((rt or {}).get('dirty'))
+    line = f'线上版本 {short} · 工作区已领先 {ahead} 个提交' if ahead > 0 else f'线上版本 {short}'
+    if dirty:
+        line += '（工作区有未提交改动）'
+    return line
+
+
+def _checkout_runtime(repo, rdir, target_sha):
+    rdir.parent.mkdir(parents=True, exist_ok=True)
+    if rdir.is_dir():
+        rc, inside, _ = _git_output(rdir, 'rev-parse', '--is-inside-work-tree')
+        if rc == 0 and inside == 'true':
+            rc1, _, _ = _git_output(rdir, 'checkout', '--detach', '--force', target_sha)
+            if rc1 == 0:
+                _git_output(rdir, 'clean', '-fd')
+                return
+        _git_output(repo, 'worktree', 'remove', '--force', str(rdir))
+        shutil.rmtree(rdir, ignore_errors=True)
+        _git_output(repo, 'worktree', 'prune')
+    rc, _, err = _git_output(repo, 'worktree', 'add', '--detach', str(rdir), target_sha)
+    if rc != 0:
+        fail('worktree_failed', f'切换运行快照失败（{target_sha[:7]}）：{err}',
+             fix='检查 git worktree list 并清理异常目录后重试', exit_code=EXIT_ERR)
+
+
+def _run_release_check(repo, target_sha):
+    import tempfile
+    tmp_root = Path(tempfile.mkdtemp(prefix='mashu-release-check-')).resolve()
+    wt = tmp_root / 'wt'
+    try:
+        rc, _, err = _git_output(repo, 'worktree', 'add', '--detach', str(wt), target_sha)
+        if rc != 0:
+            fail('worktree_failed', f'创建发布校验 worktree 失败（{target_sha[:7]}）：{err}',
+                 fix='确认目标提交存在且仓库健康后重试', exit_code=EXIT_ERR)
+        check_sh = wt / '.mashu' / 'check.sh'
+        if not check_sh.is_file():
+            return dict(checked=False, skipped=True, output='')
+        env = dict(os.environ)
+        for k in ('MASHU_SESSION', 'MASHU_ROLE', 'MASHU_NAME', 'MASHU_FILM', 'MASHU_SEQ',
+                  'MASHU_SEQ_DIR', 'MASHU_HOME', 'MASHU_CONTENT', 'MASHU_MEMORY', 'MASHU_DEV',
+                  'MASHU_TMUX', 'MASHU_TMUX_SOCKET'):
+            env.pop(k, None)
+        timeout_s = max(60, int(cfg('check_timeout_minutes') * 60))
+        try:
+            proc = subprocess.run(['bash', str(check_sh)], cwd=str(wt), env=env,
+                                  capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            out = ((exc.stdout or '') + '\n' + (exc.stderr or '')).strip()[-2000:]
+            fail('check_failed', f'发布前检查超时（{target_sha[:7]}，超过 {timeout_s}s）',
+                 fix='修复耗时或卡住的检查项并提交后再试', exit_code=EXIT_RULE,
+                 data={'sha': target_sha, 'check_output': out, 'returncode': -1})
+        combined = '\n'.join(x for x in (proc.stdout.strip(), proc.stderr.strip()) if x).strip()
+        if proc.returncode != 0:
+            summary = combined[-2000:] if combined else f'退出码 {proc.returncode}'
+            fail('check_failed', f'发布前检查未通过（{target_sha[:7]}）：\n{summary}',
+                 fix='修复失败项并提交后再运行 mashu release', exit_code=EXIT_RULE,
+                 data={'sha': target_sha, 'check_output': summary, 'returncode': proc.returncode})
+        return dict(checked=True, skipped=False, output=combined[-2000:])
+    finally:
+        _git_output(repo, 'worktree', 'remove', '--force', str(wt))
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        _git_output(repo, 'worktree', 'prune')
+
+
+def schedule_server_restart():
+    env = dict(os.environ, NO_OPEN='1', MASHU_HOME=str(HOME), MASHU_CONTENT=str(CONTENT))
+    env.pop('MASHU_DEV', None)
+    subprocess.Popen(['bash', '-c', 'sleep 1; ./start.sh restart'], cwd=str(CONTENT), env=env,
+                     start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def release_runtime(conn, *, sha=None, rollback=False, same=False, dry_run=False,
+                    actor='executive', reason='', restart=True, restart_fn=None):
+    """发布已提交快照到 state/runtime/ 并重启服务（或 --rollback / --same / --dry-run）。"""
+    if sum(bool(x) for x in (rollback, same, sha)) > 1:
+        fail('usage_error', '--rollback、--same 和 --sha 不能同时使用',
+             fix='只传其中一个选项，例如 mashu release --rollback 或 mashu release --same', exit_code=EXIT_USAGE)
+    repo = CONTENT
+    HOME.mkdir(parents=True, exist_ok=True)
+    lock_path = HOME / '.release.lock'
+    with open(lock_path, 'a') as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            meta = read_runtime_meta()
+            rdir = runtime_dir()
+            cur_sha = ''
+            if rdir.is_dir():
+                rc, out, _ = _git_output(rdir, 'rev-parse', 'HEAD')
+                if rc == 0 and out:
+                    cur_sha = out
+            if not cur_sha:
+                cur_sha = meta.get('sha') or ''
+
+            if same:
+                info = runtime_info()
+                if dry_run:
+                    return dict(mode='same', dry_run=True, sha=info['sha'], prev_sha=meta.get('prev_sha') or '',
+                                restarting=False, reason=reason or '')
+                audit(conn, actor, 'restart-server', None, None, reason or '保持当前版本重启服务')
+                if restart:
+                    (restart_fn or schedule_server_restart)()
+                return dict(mode='same', dry_run=False, sha=info['sha'], prev_sha=meta.get('prev_sha') or '',
+                            restarting=bool(restart), reason=reason or '')
+
+            if not is_git(repo):
+                fail('not_git_repo', f'工作区不是 git 仓库：{repo}',
+                     fix='确认 MASHU_CONTENT 指向麻薯仓库根目录', exit_code=EXIT_ERR)
+
+            if rollback:
+                prev = (meta.get('prev_sha') or '').strip()
+                if not prev:
+                    fail('no_previous_release', '没有可回滚的上一个发布版本',
+                         fix='先发布至少两个版本，或使用 mashu release --sha <提交> 切到指定提交', exit_code=EXIT_NOT_FOUND)
+                rc, target_sha, err = _git_output(repo, 'rev-parse', '--verify', f'{prev}^{{commit}}')
+                if rc != 0 or not target_sha:
+                    fail('invalid_sha', f'上一个发布版本不存在：{prev}（{err}）',
+                         fix='使用 mashu release --sha <提交> 指定可用提交', exit_code=EXIT_NOT_FOUND)
+                if dry_run:
+                    return dict(mode='rollback', dry_run=True, sha=target_sha, prev_sha=cur_sha,
+                                check_skipped=True, restarting=False, reason=reason or '')
+                _checkout_runtime(repo, rdir, target_sha)
+                ts = now_iso()
+                rec = dict(sha=target_sha, released_at=ts, released_by=actor,
+                           prev_sha=cur_sha if cur_sha and cur_sha != target_sha else '',
+                           reason=reason or '回滚到上一版本')
+                write_runtime_meta(rec)
+                audit(conn, actor, 'release-rollback', None, None,
+                      f'{(cur_sha[:7] + " -> ") if cur_sha else ""}{target_sha[:7]}' + (f'：{reason}' if reason else ''))
+                if restart:
+                    (restart_fn or schedule_server_restart)()
+                return dict(mode='rollback', dry_run=False, sha=target_sha, prev_sha=rec['prev_sha'],
+                            released_at=ts, released_by=actor, check_skipped=True,
+                            restarting=bool(restart), reason=rec['reason'])
+
+            ref = (sha or 'HEAD').strip()
+            rc, target_sha, err = _git_output(repo, 'rev-parse', '--verify', f'{ref}^{{commit}}')
+            if rc != 0 or not target_sha:
+                fail('invalid_sha', f'找不到提交：{ref}' + (f'（{err}）' if err else ''),
+                     fix='检查提交号后重试，例如 git log -n 5 --oneline', exit_code=EXIT_NOT_FOUND)
+            chk = _run_release_check(repo, target_sha)
+            if dry_run:
+                return dict(mode='release', dry_run=True, sha=target_sha, prev_sha=cur_sha,
+                            check_passed=True, check_skipped=bool(chk.get('skipped')),
+                            restarting=False, reason=reason or '')
+            _checkout_runtime(repo, rdir, target_sha)
+            ts = now_iso()
+            new_prev = cur_sha if (cur_sha and cur_sha != target_sha) else (meta.get('prev_sha') or '')
+            rec = dict(sha=target_sha, released_at=ts, released_by=actor, prev_sha=new_prev, reason=reason or '')
+            write_runtime_meta(rec)
+            audit(conn, actor, 'release', None, None,
+                  f'{(cur_sha[:7] + " -> ") if cur_sha else ""}{target_sha[:7]}' + (f'：{reason}' if reason else ''))
+            if restart:
+                (restart_fn or schedule_server_restart)()
+            return dict(mode='release', dry_run=False, sha=target_sha, prev_sha=new_prev,
+                        released_at=ts, released_by=actor, check_passed=True,
+                        check_skipped=bool(chk.get('skipped')), restarting=bool(restart), reason=reason or '')
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _require_release_actor(conn):
     c = caller(conn)
     if c and c['role'] != 'assistant':
-        fail('permission_denied', '只有主脑能重启服务；子脑和执行者请让用户点网页右上角「重启服务」',
+        fail('permission_denied', '只有主脑和用户能发布或重启服务；子脑和执行者请让用户点网页右上角「重启服务」',
              fix='在回复里提醒用户点网页右上角「重启服务」按钮', exit_code=EXIT_RULE)
-    cfm_cmd = 'mashu restart-server --confirm' + (f' --reason {shlex.quote(args.reason)}' if args.reason else '')
-    confirm_or_fail(args, 'confirm_required', '重启网页服务与调度器会断开网页连接数秒（各受管会话不受影响），请确认',
-                    cfm_cmd, changes=['重启网页服务与调度器进程'])
-    audit(conn, 'assistant' if c else 'executive', 'restart-server', None, None, args.reason or '')
-    import subprocess
-    subprocess.Popen(['bash', '-c', 'sleep 1; NO_OPEN=1 ./start.sh restart'], cwd=str(CODE), start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    out_ok(dict(restarting=True, reason=args.reason or ''),
-           '1 秒后重启网页服务与调度器（各会话不受影响），网页会断开几秒后自动连上。', as_json=getattr(args, 'json', False))
+    return c, ('assistant' if c else 'executive')
+
+
+def _release_summary(res):
+    short = (res.get('sha') or '')[:7] or '未知'
+    mode = res.get('mode')
+    if res.get('dry_run'):
+        if mode == 'rollback':
+            return f'[演练] 将回滚线上快照到 {short}（跳过检查，不重启）'
+        if mode == 'same':
+            return f'[演练] 将保持线上版本 {short} 重启服务（未实际重启）'
+        return f'[演练] 提交 {short} 检查通过，可以发布（未切换快照、未重启）'
+    if not res.get('restarting'):
+        if mode == 'rollback':
+            return f'已回滚线上快照到 {short}（未重启服务）。'
+        if mode == 'same':
+            return f'保持线上版本 {short}（未重启服务）。'
+        return f'已发布线上快照 {short}（未重启服务）。'
+    if mode == 'rollback':
+        return f'已回滚线上快照到 {short}，1 秒后重启网页服务与调度器（各会话不受影响）。'
+    if mode == 'same':
+        return f'保持线上版本 {short}，1 秒后重启网页服务与调度器（各会话不受影响）。'
+    return f'已发布线上快照 {short}，1 秒后重启网页服务与调度器（各会话不受影响）。'
+
+
+def cmd_release(args):
+    """发布已提交版本到 state/runtime/ 快照并重启服务（支持 --sha / --rollback / --same / --dry-run / --no-restart）。"""
+    conn = db()
+    _, actor = _require_release_actor(conn)
+    res = release_runtime(
+        conn,
+        sha=getattr(args, 'sha', None),
+        rollback=bool(getattr(args, 'rollback', False)),
+        same=bool(getattr(args, 'same', False)),
+        dry_run=bool(getattr(args, 'dry_run', False)),
+        actor=actor,
+        reason=getattr(args, 'reason', None) or '',
+        restart=not bool(getattr(args, 'no_restart', False)),
+    )
+    out_ok(res, _release_summary(res), as_json=getattr(args, 'json', False))
+
+
+def cmd_restart_server(args):
+    """主脑（或终端里的用户）发布并重启网页服务与调度器，和网页「重启服务」按钮同一做法；--same 只重启不换版本。"""
+    conn = db()
+    _, actor = _require_release_actor(conn)
+    same = bool(getattr(args, 'same', False))
+    dry_run = bool(getattr(args, 'dry_run', False))
+    sha = getattr(args, 'sha', None)
+    if not dry_run:
+        cfm_cmd = 'mashu restart-server --confirm'
+        if same:
+            cfm_cmd += ' --same'
+        if sha:
+            cfm_cmd += f' --sha {shlex.quote(sha)}'
+        if args.reason:
+            cfm_cmd += f' --reason {shlex.quote(args.reason)}'
+        changes = ['保持当前版本重启网页服务与调度器进程'] if same else ['对目标提交运行检查、更新 state/runtime/ 快照并重启网页服务与调度器']
+        confirm_or_fail(args, 'confirm_required', '重启网页服务与调度器会断开网页连接数秒（各受管会话不受影响），请确认',
+                        cfm_cmd, changes=changes)
+    res = release_runtime(
+        conn,
+        sha=sha,
+        same=same,
+        dry_run=dry_run,
+        actor=actor,
+        reason=args.reason or '',
+    )
+    out_ok(res, _release_summary(res), as_json=getattr(args, 'json', False))
 
 
 def cmd_greenlight(args):
@@ -10446,7 +10739,17 @@ CMD_EXAMPLES = {
     'finish': ['mashu finish --reason "完成"', 'mashu finish --reason "上下文交接"'],
     'ac': ['mashu ac list', 'mashu ac add "WHEN … THE system SHALL …"', 'mashu ac pass AC-1 --evidence "测试通过"'],
     'note': ['mashu note mashu/16 "补充一条说明"'],
-    'restart-server': ['mashu restart-server --reason "新代码已提交" --confirm'],
+    'release': [
+        'mashu release',
+        'mashu release --dry-run --json',
+        'mashu release --sha HEAD~1',
+        'mashu release --rollback',
+        'mashu release --same',
+    ],
+    'restart-server': [
+        'mashu restart-server --reason "新代码已提交" --confirm',
+        'mashu restart-server --same --reason "仅重启服务" --confirm',
+    ],
 }
 
 CMD_ALIASES = {
@@ -10647,7 +10950,19 @@ def build_parser(include_selfiter=True):
     s.add_argument('--ref')
     s = add('waive', help='豁免一次自动检查'); s.add_argument('ref'); s.add_argument('--reason', required=True)
     s = add('digest', help='简报数据'); s.add_argument('--send', action='store_true')
-    s = add('restart-server', help='重启网页服务与调度器（只给主脑用）'); s.add_argument('--reason'); s.add_argument('--confirm', action='store_true', help='确认重启')
+    s = add('release', help='发布已提交版本到 state/runtime/ 快照并重启服务（只给主脑和用户）')
+    s.add_argument('--sha', help='指定发布的提交（默认 HEAD）')
+    s.add_argument('--rollback', action='store_true', help='回滚到上一个发布版本并重启（跳过检查）')
+    s.add_argument('--same', action='store_true', help='不换版本，仅重启服务')
+    s.add_argument('--dry-run', action='store_true', help='只跑检查并预览结果，不切换快照也不重启')
+    s.add_argument('--no-restart', action='store_true', help='只校验并更新快照，不重启服务')
+    s.add_argument('--reason', help='发布或回滚说明')
+    s = add('restart-server', help='发布并重启网页服务与调度器（只给主脑用；--same 仅重启不换版本）')
+    s.add_argument('--reason')
+    s.add_argument('--confirm', action='store_true', help='确认重启')
+    s.add_argument('--same', action='store_true', help='不换版本，仅重启服务')
+    s.add_argument('--sha', help='指定发布的提交（默认 HEAD）')
+    s.add_argument('--dry-run', action='store_true', help='只跑检查并预览结果，不切换快照也不重启')
     add('tick')
     s = add('init', help='首次安装：检查依赖、建 state/、写默认配置（可重复跑）')
     s.add_argument('--scan-root', action='append', help='扫描未登记工程的根目录（可多次；默认 ~/workspace）')
@@ -10788,7 +11103,7 @@ def main(argv=None):
         'sync': cmd_collaboration, 'peer': cmd_collaboration, 'codex': cmd_collaboration, 'skills': cmd_skills,
         'statusline': cmd_statusline, 'hook-prompt': cmd_hook_prompt, 'hook-stop': cmd_hook_stop, 'hook-notify': cmd_hook_notify,
         'hook-pretool': cmd_hook_pretool, 'hook-session': cmd_hook_session,
-        'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,
+        'release': cmd_release, 'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,
         'opencode-models': cmd_opencode_models, 'init': cmd_init, 'account': cmd_account, 'preset': cmd_preset, 'config': cmd_config,
         'self-iterate': lambda a: __import__('selfiter').cmd(a)}[cmd]
     try:

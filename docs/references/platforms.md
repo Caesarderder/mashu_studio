@@ -210,6 +210,25 @@ Codex 也支持兼容 OpenAI Responses 的 API 号：在模型池点「加 API �
 2. 数据恢复：从 `state/backup/one-config-<时间>/` 把备份的 `studio.json`、`token`、`accounts/index.json`、`accounts/gemini/*/cred.json`、`accounts/gemini/clients.json` 拷回 `state/` 对应路径（保持 `0600` 权限）；若只是刚做完一次误导入，从 `state/backup/pre-import-<时间>/studio.json` 覆盖回 `state/studio.json`。
 3. 点击网页右上角「重启服务」使服务端进程加载回滚后的代码与配置。
 
+## 稳定运行快照（stable-runtime，#17）
+
+运行中的麻薯（CLI、hooks、调度器、网页服务、提示词、`skills/caesar-docs`）默认运行在 `state/runtime/` 下的只读 git worktree 快照（detached HEAD），与工作区隔离；执行者在工作区修改、未提交或测试未通过的代码不会影响线上会话与服务。
+
+- **代码 vs 内容分离**：
+  - **代码**读快照（`CODE` = `state/runtime/`）：`mashu/**`（含 `mashu/prompts/**`）、`web/`、`skills/caesar-docs`、`integrations/`。改动需提交并发布才生效。
+  - **内容**仍读工作区（`MASHU_CONTENT` 默认指向工作区根目录）：`docs/**`（含 `docs/memory/**` 守则与偏好）、`playbooks/**`，以及各项目的 `.mashu/**`。修改后立即对新会话生效，无需发布。
+  - **状态**显式指向工作区下的真实 `state/`（`MASHU_HOME`），快照内无独立 `state/`。
+- **入口分流**：
+  - `bin/mashu`（工作区）：当未设 `MASHU_DEV=1` 且 `state/runtime/mashu/studio.py` 存在并支持 `MASHU_CONTENT` 时，自动 `exec` 快照里的 `studio.py` 并传入 `MASHU_HOME`、`MASHU_CONTENT`、`MASHU_MEMORY`；否则（快照不存在或快照版本过旧）回退运行工作区代码，确保 `docs` 仍从工作区读且 `mashu release` 可用。已有会话的 `PATH`、hooks 和提示词里的绝对路径无需修改，切换后自动走快照。
+  - `bin/mashu-dev`：固定设置 `MASHU_DEV=1` 运行当前工作区代码，供开发手测使用；手测时须配合独立的临时 `MASHU_HOME`（如 `MASHU_HOME=/tmp/mashu-dev bin/mashu-dev status`），不要碰正式 `state/`。
+  - `start.sh`：存在支持 `MASHU_CONTENT` 与 `release_runtime` 的快照时，启动快照里的 `mashu/server.py`。在 `./start.sh restart` 模式下，若检测到 `state/runtime/` 是不支持 `MASHU_CONTENT` 或 `release_runtime` 的旧快照，会先调用工作区 `studio.py release --no-restart` 自动从 `HEAD` 校验并升级快照，再重启服务（检查失败则在停服前中止）；也可直接由主脑/用户执行 `bin/mashu-dev release` 完成旧快照升级。
+- **发布即重启**：
+  - `mashu release [--sha <提交>] [--dry-run] [--no-restart] [--json]`：默认发布工作区 `HEAD`（只发布已提交内容，忽略未提交改动）。先在临时 worktree 里对目标提交跑 `.mashu/check.sh`（单测 + docs 校验），失败则拒绝发布并返回 `code=check_failed`、线上 sha 不变；通过后将 `state/runtime/` 切到目标 sha、原子写入 `state/runtime.json`（记 `sha`、`released_at`、`released_by`、`prev_sha`），随后调用 `start.sh restart` 重启网页服务与调度器（加 `--no-restart` 时仅更新快照不重启）。
+  - `mashu release --rollback`：切回 `state/runtime.json` 中的 `prev_sha` 并重启，跳过检查，用于救火。
+  - `mashu release --same` / `mashu restart-server --same --confirm`：不换版本，仅重启服务。
+  - 权限与 `restart-server` 一致：仅主脑和终端用户可用，子脑和执行者不可发布；网页右上角显示「线上版本 `<短 sha>` · 工作区已领先 N 个提交」与「有 N 个提交待发布」按钮，点击等价于发布并重启，失败时弹窗展示完整失败原因且不卡住。
+- **回滚本特性**：`git revert` 对应提交后删除 `state/runtime/`，`bin/mashu` 与 `start.sh` 在快照不存在时自动回到旧行为。
+
 ## 验证记录（2026-11-24）
 
 - 单测：`tests/test_platforms.py`（格式转换、拦截、会话 ID / 用量 / 回复、独立 CODEX_HOME 不改用户目录、OpenCode 启动参数、未验证版本不能选、开工卡配置）。

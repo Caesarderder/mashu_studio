@@ -1241,8 +1241,13 @@ table { border-radius: var(--r-card); box-shadow: var(--shadow-card); border: 1p
 .mashu-box .ghost-btn { flex: none; }
 .film-head .fc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .film-head .fc .fl { color: var(--accent); }
-.restart-btn { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
-.restart-btn.stale { color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 2px 9px; background: var(--accent-soft); }
+.runtime-ver { flex: 0 0 auto; font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 2px 6px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); white-space: nowrap; }
+.runtime-ver.ahead { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.restart-btn { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--muted); }
+.restart-btn.stale { color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 2px 7px; background: var(--accent-soft); }
+.restart-btn.busy { opacity: .65; cursor: progress; }
+@media (max-width: 1620px) { .tabs-right { gap: 5px; } .tabs-right .tmux-text { display: none; } }
+.release-err { margin: 10px 0 0; padding: 10px 12px; border-radius: 8px; background: var(--card-2); border: 1px solid var(--line); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; max-height: 320px; overflow: auto; color: var(--text-2); }
 
 /* 行为模板（#6）：工作流卡片 / 功能状态里的模板链接、模板页顶部的反查 */
 .bh-link { margin: 0 4px 0 0; vertical-align: middle; }
