@@ -9,7 +9,7 @@
 | 功能 | 执行者 | 交付 / 状态 | 方案 |
 | --- | --- | --- | --- |
 | #16 agent-cli 统一收发 + 收件箱分拣 + agent 友好输出 | 我不难过（#382 批准，阶段 1 进行中） | 新增 `cmd_me/inbox/send/reply/forward/close`、`resolve_address`、`triage_reports`、`fail()`；旧通信命令改为别名；`reports` 加列；hook_prompt 摘要；web 卡片类型/过时；提示词瘦身。`peer` 只调用 #15 的函数，不改其表 | `.mashu/plans/agent-cli.md` |
-| #15 左栏状态细化 + 点对点等待 | 已完成（2e81a8b），待重启服务 | 改 `seq_status`/`status_data`/`bg_tasks_of`/`cam_view_bg`/`launch_queue`（记排队原因）/`cmd_collaboration`（peer 等待）/`collaboration_context`、新表 `peer_waits`、web 左栏与对话头部 | `.mashu/plans/status-detail.md` |
+| #15 左栏状态细化 + 点对点等待 | 雨天（2e81a8b 已完成；用户 13:58 要求左栏黄字更简洁，返工中） | 改 `seq_status`/`status_data`/`bg_tasks_of`/`cam_view_bg`/`launch_queue`（记排队原因）/`cmd_collaboration`（peer 等待）/`collaboration_context`、新表 `peer_waits`、web 左栏与对话头部 | `.mashu/plans/status-detail.md` |
 | #14 模型池（预设 + 备选预设） | 日落（已完成 1fb06e9、1694bfd，待重启服务） | 改 `session_pref`/`code_pref`/`choose_account`/`set_pref`/launch 取配置/defaults 动作/`pitch`、`config_file.py` 迁移、web 模型池页与各选择器 | `.mashu/plans/model-pool.md` |
 | #13 caesar-docs 治理 | 很好 | 已完成（d2a859a），待用户点「重启服务」生效 | `.mashu/plans/docs-governance.md`，依据 `.mashu/drafts/caesar-docs-audit-2026-11-27.md` |
 | #11 并行调度 + 法典 + 协作板 + 点对点 | — | 已完成（6e00cb8），服务 04:05 重启后已生效 | `.mashu/plans/parallel-codex.md` |
@@ -18,6 +18,11 @@
 **验收**：每个功能的 AC 写在方案里；改 Python 的功能完成后，由用户点「重启服务」，子脑用 curl 核对接口后才算上线。
 
 **待决**：
+- **#15 返工 ↔ #16 并行分工（2026-11-27 星期五）**：
+  - #15 只改左栏、对话头部的状态文字：studio.py 的 `seq_status`/`status_data`/`assistant_detail` 等 detail 文案函数，以及 web/app.js、web/style.css 中左栏和对话头部的渲染与样式。
+  - #16 不碰上面这些函数和左栏渲染。#16 的网页改动只限上报卡片（类型标签、取代 / 过时标记）。
+  - #16 把 `peer` 包成 `send #N` 时只调用 #15 的 `cmd_collaboration`/`peer_waits` 辅助函数，不改它们的签名和表结构；#15 返工期间也不改这些签名。
+  - 两边都改 web/app.js 和 style.css：用 `git add -p` 只暂存自己的 hunk，编辑前重读文件。冲突时 `mashu peer` 对方，谈不拢交子脑。
 - `mashu/studio.py` 工作区有一处未提交改动（`BROWSER_PROMPT` 加了「不要起无头 Chrome」一条），归属待确认。**不是你写的就不要暂存或提交它**。
 - #13 在 studio.py 改 `skill_host`、`claude_cmd`/`agy_cmd`/`opencode_cmd`、check 流程、handoff/finish；别的功能要碰这些函数先 `mashu peer` #13。
 - #13 只读 caesar 各仓库文档；caesar 工程副本同步要等 caesar #7 docs-hardening 结单或先和它确认。
