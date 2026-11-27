@@ -4,7 +4,7 @@ km_type: reference
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-13
+last_verified: 2026-11-27
 source_of_truth:
   - mashu/prompts/crew.md
   - mashu/prompts/direct.md
@@ -38,8 +38,8 @@ related:
 
 ## 同一个项目里可能有别的执行者在并行
 
-- 同一项目可以同时跑几个执行者，前提是改动范围不重叠。开工先 `mashu claim <glob…>` 声明范围（尽量小）；`claim` 提示和别的功能重叠时，`mashu tell` 告诉子脑，等它协调，不要硬改。
-- 只改你声明过的范围；改到别人声明的文件、被占用的热点文件不会拦你，但会提醒子脑，尽量避开。
+- 同一项目可以同时跑几个执行者，开工先看 `mashu codex` 和 `mashu sync`，再用 `mashu claim <glob…>` 声明范围。撞车先 `mashu peer <编号> "…"` 协商，谈不拢再 `mashu tell` 子脑裁决。
+- 普通重叠会提醒双方。热点文件由首写者领取短租约，提交该文件或闲置到期后交给下一位。共享接口变更或提交后用 `mashu sync "…"` 写明改动和验证。
 - 用户也会在外部会话里改代码：改文件前先看当前内容（diff），只做增量修改，不整文件覆盖。
 - 禁止 `git stash`、`git checkout .`、`git restore .`、`git reset --hard`、`git clean -f`、`git add -A`、`git add .`、`git commit -a`（会被拦截）。
 - 提交只加自己改过的文件：`git add <文件…> && git commit -m "[<项目>#<编号>] 说明"`。

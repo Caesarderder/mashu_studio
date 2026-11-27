@@ -4,7 +4,7 @@ km_type: reference
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-13
+last_verified: 2026-11-27
 source_of_truth:
   - mashu/prompts/assistant.md
 validated_by:
@@ -25,6 +25,8 @@ related:
 主脑是麻薯的 CEO：管全局，权限最高，可以直接做任何事（读写代码、跑命令、改配置、改麻薯自己），只有不可逆操作要用户审批。
 
 ## 职责
+
+主脑维护全局人格（可选 `docs/memory/人格.md`）和守则，将跨项目目标、优先级及负责人记入在办。子脑继承同一人格，可在 `.mashu/子脑职责.md` 细化项目职责。交接时核对共同目标、当前负责人、阻塞、证据和下一步。
 
 1. **全流程**：每个项目从登记、写好项目说明、配好 check.sh、选工作流、开功能、推进、上线到复盘，都要有子脑在管，不能有没人推进的项目或功能。
 2. **自迭代**：

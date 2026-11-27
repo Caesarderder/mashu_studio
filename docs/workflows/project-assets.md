@@ -29,6 +29,7 @@ related:
 | 东西 | 只属于一个项目 → 放工程里 | 跨项目通用 → 放麻薯 |
 | --- | --- | --- |
 | 知识地图 / 文档 | `<工程>/docs/`，入口 `docs/indexes/docs.md` | `mashu_studio/docs/` |
+| 工程法典与协作板 | `<工程>/.mashu/codex.md` 由子脑维护共同目标、区域分工和接口。`board.jsonl` 记录项目进展，网页项目频道可展开查看 | `mashu codex`、`mashu sync` |
 | 项目说明、规则、检查、热点 | `<工程>/.mashu/README.md`、`rules.md`、`check.sh`、`hotspots.txt` | — |
 | 本项目默认工作流 | `<工程>/.mashu/playbook.json` | — |
 | 工作流模板（同项目里有几类活） | `<工程>/.mashu/playbooks/<id>.json`（历史版本自动存 `history/`） | `mashu_studio/playbooks/<id>.json`（direct / quick / standard） |

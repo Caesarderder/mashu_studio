@@ -246,7 +246,6 @@ await new Promise((r) => setTimeout(r, 350));
 class TestStudioLiveSyncIntegration(Base):
     def setUp(self):
         super().setUp()
-        self.addCleanup(studio._clash_noted.clear)
         self.addCleanup(studio._LIVE_CACHE.clear)
         self.repo = self.make_repo('builda')
         studio.greenlight(self.conn, self.repo, 'builda', '测试项目')

@@ -1539,3 +1539,9 @@ details.sd-sec summary { cursor: pointer; }
 .tag.ok { color: var(--green); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
 .tag.warn { color: #b7791f; border-color: color-mix(in srgb, #d99a2b 45%, transparent); }
 .tag.dim { color: var(--faint); }
+#projectBoard { flex: none; padding: 8px 18px; border-bottom: 1px solid var(--line); font-size: 13px; }
+#projectBoard summary { cursor: pointer; font-weight: 600; }
+#projectBoard small, #projectBoard time { color: var(--faint); margin-left: 8px; font-weight: normal; }
+#projectBoard ul { max-height: 24vh; overflow: auto; list-style: none; padding: 0; margin: 8px 0 0; }
+#projectBoard li { padding: 6px 0; }
+#projectBoard p { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }

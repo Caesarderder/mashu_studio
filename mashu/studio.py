@@ -18,6 +18,8 @@
 """
 import argparse
 import datetime
+import difflib
+import fcntl
 import fnmatch
 import json
 import os
@@ -56,6 +58,7 @@ DEFAULTS = dict(
     stages=3,                     # 并发槽：每个账号（Claude、Codex 每个号、Gemini、OpenCode 各算一个）同时跑的写代码执行者上限；总数不封顶
     producer_desks=3,             # 子脑并发：同时运行中的子脑上限
     max_stages_per_film=2,        # 每个项目默认最多占几个并发槽
+    hotspot_lease_minutes=15,
     scan_roots=['~/workspace'],   # 扫描未登记项目的根目录
     producer_idle_minutes=30,
     report_timeout_minutes=10,    # 上报在某一级停留超时后自动上交
@@ -134,6 +137,9 @@ SONGS = [
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS hotspot_leases(film_id TEXT, path TEXT, owner TEXT, head TEXT, until REAL,
+  PRIMARY KEY(film_id, path));
+CREATE TABLE IF NOT EXISTS peer_inbox(id INTEGER PRIMARY KEY, camera_id INTEGER, text TEXT);
 CREATE TABLE IF NOT EXISTS films(
   id TEXT PRIMARY KEY, title TEXT, type TEXT, path TEXT, producer_name TEXT, created_at TEXT, archived INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sequences(
@@ -653,9 +659,26 @@ echo "MASHU_CHECK_UNCONFIGURED"
 exit 0
 """
 HOTSPOTS_TEMPLATE = """# 热点文件：多个功能都可能要改、但同一时间只能有一个功能改的文件（注册表、package.json、迁移、全局配置……）
-# 每行一个 glob。两个功能都要改同一个热点时，后一个会排队。例：
+# 每行一个 glob。写入时按实际文件领取短租约，同一会话可继续改其他文件。例如
 # package.json
 # src/routes/index.ts
+"""
+
+
+CODEX_TEMPLATE = """# 工程法典
+
+## 共同目标与验收
+子脑记录用户目标、成功条件、依赖及待决事项，每项注明负责人。
+
+## 模块分工与接口
+按功能编号约定函数、区域、接口签名和数据格式，接口变更用 `mashu sync` 同步。
+
+## 共享文件
+编辑前重读，只改约定区域。共享文件用 `git add -p` 暂存自己的改动，检查暂存差异，提交标题带功能标签。
+热点被占用先做其他部分，用 `mashu peer` 协商，未解决交子脑裁决。
+
+## 当前并行功能
+`mashu codex` 与会话上下文根据调度状态列出当前功能。
 """
 
 
@@ -674,6 +697,8 @@ def ensure_film_docs(f):
         extra = f.get('crew_prompt_extra') or ''
         (d / 'rules.md').write_text('# 项目规则\n\n> 每条都会拼进本项目每个执行者的系统提示。子脑和麻薯可以迭代它。\n\n' + extra + '\n')
     notes = d / 'producer-notes.md'
+    if not (d / 'codex.md').exists():
+        (d / 'codex.md').write_text(CODEX_TEMPLATE)
     old = film_dir(f['id']) / 'producer-notes.md'
     if not notes.exists():
         notes.write_text(old.read_text() if old.exists() else
@@ -1322,7 +1347,7 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
     (d / 'docs').mkdir(exist_ok=True)
     (d / 'tests').mkdir(exist_ok=True)
     data = new_seq_state(key, title or slug, brief, pb)
-    if touches:        # 开功能时就声明改动范围：和同项目在跑的功能不重叠就能并行，重叠就排队
+    if touches:
         data['claims'] = dict(touches=list(touches), declared_at=now_iso())
     elif not by:       # 用户从网页开的功能 / 会话没写范围：先只认领自己的资料夹，不和别的功能互相排队；写了别的文件会自动记进范围
         data['claims'] = dict(touches=[f'.mashu/features/{key}/**'], declared_at=now_iso(), auto=True)
@@ -2603,6 +2628,17 @@ def skill_host():
     return HOME / 'skill-host'
 
 
+def brain_profile(role, f=None):
+    sources = [MEMORY / '人格.md']
+    if role == 'producer' and f:
+        sources.append(film_docs(f) / '子脑职责.md')
+    text = ''
+    for path in sources + [MEMORY / '守则.md']:
+        if path.is_file():
+            text += f'\n\n## {path.stem}（{path}）\n' + strip_frontmatter(path.read_text())
+    return text + '\n\n' + (PROMPTS / 'brain.md').read_text()
+
+
 def system_prompt(conn, cam):
     """系统提示只放身份 + 入口路由 + 每轮必须生效的硬规则；手册、命令、流程在 docs/ 里按需读。"""
     role_file = {'assistant': 'assistant.md', 'producer': 'producer.md', 'crew': 'crew.md'}[cam['role']]
@@ -2624,9 +2660,10 @@ def system_prompt(conn, cam):
     text = (f'> 下文所有 `mashu …` 命令的完整路径是 `{BIN / "mashu"}`。如果直接敲 `mashu` 提示找不到，就用完整路径，'
             '不用再报告这个问题。\n\n') + text
     if cam['role'] in ('assistant', 'producer'):     # 主脑和子脑是同一个麻薯，共用守则
-        rules = MEMORY / '守则.md'
-        if rules.exists():
-            text += f'\n\n## 你自己的工作守则（{rules}，你可以自己迭代）\n\n' + strip_frontmatter(rules.read_text())
+        profile = brain_profile(cam['role'], f)
+        text += '\n\n' + profile
+        conn.execute('INSERT OR IGNORE INTO meta(k,v) VALUES(?,?)', (f'collab:{cam["id"]}:profile', profile))
+        conn.commit()
     if cam['role'] == 'crew' and f:
         data = seq_state(f, cam['seq_key'])
         stage = stage_def(data, cam['stage_no'] or 1)
@@ -2649,9 +2686,14 @@ def system_prompt(conn, cam):
                 text += f'| {d["id"]} {d["name"]}（{d["plain"]}） | {d["role"]} | {d["do"]} | {d["exit"]}{need} |\n'
         if extra.get('text') and not extra.get('replace'):
             text += '\n\n' + extra['text']
+    if cam['role'] in ('producer', 'crew') and f:
         rules = film_docs(f) / 'rules.md'
         if rules.exists():
             text += '\n\n## 项目规则（.mashu/rules.md）\n\n' + rules.read_text()
+        codex = project_codex(f)
+        text += '\n\n' + codex + '\n\n' + parallel_roster(conn, f)
+        conn.execute('INSERT OR IGNORE INTO meta(k,v) VALUES(?,?)', (f'collab:{cam["id"]}:codex', codex))
+        conn.commit()
     return text
 
 
@@ -3554,6 +3596,89 @@ def hotspots(f):
     return [l.strip() for l in lines if l.strip() and not l.strip().startswith('#')]
 
 
+def board_post(f, author, text, camera_id=None):
+    entry = dict(ts=now_iso(), author=author, camera=camera_id, text=text.strip()[:800])
+    if not entry['text']:
+        raise ValueError('请填写协作内容')
+    with (film_docs(f) / 'board.jsonl').open('ab') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.write((json.dumps(entry, ensure_ascii=False) + '\n').encode())
+        stream.flush()
+
+
+def board_page(f, offset=None, limit=12):
+    try:
+        stream = (film_docs(f) / 'board.jsonl').open('rb')
+    except FileNotFoundError:
+        return [], 0
+    with stream:
+        fcntl.flock(stream, fcntl.LOCK_SH)
+        size = stream.seek(0, 2)
+        recent = offset is None or offset > size
+        start = max(0, size - 65536) if recent else offset
+        stream.seek(start)
+        if recent and start:
+            stream.readline()
+        entries = []
+        for line in stream:
+            try:
+                entry = json.loads(line)
+                if isinstance(entry, dict) and all(isinstance(entry.get(k), str) for k in ('author', 'text', 'ts')):
+                    entries.append(entry)
+            except (ValueError, UnicodeError):
+                continue
+            if not recent and len(entries) >= limit:
+                break
+        return entries[-limit:], stream.tell()
+
+
+def project_codex(f):
+    path = film_docs(f) / 'codex.md'
+    return path.read_text() if path.is_file() else CODEX_TEMPLATE
+
+
+def parallel_roster(conn, f):
+    active = rows(conn, f'SELECT c.seq_key, c.name, s.title FROM cameras c JOIN sequences s ON '
+                  f's.film_id=c.film_id AND s.key=c.seq_key WHERE c.film_id=? AND c.role="crew" '
+                  f'AND c.state IN {ACTIVE} ORDER BY c.id', f['id'])
+    return '当前并行功能（自动）\n' + ('\n'.join(f'#{seq_num(c["seq_key"])} {c["title"]} · {c["name"]}' for c in active) or '无')
+
+
+def collaboration_context(conn, cam):
+    f = film(conn, cam['film_id'])
+    prefix = f'collab:{cam["id"]}:'
+    out = []
+    if cam['role'] in ('assistant', 'producer'):
+        profile = brain_profile(cam['role'], f)
+        previous = meta_get(conn, prefix + 'profile')
+        if previous != profile:
+            if previous is not None:
+                changes = difflib.unified_diff(previous.splitlines(), profile.splitlines(), n=1)
+                out.append('人格与守则已更新\n' + '\n'.join(changes)[:1800])
+            meta_set(conn, prefix + 'profile', profile)
+    if not f:
+        return '\n'.join(out)
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        offset = meta_get(conn, prefix + 'board')
+        entries, end = board_page(f, int(offset) if offset else None, 8)
+        lines = [f'{item["author"]} · {item["text"][:320]}' for item in entries if item.get('camera') != cam['id']]
+        if lines:
+            out.append('项目协作板 · 新进展\n' + '\n'.join(lines))
+        codex = project_codex(f)
+        before = meta_get(conn, prefix + 'codex')
+        if before != codex:
+            changes = difflib.unified_diff((before or '').splitlines(), codex.splitlines(), n=1)
+            out.append('工程法典已更新（全文见 .mashu/codex.md）\n' + '\n'.join(changes)[:1800])
+        for name, value in [('board', str(end)), ('codex', codex)]:
+            conn.execute('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)', (prefix + name, value))
+        inbox = rows(conn, 'SELECT id,text FROM peer_inbox WHERE camera_id=? ORDER BY id LIMIT 8', cam['id'])
+        if inbox:
+            out.extend(item['text'] for item in inbox)
+            conn.execute('DELETE FROM peer_inbox WHERE camera_id=? AND id<=?', (cam['id'], inbox[-1]['id']))
+    return '\n\n'.join(out)
+
+
 def claim_match(rel, pat):
     pat = pat.strip()
     if not pat:
@@ -3716,6 +3841,11 @@ def finish_checks(conn, c):
             warns.append(msg)
         since = datetime.datetime.fromtimestamp(c['started_at']).isoformat() if c['started_at'] else None
         st['commits'] = [x[0] for x in feature_commits(f, key, since)]
+        for sha in st['commits']:
+            paths = git(f['path'], 'diff-tree', '--root', '--no-commit-id', '--name-only', '-r', '-z', sha).split('\0')
+            shared = [path for path in paths if path and path_owner(conn, f, path, key)]
+            if shared:
+                warns.append(f'{sha[:8]} 涉及其他在跑功能的范围，请核对提交差异：' + '、'.join(shared[:8]))
         notes.append(f'本阶段提交 {len(st["commits"])} 个')
     if d.get('check'):
         waiver = has_approval(conn, f['id'], key, 'check-waiver')
@@ -4270,7 +4400,6 @@ def offduty_producers(conn, force_one=False):
             post(conn, 'system', c['film_id'], 'handover', f'—— 子脑停止（给其他项目让席位）——')
 
 
-_clash_noted = set()
 
 
 def crew_slots(conn, film_id=None):
@@ -4375,12 +4504,10 @@ def launch_queue(conn):
                 _acct_full_noted.add(c['id'])
                 notice(conn, f'{f["id"]}/{c["seq_key"]}', f'排队：{account_key_label(k)} 已有 {cfg("stages")} 个执行者在跑（每个账号上限），等它空出来')
             continue
-        clash = scope_conflicts(conn, f, c['seq_key'])
-        if clash:
-            if c['id'] not in _clash_noted:
-                _clash_noted.add(c['id'])
-                notice(conn, f'{f["id"]}/{c["seq_key"]}', f'排队：和 {seq_label(f, clash[0][0])} {clash[0][1]}，等它完成本阶段')
-            continue
+        for other, why in scope_conflicts(conn, f, c['seq_key']):
+            text = f'#{seq_num(c["seq_key"])} 与 #{seq_num(other)} 并行，{why}。请子脑更新 .mashu/codex.md 的分工。'
+            board_post(f, '调度器', text)
+            post(conn, 'system', f['id'], 'notice', text, target=f'producer:{f["id"]}')
         launch(conn, c['id'])
 
 
@@ -6372,10 +6499,12 @@ def cmd_hook_prompt(args):
         conn.execute('UPDATE cameras SET state="running", last_active=? WHERE id=?', (time.time(), c['id']))
         conn.commit()
         prompt = payload.get('lastUserInput') or ''
-        if payload.get('invocationNum') in (0, None) and c['role'] == 'crew' and prompt.lstrip().startswith('继续'):
-            f = film(conn, c['film_id'])
-            if f:
-                agy_out(agy_system('[麻薯电脑秘书 · 状态文件]\n' + status_text(f, c['seq_key'])))
+        if payload.get('invocationNum') in (0, None):
+            out = [collaboration_context(conn, c)]
+            if c['role'] == 'crew' and prompt.lstrip().startswith('继续'):
+                out.append('[麻薯电脑秘书 · 状态文件]\n' + status_text(film(conn, c['film_id']), c['seq_key']))
+            if any(out):
+                agy_out(agy_system('\n\n'.join(filter(None, out))))
         return
     fmt = hook_fmt(args)
     if fmt in ('codex', 'opencode'):         # 格式和 Claude 一样（session_id / prompt）；会话 ID 要回写、记是哪家的
@@ -6391,6 +6520,7 @@ def cmd_hook_prompt(args):
         f = film(conn, c['film_id'])
         if f:
             out.append('[麻薯电脑秘书 · 状态文件]\n' + status_text(f, c['seq_key']))
+    out.append(collaboration_context(conn, c))
     text = '\n\n'.join(x for x in out if x and x.strip())
     if text:
         if fmt == 'codex':
@@ -6536,8 +6666,24 @@ def deny(reason):
                                                   permissionDecisionReason=reason)), ensure_ascii=False))
 
 
+def take_hotspot(conn, f, key, rel):
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        lease = one(conn, 'SELECT * FROM hotspot_leases WHERE film_id=? AND path=?', f['id'], rel)
+        head = git_head(f['path'])
+        if lease and lease['owner'] != key and lease['until'] > time.time():
+            revision = f'{lease["head"]}..HEAD' if lease['head'] else 'HEAD'
+            committed = head and head != lease['head'] and git(f['path'], 'log', '-1', '--format=%H', '-F',
+                '--grep=' + feature_tag(f, lease['owner']), revision, '--', rel, check=False)
+            if not committed:
+                return (f'#{seq_num(lease["owner"])} 正持有热点文件 {rel}。先做其他部分，'
+                        f'或用 mashu peer {seq_num(lease["owner"])} 协调。')
+        conn.execute('INSERT OR REPLACE INTO hotspot_leases VALUES(?,?,?,?,?)',
+                     (f['id'], rel, key, head, time.time() + 60 * cfg('hotspot_lease_minutes')))
+    return None
+
+
 def edit_guard(conn, c, f, fp):
-    """执行者写文件：不能写别的进行中功能的范围和被占用的热点；范围外的写入记下来。"""
     try:
         p, root = Path(fp).resolve(), Path(f['path']).resolve()
     except (OSError, RuntimeError):
@@ -6545,24 +6691,20 @@ def edit_guard(conn, c, f, fp):
     if root not in p.parents:
         return None
     rel = str(p.relative_to(root))
+    if rel == '.mashu/codex.md':
+        return '工程法典由子脑维护，请用 mashu tell 提交分工建议。'
     if rel.startswith('.mashu/'):
         if p.name in ('acceptance.json', 'state.json'):
             return 'acceptance.json 和 state.json 只能用 mashu ac / mashu feature 修改'
         return None
     key = c['seq_key']
-    clash = None
+    if any(claim_match(rel, pattern) for pattern in hotspots(f)):
+        denied = take_hotspot(conn, f, key, rel)
+        if denied:
+            return denied
     owner = path_owner(conn, f, rel, key)
     if owner:
-        clash = f'{rel} 在 {seq_label(f, owner)} 声明的改动范围里，那个功能正在进行。'
-    for h in hotspots(f):
-        if not clash and claim_match(rel, h):
-            other = next((o for o in active_writers(conn, f, key) if any(globs_overlap(h, x) for x in claims_of(f, o))), None)
-            if other:
-                clash = f'{rel} 是热点文件，{seq_label(f, other)} 正在改它。'
-    if clash:
-        if cfg('strict_checks'):
-            return clash + '不要改它；需要协调就 mashu tell 告诉子脑。'
-        notice(conn, channel_of(c), f'注意：{clash}（没拦，留意冲突）')
+        board_post(f, '写入提醒', f'#{seq_num(key)} 正在编辑 {rel}，与 #{seq_num(owner)} 的范围重叠。请按法典分区编辑。')
     if not any(claim_match(rel, x) for x in claims_of(f, key)):
         data = seq_state(f, key)
         if data is not None:
@@ -6611,10 +6753,16 @@ def codex_tool_calls(payload):
     ti = ti if isinstance(ti, dict) else {'command': str(ti)}
     if name in ('Bash', 'shell', 'exec_command', 'local_shell', 'unified_exec'):
         c = ti.get('command') if ti.get('command') is not None else ti.get('cmd')
-        return [('Bash', {'command': ' '.join(c) if isinstance(c, list) else str(c or '')})]
+        command = ' '.join(c) if isinstance(c, list) else str(c or '')
+        calls = [('Bash', {'command': command})]
+        if 'apply_patch' in command and '*** Begin Patch' in command:
+            calls.extend(('Write', {'file_path': path}) for path in plat.patch_files(command, ti.get('workdir') or hook_cwd(payload)))
+        return calls
     if name == 'write_stdin':
         return [('Bash', {'command': str(ti.get('chars') or '')})]
     if name in ('apply_patch', 'Edit', 'Write'):
+        if ti.get('file_path'):
+            return [(name, ti)]
         files = plat.patch_files(ti.get('command') or ti.get('input') or ti.get('patch') or '', hook_cwd(payload))
         return [('Write', {'file_path': fp}) for fp in files] or [('Write', {'file_path': ''})]
     return [(name, ti)]
@@ -6704,6 +6852,8 @@ def session_context(conn, c):
     if c['role'] == 'assistant':
         ensure_memory()
         return (f'[上下文恢复 · 主脑]\n记忆索引（{MEMORY_INDEX}）：\n{strip_frontmatter(head(MEMORY_INDEX, 5000))[:4000]}\n\n'
+                f'{brain_profile("assistant")[:2400]}\n全局人格与守则见 {MEMORY}，项目管理准则见 {PROMPTS / "brain.md"}。\n当前项目负责人：\n' + '\n'.join(
+                    f'{project["title"]} · {project["producer_name"]}' for project in films(conn)[:24]) + '\n'
                 f'在办（节选）：\n{tail(MEMORY / "在办.md", 3000)}\n\n'
                 f'你手上的上报：{len(open_reports(conn, "assistant"))} 个（mashu reports）；全局：mashu status'
                 + handoff_context(conn, c))
@@ -6713,6 +6863,7 @@ def session_context(conn, c):
     d = film_docs(f)
     if c['role'] == 'producer':
         return (f'[上下文恢复 · 子脑] 项目 {f["title"]}（{f["path"]}）\n项目说明：\n{head(d / "README.md", 5000)}\n\n'
+                f'{brain_profile("producer", f)[:2400]}\n{project_codex(f)[:2200]}\n{parallel_roster(conn, f)}\n'
                 f'项目笔记（节选）：\n{tail(d / "producer-notes.md", 1500)}\n\n'
                 f'你手上的上报：{len(open_reports(conn, "producer", f["id"]))} 个（mashu reports）；项目状态：mashu status {f["id"]}'
                 + handoff_context(conn, c))
@@ -7012,7 +7163,7 @@ def status_data(conn):
                               docs=str(film_docs(f)),
                               playbook=dict(name=fpb.get('name'), version=fpb.get('version'), based_on=fpb.get('based_on'),
                                             stages=[x['name'] for x in fpb.get('stages', [])]),
-                              producer=prod, sequences=seqs, max_stages=f.get('max_stages'),
+                              producer=prod, sequences=seqs, board=board_page(f)[0], max_stages=f.get('max_stages'),
                               accounts=acc and dict(accounts=[{k: a[k] for k in ('id', 'name', 'account', 'order')} for a in acc['accounts']],
                                                     workflows=acc['workflows'], default=acc['default']),
                               budget=dict(today_tokens=sp.get('tokens') or 0, today_cost=sp.get('cost'),
@@ -7571,6 +7722,44 @@ def cmd_ac(args):
     print(f'{it["id"]} → {"通过" if it["passes"] else "未通过"}（{sum(1 for i in items if i.get("passes"))}/{len(items)}）')
 
 
+def cmd_collaboration(args):
+    conn = db()
+    cam = my_camera(conn, ['producer'] if args.command == 'codex' and args.action else ['crew', 'producer'])
+    f = require_film(conn, cam['film_id'])
+    author = f'#{seq_num(cam["seq_key"])}' if cam['seq_key'] else '子脑'
+    if args.command == 'codex':
+        if args.action:
+            if not (args.text or '').strip():
+                raise ValueError('请填写法典变更')
+            path = film_docs(f) / 'codex.md'
+            with path.open('a+') as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                if not stream.tell():
+                    stream.write(CODEX_TEMPLATE)
+                stream.write(f'\n- {now_iso()} · {args.text.strip()}\n')
+        print(project_codex(f) + '\n' + parallel_roster(conn, f))
+    elif args.command == 'sync':
+        if args.text is None:
+            print('\n'.join(f'{item["author"]} · {item["text"]}' for item in board_page(f)[0]) or '协作板暂无进展')
+        else:
+            board_post(f, author, args.text, cam['id'])
+            print('已同步到项目协作板')
+    else:
+        seq = find_seq(conn, f, args.ref.lstrip('#'))
+        if seq['key'] == cam['seq_key'] or not args.text.strip():
+            raise ValueError('请指定另一功能并填写消息')
+        with conn:
+            conn.execute('BEGIN IMMEDIATE')
+            peer = active_crew(conn, f['id'], seq['key'])
+            if not peer or peer['state'] not in LIVE:
+                print('对方不在线，未发送')
+                return
+            text = f'[点对点 {author} → #{seq["num"]}] {args.text.strip()[:800]}'
+            conn.execute('INSERT INTO peer_inbox(camera_id,text) VALUES(?,?)', (peer['id'], text))
+            post(conn, 'system', f['id'], 'notice', text, target=f'producer:{f["id"]}', camera=cam)
+        print('已送入对方下一轮上下文，并抄送子脑')
+
+
 def cmd_claim(args):
     conn = db()
     f, s = my_seq(conn, args)
@@ -7581,7 +7770,7 @@ def cmd_claim(args):
     save_state(f, s['key'], data)
     print('改动范围：' + ', '.join(cl['touches']))
     for other, why in scope_conflicts(conn, f, s['key']):
-        print(f'注意：和 {seq_label(f, other)} {why}。开始写代码前会排队等它。')
+        print(f'与 {seq_label(f, other)} 并行，{why}。请按工程法典分工。')
 
 
 def cmd_waive(args):
@@ -7836,7 +8025,12 @@ def cmd_init(args):
             data['scan_roots'] = args.scan_root
         cfgfile.write_config(conf, data)
         print(f'  ✓ 写入主配置 {conf}（0600，字段说明见 mashu/studio.py 的 DEFAULTS）')
-    db().close()
+    conn = db()
+    for project in films(conn):
+        directory = film_docs(project)
+        if directory.is_dir() and not (directory / 'codex.md').exists():
+            (directory / 'codex.md').write_text(CODEX_TEMPLATE)
+    conn.close()
     print(f'  ✓ 数据目录 {HOME}')
     missing = [n for n in ('index.md', '用户.md', '方针.md', '在办.md', '复盘.md', '守则.md') if not (MEMORY / n).exists()]
     print(f'  {"✗ 记忆缺文件：" + "、".join(missing) if missing else "✓ 记忆 " + str(MEMORY)}')
@@ -7929,7 +8123,7 @@ def main(argv=None):
     s = sub.add_parser('new-feature', aliases=['pitch'], help='新建功能'); s.add_argument('film'); s.add_argument('slug')
     s.add_argument('--brief', required=True); s.add_argument('--title'); s.add_argument('--playbook', help='用哪个工作流模板（先找本项目 .mashu/playbooks/，再找麻薯通用模板）')
     s.add_argument('--workflow', action='store_true', help='按项目的专门工作流分阶段（默认直接做，不分阶段）')
-    s.add_argument('--touches', nargs='+', help='预计改动范围（glob）；同项目有别的执行者在跑时，不重叠才能并行')
+    s.add_argument('--touches', nargs='+', help='预计改动范围（glob），重叠时通知双方与子脑协调分工')
     s.add_argument('--plan', help='方案文件（需求 + 技术方案 + 验收标准，已和用户谈清楚）；麻薯开功能必填，开好后等用户批准开工')
     s.add_argument('--account', help='归哪个账号（项目有 .mashu/accounts.json 时；不写按 accounts.json 的 features / 改动范围推）')
     s.add_argument('--workdir', help='执行者的工作目录：工程文件夹里已存在的子目录（相对路径）；不写就是工程根目录。项目适配器开功能时也可能自己设')
@@ -7985,6 +8179,9 @@ def main(argv=None):
     s = sub.add_parser('ac', help='验收标准'); s.add_argument('action', choices=['add', 'pass', 'fail', 'list'])
     s.add_argument('arg', nargs='?', help='add：内容；pass/fail：AC 编号'); s.add_argument('--evidence'); s.add_argument('--ref')
     s = sub.add_parser('claim', help='声明改动范围'); s.add_argument('globs', nargs='+'); s.add_argument('--add', action='store_true')
+    s = sub.add_parser('sync', help='查看或更新项目协作板'); s.add_argument('text', nargs='?')
+    s = sub.add_parser('peer', help='联系同项目执行者'); s.add_argument('ref'); s.add_argument('text')
+    s = sub.add_parser('codex', help='查看工程法典或追加子脑约定'); s.add_argument('action', choices=['note'], nargs='?'); s.add_argument('text', nargs='?')
     s.add_argument('--ref')
     s = sub.add_parser('waive', help='豁免一次自动检查'); s.add_argument('ref'); s.add_argument('--reason', required=True)
     s = sub.add_parser('digest', help='简报数据'); s.add_argument('--send', action='store_true')
@@ -8030,6 +8227,7 @@ def main(argv=None):
         'tell': cmd_tell, 'report': cmd_report, 'pass': cmd_pass, 'answer': cmd_answer, 'decide': cmd_decide, 'browser': cmd_browser,
         'finish': cmd_finish, 'handoff': cmd_handoff, 'reports': cmd_reports, 'priority': cmd_priority, 'feature': cmd_seq, 'tick': cmd_tick,
         'playbook': cmd_playbook, 'retro': cmd_retro, 'logs': cmd_logs, 'ac': cmd_ac, 'claim': cmd_claim, 'waive': cmd_waive, 'digest': cmd_digest,
+        'sync': cmd_collaboration, 'peer': cmd_collaboration, 'codex': cmd_collaboration,
         'statusline': cmd_statusline, 'hook-prompt': cmd_hook_prompt, 'hook-stop': cmd_hook_stop, 'hook-notify': cmd_hook_notify,
         'hook-pretool': cmd_hook_pretool, 'hook-session': cmd_hook_session,
         'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,

@@ -787,7 +787,24 @@ function headStatus(ch, k, extra = '') {
   const lt = liveBusy(ch) ? liveText(ch) : '';
   return `<div class="s">${sdot(lt ? liveKey(ch) : k)}<span class="st-t ${lt ? 'live' : ''}">${esc(lt || ST[k])}</span>${extra}</div>`;
 }
+function renderProjectBoard(project) {
+  let board = $('#projectBoard');
+  if (!project) { board?.remove(); return; }
+  if (!board) {
+    board = document.createElement('details');
+    board.id = 'projectBoard';
+    $('#chatHead').after(board);
+  }
+  if (board.dataset.film !== project.id) board.open = false;
+  board.dataset.film = project.id;
+  const entries = project.board || [];
+  const html = `<summary>协作板 <small>最近 ${entries.length} 条</small></summary><ul>${entries.length ? entries.slice().reverse().map(item =>
+    `<li><b>${esc(item.author)}</b><time>${esc(item.ts.slice(5, 16).replace('T', ' '))}</time><p>${esc(item.text)}</p></li>`).join('') : '<li>暂无进展</li>'}</ul>`;
+  if (board._html !== html) { board.innerHTML = html; board._html = html; }
+}
+
 function renderHead() {
+  renderProjectBoard(isFilmCh(current) ? filmOf(current) : null);
   const real = $('#chatHead');
   // 内容没变不重画；正在选模型 / 思考程度时也不重画，免得下拉框被关掉
   const el = { set innerHTML(h) { if (real._html !== h && !(real.contains(document.activeElement) && document.activeElement.tagName === 'SELECT')) { real.innerHTML = h; real._html = h; } } };

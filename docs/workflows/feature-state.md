@@ -4,7 +4,7 @@ km_type: workflow
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-24
+last_verified: 2026-11-27
 source_of_truth:
   - mashu/studio.py
 validated_by:
@@ -44,6 +44,8 @@ mashu feature block --text "阻塞原因"            # 解除：mashu feature bl
 mashu ac add "WHEN … THE system SHALL …"         # 任何阶段都能加
 mashu ac pass AC-1 --evidence "命令和结果"  /  mashu ac fail AC-1 --evidence "…"  /  mashu ac list
 mashu claim "src/export/**" "tests/export/**" [--add]
+mashu sync "接口已提交，等待联调"
+mashu peer 12 "请确认导出接口"
 ```
 
 ## 停止条件

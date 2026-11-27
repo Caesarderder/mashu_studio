@@ -765,30 +765,118 @@ class TestStudio(Base):
         self.assertEqual(m['ac']['passed'], 1)
         self.assertEqual(m['diff']['commits'], 1)
 
-    def test_scope_conflict_queues_and_edit_guard(self):
+    def test_scope_conflict_runs_and_collaborates(self):
         self.strict()
         studio.CONFIG_OVERRIDES['stages'] = 5
         ka, kb = self.pitch('a')[0], self.pitch('b')[0]
-        a = self.writing(ka, ['src/shared/**'])
+        a = self.writing(ka, ['mashu/studio.py'])
         self.tick()
-        b = self.writing(kb, ['src/shared/util.py'])
+        b = self.writing(kb, ['mashu/studio.py'])
         self.tick()
         self.assertEqual(self.cam(a['id'])['state'], 'running')
-        self.assertEqual(self.cam(b['id'])['state'], 'queued')
-        self.assertTrue(studio.one(self.conn, 'SELECT id FROM messages WHERE text LIKE "%改动范围重叠%"'))
-        # 写别人范围里的文件被拦；写自己范围外的文件被记下
-        kc = self.pitch('c')[0]
-        c = self.writing(kc, ['docs/**'])
-        self.tick()
-        c = self.cam(c['id'])
-        out = self.hook('hook-pretool', c, {'tool_name': 'Write', 'tool_input': {'file_path': str(self.repo / 'src/shared/x.py')}})
-        self.assertIn('deny', out)
-        out = self.hook('hook-pretool', c, {'tool_name': 'Edit', 'tool_input': {'file_path': str(self.repo / 'README.md')}})
+        self.assertEqual(self.cam(b['id'])['state'], 'running')
+        self.assertEqual(len(studio.rows(self.conn, 'SELECT id FROM messages WHERE target="producer:builda" AND text LIKE "%改动范围重叠%"')), 1)
+        for cam in (a, b):
+            context = self.hook('hook-prompt', cam, {})
+            for expected in ('mashu/studio.py', '#' + str(studio.seq_num(ka)), '#' + str(studio.seq_num(kb))):
+                self.assertIn(expected, context)
+        self.cli(a, 'sync', '接口约定' + '甲' * 1000)
+        self.assertNotIn('接口约定', self.hook('hook-prompt', a, {}))
+        message = self.hook('hook-prompt', b, {})
+        self.assertIn('接口约定', message)
+        self.assertLess(message.count('甲'), 321)
+        self.assertNotIn('接口约定', self.hook('hook-prompt', b, {}))
+        self.tick(2)
+        prod = studio.active_producer(self.conn, 'builda')
+        self.assertIn('协作板', self.hook('hook-prompt', prod, {}))
+        self.cli(a, 'peer', kb, '请复核签名')
+        self.assertIn('请复核签名', self.hook('hook-prompt', b, {}))
+        self.assertNotIn('请复核签名', self.hook('hook-prompt', b, {}))
+        self.assertTrue(studio.one(self.conn, 'SELECT id FROM messages WHERE target="producer:builda" AND text LIKE "%请复核签名%"'))
+        self.assertIn('工程法典', studio.system_prompt(self.conn, a))
+        self.cli(prod, 'codex', 'note', '乙负责输入校验')
+        self.assertIn('+', self.hook('hook-prompt', a, {}))
+        self.assertIn('乙负责输入校验', self.hook('hook-prompt', b, {}))
+        self.assertNotIn('乙负责输入校验', self.hook('hook-prompt', b, {}))
+        out = self.hook('hook-pretool', b, {'tool_name': 'Edit', 'tool_input': {'file_path': str(self.repo / 'mashu/studio.py')}})
         self.assertEqual(out, '')
-        self.assertIn('README.md', studio.seq_state(self.film, kc)['claims']['extra'])
-        out = self.hook('hook-pretool', c, {'tool_name': 'Write', 'tool_input': {
-            'file_path': str(studio.seq_dir(self.film, kc) / 'acceptance.json')}})
+        self.assertIn('写入提醒', self.hook('hook-prompt', a, {}))
+        self.hook('hook-pretool', b, {'tool_name': 'Edit', 'tool_input': {'file_path': str(self.repo / 'README.md')}})
+        self.assertIn('README.md', studio.seq_state(self.film, kb)['claims']['extra'])
+        out = self.hook('hook-pretool', b, {'tool_name': 'Write', 'tool_input': {
+            'file_path': str(studio.seq_dir(self.film, kb) / 'acceptance.json')}})
         self.assertIn('deny', out)
+        studio.end_camera(self.conn, b['id'], 'cut')
+        self.assertIn('不在线', self.cli(a, 'peer', kb, '复核'))
+        self.assertIsNone(studio.active_crew(self.conn, 'builda', kb))
+
+    def test_brain_context_role_and_project_scope(self):
+        self.tick()
+        main = studio.active_assistant(self.conn)
+        producer = studio.create_camera(self.conn, 'producer', 'builda', None, '开始')
+        studio.MEMORY.mkdir(exist_ok=True, parents=True)
+        (studio.MEMORY / '人格.md').write_text('给出判断依据')
+        (studio.film_docs(self.film) / '子脑职责.md').write_text('交接先验导出接口')
+        for cam in (main, producer):
+            self.assertIn('给出判断依据', studio.system_prompt(self.conn, cam))
+            context = studio.session_context(self.conn, cam)
+            self.assertEqual('交接先验导出接口' in context, cam == producer)
+            self.hook('hook-prompt', cam, {})
+        (studio.MEMORY / '人格.md').write_text('交接附验收证据')
+        for cam in (main, producer):
+            self.assertIn('交接附验收证据', self.hook('hook-prompt', cam, {}))
+            self.assertNotIn('交接附验收证据', self.hook('hook-prompt', cam, {}))
+
+    def test_hotspot_lease_release(self):
+        ka, a = self.pitch('a')
+        kb, b = self.pitch('b')
+        self.tick()
+        (studio.film_docs(self.film) / 'hotspots.txt').write_text('*.md\n')
+        path = self.repo / 'README.md'
+        guard = lambda cam: studio.edit_guard(self.conn, cam, self.film, path)
+        self.assertIsNone(guard(a))
+        self.assertIn(f'#{studio.seq_num(ka)} 正持有', guard(b))
+        calls = studio.codex_tool_calls({'tool_name': 'exec_command', 'tool_input': {
+            'workdir': str(self.repo), 'cmd': "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: README.md\n*** End Patch\nPATCH"}})
+        self.assertEqual(calls[-1], ('Write', {'file_path': str(path)}))
+        self.assertIsNone(studio.edit_guard(self.conn, b, self.film, self.repo / 'other.md'))
+        path.write_text('完成\n')
+        studio.git(self.repo, '-c', 'user.name=test', '-c', 'user.email=t@t', 'commit', '-qm', studio.feature_tag(self.film, ka), '--', 'README.md')
+        self.assertIsNone(guard(b))
+        self.assertIn(f'#{studio.seq_num(kb)} 正持有', guard(a))
+        self.conn.execute('UPDATE hotspot_leases SET until=0')
+        self.conn.commit()
+        self.assertIsNone(guard(a))
+        self.assertEqual(self.cam(b['id'])['state'], 'running')
+
+    def test_project_board_render(self):
+        studio.board_post(self.film, '子脑', '共同目标已登记。接口与页面分别由两个功能负责。')
+        studio.board_post(self.film, '#1', '导出接口已提交，参数和返回值已同步给页面负责人。')
+        studio.board_post(self.film, '#2', '页面已接入导出接口，正在验证空列表。')
+        state = studio.status_data(self.conn)
+        self.assertEqual([item['author'] for item in state['films'][0]['board']], ['子脑', '#1', '#2'])
+        screenshot = os.environ.get('MASHU_BOARD_SCREENSHOT')
+        if not screenshot:
+            return
+        web = studio.CODE / 'web'
+        state.update(limits={}, cli_accounts=[], vendors=[])
+        page = (web / 'index.html').read_text().replace('/static/', web.as_uri() + '/')
+        fixture = ('<script>window.EventSource=undefined; const data=' + json.dumps(state) + ';'
+                   'window.fetch=async path=>({ok:true,json:async()=>path==="/api/state"?data:{messages:[],boxes:[]}});'
+                   'setTimeout(()=>{document.querySelector("#projectBoard summary")?.click();'
+                   f'document.querySelectorAll(\'img[src="/static/mashu.jpg"]\').forEach(img=>img.src="{web.as_uri()}/mashu.jpg");'
+                   '},300);</script>')
+        page = page.replace('</head>', fixture + '</head>')
+        path = self.tmp / 'project.html'
+        path.write_text(page)
+        chrome = shutil.which('chromium') or '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+        rendered = subprocess.run([chrome, '--headless', '--disable-gpu', '--disable-background-networking',
+            '--no-first-run', '--allow-file-access-from-files', '--user-data-dir=' + str(self.tmp / 'profile'),
+            '--virtual-time-budget=1500', '--window-size=1320,860', '--screenshot=' + screenshot, '--dump-dom',
+            path.as_uri() + '#/chat/builda'], capture_output=True, text=True, timeout=35, check=True)
+        self.assertRegex(rendered.stdout, r'<details[^>]*id="projectBoard"[^>]*open[^>]*>')
+        self.assertIn('<p>页面已接入导出接口，正在验证空列表。</p>', rendered.stdout)
+        self.assertTrue(Path(screenshot).is_file())
 
     def test_user_opened_features_without_scope_do_not_queue_each_other(self):
         # 用户从网页开的功能 / 会话（by=None）没写范围：自动认领自己的资料夹，不再因「有一方没声明范围」互相排队（#6、#10）
