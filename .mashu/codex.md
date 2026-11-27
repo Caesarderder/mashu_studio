@@ -20,6 +20,7 @@
 **验收**：每个功能的 AC 写在方案里；改 Python 的功能完成后，由用户点「重启服务」，子脑用 curl 核对接口后才算上线。
 
 **待决**：
+- **#16 小修（2026-11-27 星期五）**：修 `reply --choice` 丢补充文字，只改 `cmd_reply`/`resolve_choice` 和批复投递那一段，不碰 #17、#18 的区域。
 - **#17 ↔ #18 并行分工（2026-11-27 星期五）**：
   - #18 在 studio.py 里只改 Gemini 体检循环（`refresh_accounts` 一带，约 2250–2300 行）的额度失败处理，以及 `mashu account` 的 Gemini 输出。主要改动放在 `mashu/accounts.py`。
   - #17 不碰这些地方。#18 也不碰路径常量、`cmd_release`/`cmd_restart_server`、`status_data`、argparse 里的 release 段。
