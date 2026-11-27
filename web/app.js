@@ -362,11 +362,11 @@ function moveTabInd() {
 // 统一的执行状态（侧栏只用直白说法，一眼能看懂）
 // 会话状态：空闲 / 执行中 / 阻塞 / 待回复 / 待审批 / 等待后台任务 / 已完成（待查看带小点）/ 已归档（手点归档）
 const ST = {
-  approve: '待审批', answer: '待回复', relay: '待回复', busy: '执行中', queued: '执行中', waiting: '等待后台任务', peer: '等会话回复',
+  approve: '待审批', answer: '待回复', relay: '待回复', busy: '执行中', queued: '排队中', waiting: '等后台', peer: '等会话',
   idle: '空闲', blocked: '阻塞', done: '已完成', archived: '已归档', off: '空闲', rest: '空闲',
   stuck: '可能卡住', apierr: 'API 报错',
 };
-const ST_TIP = { relay: '在等子脑回复', queued: '排队等空位', peer: '发了点对点消息，在等对方会话回复', off: '还没启动', rest: '会话在休息，有事会自动叫醒',
+const ST_TIP = { relay: '在等子脑回复', queued: '排队等空位', waiting: '等待后台任务完成', peer: '发了点对点消息，在等对方会话回复', off: '还没启动', rest: '会话在休息，有事会自动叫醒',
   stuck: '忙碌中但很久没有任何进展，可能卡住了', apierr: '调用接口报错，麻薯会自动让它继续' };
 const SEQ_ST = { stuck: 'stuck', apierr: 'apierr', sign: 'answer', asking: 'relay', queued: 'queued', shooting: 'busy', waiting: 'waiting', peer: 'peer', idle: 'idle', blocked: 'blocked',
   done: 'done', closed: 'done', archived: 'archived', stopped: 'off' };
@@ -425,6 +425,12 @@ const STALL_HINT_MIN = 3;       // 屏幕和记录这么多分钟没变化就在
 function liveKey(ch) { const l = live[ch]; return l && l.health ? l.health : 'busy'; }
 function liveBusy(ch) { const l = live[ch]; return !!(l && !l.waiting); }
 function ageMinutes(since) { return since ? Math.max(0, Math.floor((Date.now() / 1000 - since) / 60)) : 0; }
+function ageCompact(mins) {
+  if (!mins || mins < 1) return '';
+  if (mins < 60) return `${mins}分`;
+  const h = Math.floor(mins / 60), r = mins % 60;
+  return h >= 24 ? `${Math.floor(h / 24)}天` : (r ? `${h}h${r}m` : `${h}h`);
+}
 function insertDetailDur(detail, dur) {
   if (!detail || !dur || detail.includes('分钟') || detail.includes('已超时')) return detail;
   for (const mk of [' · 在等 ', ' · 等 ', ' 在等它回复']) {
@@ -436,19 +442,19 @@ function insertDetailDur(detail, dur) {
   }
   return `${detail} · ${dur}`;
 }
-function waitSuffixes(waits, waitedBy, k) {
+function waitSuffixes(waits, waitedBy, k, short = false) {
   const parts = [];
   if (k !== 'peer' && waits && waits.length) {
     const liveW = waits.filter((w) => !w.timed_out);
     const src = liveW.length ? liveW : waits;
     const lbls = [...new Set(src.map((w) => (w.num != null ? `#${w.num}` : w.to)))].join('、');
-    parts.push(liveW.length ? `在等 ${lbls}` : `等 ${lbls} 已超时`);
+    parts.push(liveW.length ? `等 ${lbls}` : `等 ${lbls} 超时`);
   }
   if (waitedBy && waitedBy.length) {
     const activeB = waitedBy.filter((w) => !w.timed_out);
     if (activeB.length) {
       const lbls = [...new Set(activeB.map((w) => w.from))].join('、');
-      parts.push(`${lbls} 在等它回复`);
+      parts.push(short ? `${lbls} 等回复` : `${lbls} 在等它回复`);
     }
   }
   return parts.join(' · ');
@@ -473,13 +479,36 @@ function formatStatusDetail(rawDetail, since, k, ch, waits, waitedBy) {
   }
   return det;
 }
+// 左栏极简详情：去掉与状态胶囊重复的前缀，把时长拆到行尾右对齐，悬停仍看完整原文
+function compactSideDetail(rawDetail, since, k, ch, waits, waitedBy) {
+  const mins = ageMinutes(since);
+  const full = formatStatusDetail(rawDetail, since, k, ch, waits, waitedBy);
+  const age = ['busy', 'peer', 'waiting', 'queued', 'stuck', 'apierr', 'approve', 'answer', 'relay', 'idle'].includes(k) ? ageCompact(mins) : '';
+  if (ch && liveBusy(ch) && !['approve', 'answer'].includes(k)) {
+    let text = liveText(ch);
+    const suf = waitSuffixes(waits, waitedBy, 'busy', true);
+    if (suf) text = `${text} · ${suf}`;
+    return { text, age: text.includes('分钟') ? '' : ageCompact(mins), full };
+  }
+  let text = String(rawDetail || '').trim();
+  if (!text) return { text: '', age, full };
+  text = text.replace(/\s*在等它回复/g, ' 等回复');
+  if (k === 'blocked') text = text.replace(/^阻塞[：:]\s*/, '');
+  else if (k === 'queued') text = text.replace(/^排队[：:]\s*/, '').replace(/已满\s*/, '满 ').replace(/^本项目已有\s*/, '本项目 ');
+  else if (k === 'waiting') text = text.replace(/^后台[：:]\s*/, '');
+  else if (k === 'done') text = text.replace(/^已完成(?:\s*[·・]\s*)?/, '');
+  else if (k === 'idle') text = text.replace(/^空闲(?:\s*\d+\s*分钟)?(?:\s*[·・]\s*)?/, '');
+  else if (k === 'relay') text = text.replace(/^等子脑回复\s*/, '等子脑 ');
+  else if (k === 'approve') text = text.replace(/^等用户批准开工\s*/, '批准开工 ').replace(/^等用户确认\s*/, '确认 ').replace(/^等用户审批\s*/, '审批 ');
+  else if (k === 'answer') text = text.replace(/^等用户回复\s*/, '等你回 ');
+  else if (k === 'off' || k === 'rest') { if (text === '未开始' || text === '空闲') text = ''; }
+  text = text.replace(/^待处理上报\s*/, '待处理 ');
+  if (text === ST[k]) text = '';
+  return { text, age: text.includes('分钟') || text.includes('已超时') ? '' : age, full };
+}
 function detailTone(k, isLive) {
-  if (isLive || k === 'busy') return 'live';
-  if (k === 'approve' || k === 'answer' || k === 'queued') return 'warn';
   if (k === 'blocked' || k === 'stuck' || k === 'apierr') return 'bad';
-  if (k === 'peer') return 'peer';
-  if (k === 'waiting') return 'wait';
-  if (k === 'relay') return 'relay';
+  if (isLive || k === 'busy' || k === 'approve' || k === 'answer') return 'em';
   return '';
 }
 function workingLine() { return `<div class="working">工作中 <span class="dots"><i></i><i></i><i></i></span></div>`; }
@@ -661,13 +690,13 @@ function renderSide() {
   // 麻薯：主脑（主对话，管项目）+ 每个项目一个子脑
   const aState = needOf(inboxOf(null)) || camState(a, 'off');
   const aLive = liveBusy(MAIN);
-  const aDet = formatStatusDetail(a?.detail || state.assistant_detail || '', a?.detail_since ?? state.assistant_detail_since, aState, MAIN);
+  const aDet = compactSideDetail(a?.detail || state.assistant_detail || '', a?.detail_since ?? state.assistant_detail_since, aState, MAIN);
   const aTone = detailTone(aState, aLive);
   const boxHtml = `<div class="mashu-box">
     <div class="row main-row ${current === MAIN ? 'active' : ''}" data-go="${MAIN}" title="麻薯主脑：主对话">
       ${mashuAv('av')}
       <div class="meta"><div class="t">麻薯</div>
-        <div class="s st-line ${aTone}" title="${esc(aDet)}">${sdot(aLive ? liveKey(MAIN) : aState)}<span class="st-t">${esc(aDet)}</span>${ctxChip(a)}</div></div>
+        <div class="s st-line ${aTone}" title="${esc(aDet.full)}">${sdot(aLive ? liveKey(MAIN) : aState)}<span class="st-t">${esc(aDet.text || ST[aState] || '')}</span>${aDet.age ? `<span class="st-age">${esc(aDet.age)}</span>` : ''}${ctxChip(a)}</div></div>
       ${unreadBadge([MAIN])}</div>
     <button class="ghost-btn" data-theme-toggle title="切换主题"></button>
   </div>`;
@@ -689,7 +718,7 @@ function renderSide() {
     const nLive = all.filter(([, , k]) => k !== 'archived').length;   // 已归档的不计数、不算未读
     const subChs = all.filter(([, , k]) => k !== 'archived').map(([s]) => `${f.id}/${s.key}`);
     const fLive = liveBusy(f.id);
-    const fDet = formatStatusDetail(f.detail || f.producer?.detail || '', f.detail_since ?? f.producer?.detail_since, bk, f.id, f.waits);
+    const fDet = compactSideDetail(f.detail || f.producer?.detail || '', f.detail_since ?? f.producer?.detail_since, bk, f.id, f.waits);
     const fTone = detailTone(bk, fLive);
     const inFilm = current === f.id || current.startsWith(f.id + '/');
     html.push(`<div class="film-card ${inFilm ? 'cur' : ''} ${open && (nLive || acctsOf(f)) ? 'open' : ''}">`);   // 一个项目一张卡：子脑标题 + 它的功能会话
@@ -701,7 +730,7 @@ function renderSide() {
         ${unreadBadge(open ? [f.id] : [f.id, ...subChs])}${ctxChip(f.producer)}${fLive && !['busy', 'stuck', 'apierr'].includes(bk) ? pill(liveKey(f.id)) : pill(bk)}
         <button class="mini-btn" data-pitch="${esc(f.id)}" title="新功能">${icon('plus', 13)}</button>
       </div>
-      ${fDet ? `<div class="fh-detail ${fTone}" title="${esc(fDet)}">${esc(fDet)}</div>` : ''}</div>`);
+      ${fDet.text ? `<div class="fh-detail ${fTone}" title="${esc(fDet.full)}"><span class="st-dt">${esc(fDet.text)}</span>${fDet.age ? `<span class="st-age">${esc(fDet.age)}</span>` : ''}</div>` : ''}</div>`);
     if (!open) { html.push('</div>'); continue; }
     const seqRow = ([s, , k]) => {
       const ch = `${f.id}/${s.key}`;
@@ -709,15 +738,17 @@ function renderSide() {
       const who = (c || s.last)?.name || '';
       const busy = k === 'busy' || liveBusy(ch);
       const fresh = k === 'done' && unseenDone(s);
-      const sDet = formatStatusDetail(s.detail || '', s.detail_since, k, ch, s.waits, s.waited_by);
+      const sDet = compactSideDetail(s.detail || '', s.detail_since, k, ch, s.waits, s.waited_by);
       const sTone = detailTone(k, busy);
+      const fallback = who ? `「${who}」` : (s.num != null ? `#${s.num}` : '');
+      const subTxt = sDet.text || fallback;
+      const rowTip = `${f.title} #${s.num ?? ''} ${s.title}${who ? ` · 「${who}」` : ''}${sDet.full ? `\n${sDet.full}` : ''}`;
       const act = ['done', 'blocked', 'idle', 'off'].includes(k) ? `<button class="row-act" data-cam="archive" data-ref="${esc(ch)}" title="归档：收进「已归档」">${icon('archive', 13)}</button>`
         : k === 'archived' ? `<button class="row-act" data-cam="unarchive" data-ref="${esc(ch)}" title="取消归档">${icon('undo', 13)}</button>` : '';
-      html.push(`<div class="row seq-row ${current === ch ? 'active' : ''} ${busy ? 'is-busy' : ''} ${fresh ? 'fresh' : ''}" data-go="${esc(ch)}" title="${esc(f.title)} #${esc(s.num ?? '')} ${esc(s.title)}">
+      html.push(`<div class="row seq-row ${current === ch ? 'active' : ''} ${busy ? 'is-busy' : ''} ${fresh ? 'fresh' : ''}" data-go="${esc(ch)}" title="${esc(rowTip)}">
         ${fresh ? '<span class="fresh-dot" title="已完成，还没看结果"></span>' : ''}
         <div class="meta"><div class="t-line"><span class="t">${esc(s.title)}</span>${busy && !['busy', 'stuck', 'apierr'].includes(k) ? pill(liveKey(ch)) : pill(k)}${k === 'archived' ? '' : unreadBadge([ch])}${act}</div>
-          <div class="s3">${who ? `<span class="who">「${esc(who)}」</span>` : `<span class="who">#${esc(s.num ?? '')}</span>`}${segBar(s)}${ctxChip(c)}</div>
-          ${sDet ? `<div class="st-detail ${sTone}" title="${esc(sDet)}">${busy ? '<span class="dots"><i></i><i></i><i></i></span>' : ''}<span class="st-dt">${esc(sDet)}</span></div>` : ''}</div></div>`);
+          <div class="st-detail ${sDet.text ? sTone : 'dim'}" title="${esc(sDet.full || fallback)}">${busy ? '<span class="dots"><i></i><i></i><i></i></span>' : ''}<span class="st-dt">${esc(subTxt)}</span>${segBar(s)}${ctxChip(c)}${sDet.age ? `<span class="st-age">${esc(sDet.age)}</span>` : ''}</div></div></div>`);
     };
     const arch = seqs.filter((x) => x[1] === 'archived').sort((x, y) => (y[0].archived_at || 0) - (x[0].archived_at || 0));   // 归档越晚越靠上
     const cur = seqs.filter((x) => x[1] !== 'archived');
