@@ -180,6 +180,27 @@ class TestCodexParser(unittest.TestCase):
         self.assertEqual(d['tool'], 'Bash · python3 -m unittest')
         self.assertTrue(any(t['name'] == 'Write' and t['detail'] == 'live_parsers.py' for t in d['tools']))
 
+    def test_bg_shell_finished_by_item_completed(self):
+        """新版 Codex：后台 shell 不再 write_stdin 轮询，结束只记在 CommandExecution 的 item_completed 里（#13/#19 一直显示「等待后台任务」）。"""
+        entries = [
+            {'timestamp': '2026-11-27T09:49:11Z', 'type': 'response_item', 'payload': {
+                'type': 'function_call', 'call_id': 'c1', 'name': 'exec_command', 'arguments': json.dumps({'cmd': 'bash .mashu/check.sh'})}},
+            {'timestamp': '2026-11-27T09:49:12Z', 'type': 'response_item', 'payload': {
+                'type': 'function_call_output', 'call_id': 'c1',
+                'output': 'Chunk ID: 1\nWall time: 1.0 seconds\nProcess running with session ID 11430\nOutput:\n'}},
+            {'timestamp': '2026-11-27T09:49:13Z', 'type': 'response_item', 'payload': {
+                'type': 'function_call', 'call_id': 'c2', 'name': 'exec_command', 'arguments': json.dumps({'cmd': 'go test ./...'})}},
+            {'timestamp': '2026-11-27T09:49:14Z', 'type': 'response_item', 'payload': {
+                'type': 'function_call_output', 'call_id': 'c2', 'output': 'Process running with session ID 222\nOutput:\n'}},
+            {'timestamp': '2026-11-27T09:50:40Z', 'type': 'event_msg', 'payload': {
+                'type': 'item_completed', 'item': {'type': 'CommandExecution', 'id': 'c1', 'process_id': '11430',
+                                                   'status': 'completed', 'exit_code': 0, 'command': ['bash', '.mashu/check.sh']}}},
+        ]
+        d = lp.parse_codex_entries(entries, now=1795773100.0)
+        st = {s['id']: s['state'] for s in d['shells']}
+        self.assertNotEqual(st.get('shell-11430'), 'running')
+        self.assertEqual(st.get('shell-222'), 'running')
+
 
 class TestOpenCodeParserAndPlugin(unittest.TestCase):
     def test_opencode_fixture_and_legacy(self):

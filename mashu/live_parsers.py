@@ -735,6 +735,12 @@ def parse_codex_entries(entries, now=None, mtime=None):
                     todos = parsed_td
             elif pt == 'item_completed' and isinstance(p.get('item'), dict):
                 item = p['item']
+                # 后台 shell 结束：新版 Codex 不一定再 write_stdin 轮询，结束只记在 CommandExecution 的 item_completed 里
+                pid = item.get('process_id')
+                if item.get('type') == 'CommandExecution' and pid is not None and item.get('status') not in (None, 'in_progress', 'running'):
+                    code = item.get('exit_code')
+                    st = 'completed' if item.get('status') == 'completed' and code in (0, None) else 'failed'
+                    finished[f'shell-{pid}'] = (st, parse_ts(p.get('completed_at_ms')) or ts)
                 if item.get('type') == 'Reasoning':
                     stxt = item.get('summary_text') or []
                     if isinstance(stxt, list):
