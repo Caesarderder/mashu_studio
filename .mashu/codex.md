@@ -8,9 +8,9 @@
 
 | 功能 | 执行者 | 交付 / 状态 | 方案 |
 | --- | --- | --- | --- |
-| #17 stable-runtime 线上跑稳定快照（发布 = 重启服务） | 待批准开工 | `bin/mashu` 分流器、`bin/mashu-dev`、`start.sh` 服务路径、studio.py 路径常量 + `MASHU_CONTENT` + `cmd_release`/`runtime_info`/`cmd_restart_server`、`status_data` 只加 `runtime` 字段、server.py 重启接口、web 右上角。不碰 #16 的通信命令/hook_prompt/卡片，不碰 #15 的左栏 | `.mashu/plans/stable-runtime.md` |
+| #17 stable-runtime 线上跑稳定快照（发布 = 重启服务） | 遇见（#390 批准，进行中） | `bin/mashu` 分流器、`bin/mashu-dev`、`start.sh` 服务路径、studio.py 路径常量 + `MASHU_CONTENT` + `cmd_release`/`runtime_info`/`cmd_restart_server`、`status_data` 只加 `runtime` 字段、server.py 重启接口、web 右上角。不碰 #16 的通信命令/hook_prompt/卡片，不碰 #15 的左栏 | `.mashu/plans/stable-runtime.md` |
 | #16 agent-cli 统一收发 + 收件箱分拣 + agent 友好输出 | 我不难过（阶段 1 已提交 b1b5703，阶段 2 进行中） | 新增 `cmd_me/inbox/send/reply/forward/close`、`resolve_address`、`triage_reports`、`fail()`；旧通信命令改为别名；`reports` 加列；hook_prompt 摘要；web 卡片类型/过时；提示词瘦身。`peer` 只调用 #15 的函数，不改其表 | `.mashu/plans/agent-cli.md` |
-| #15 左栏状态细化 + 点对点等待 | 雨天（2e81a8b 已完成；用户 13:58 要求左栏黄字更简洁，返工中） | 改 `seq_status`/`status_data`/`bg_tasks_of`/`cam_view_bg`/`launch_queue`（记排队原因）/`cmd_collaboration`（peer 等待）/`collaboration_context`、新表 `peer_waits`、web 左栏与对话头部 | `.mashu/plans/status-detail.md` |
+| #15 左栏状态细化 + 点对点等待 | 已完成（2e81a8b、返工 6522542），待重启服务 | 改 `seq_status`/`status_data`/`bg_tasks_of`/`cam_view_bg`/`launch_queue`（记排队原因）/`cmd_collaboration`（peer 等待）/`collaboration_context`、新表 `peer_waits`、web 左栏与对话头部 | `.mashu/plans/status-detail.md` |
 | #14 模型池（预设 + 备选预设） | 日落（已完成 1fb06e9、1694bfd，待重启服务） | 改 `session_pref`/`code_pref`/`choose_account`/`set_pref`/launch 取配置/defaults 动作/`pitch`、`config_file.py` 迁移、web 模型池页与各选择器 | `.mashu/plans/model-pool.md` |
 | #13 caesar-docs 治理 | 很好 | 已完成（d2a859a），待用户点「重启服务」生效 | `.mashu/plans/docs-governance.md`，依据 `.mashu/drafts/caesar-docs-audit-2026-11-27.md` |
 | #11 并行调度 + 法典 + 协作板 + 点对点 | — | 已完成（6e00cb8），服务 04:05 重启后已生效 | `.mashu/plans/parallel-codex.md` |
@@ -19,6 +19,12 @@
 **验收**：每个功能的 AC 写在方案里；改 Python 的功能完成后，由用户点「重启服务」，子脑用 curl 核对接口后才算上线。
 
 **待决**：
+- **#16 ↔ #17 并行分工（2026-11-27 星期五）**：
+  - `cmd_restart_server` 归 #17，改成走 release。#16 第 2 步加的确认信封（不带 `--confirm` 返回退出码 4）要保留：#17 改函数体时沿用 #16 的 `confirm_or_fail`/`MashuError`，不另写一套。
+  - `cmd_release` 的报错和 JSON 输出用 #16 的 `fail`/`out_ok`/退出码枚举（检查失败归 code=`check_failed`）。
+  - 路径常量（`CODE`/`HOME`/`KMAP`/`PLAYBOOKS`/`BIN`）、`bin/*`、`start.sh` 归 #17。#16 不碰。
+  - 通信命令、`hook_prompt`、`triage_reports`/`evaluate_stale`、`schema`/`help` 归 #16。#17 新增的 `release` 子命令要在 #16 的 schema 和 help 里登记：#17 照 #16 的格式自己补上。
+  - 网页：#16 只改上报卡片，#17 只改右上角版本和重启区域。argparse 段两边各加自己的子命令，用 `git add -p` 暂存。
 - **#15 返工 ↔ #16 并行分工（2026-11-27 星期五）**：
   - #15 只改左栏、对话头部的状态文字：studio.py 的 `seq_status`/`status_data`/`assistant_detail` 等 detail 文案函数，以及 web/app.js、web/style.css 中左栏和对话头部的渲染与样式。
   - #16 不碰上面这些函数和左栏渲染。#16 的网页改动只限上报卡片（类型标签、取代 / 过时标记）。
