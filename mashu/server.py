@@ -185,6 +185,11 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/api/state':
             with self.lock:
                 d = studio.status_data(conn)
+            for r in d.get('inbox') or []:
+                r['msg_type'] = studio.infer_msg_type(r)
+                r['msg_type_label'] = studio.MSG_TYPE_LABEL.get(r['msg_type'], r['msg_type'])
+                r['superseded_by'] = studio.report_superseded_by(conn, r)
+                r['stale_reason'] = studio.evaluate_stale(conn, r)
             d['server'] = dict(started=STARTED, stale=code_stale())
             add_behaviors(d, conn)
             return self.send_json(d)
@@ -642,13 +647,17 @@ def viewable(conn, p):
 
 
 def report_view(conn, r):
-    """上报加上来源、路线、审批状态、文档等，给网页的卡片用。"""
+    """上报加上来源、路线、审批状态、文档、类型与过时分拣信息，给网页的卡片用。"""
     r['origin'] = ' · '.join(studio.report_origin(conn, r))
     r['route'] = json.loads(r['route'] or '[]')
     r['options'] = json.loads(r['options'] or '[]')
     r['meta'] = json.loads(r.get('meta') or '{}')
     r['required'] = studio.required_level(r)
     r['gate_label'] = studio.GATES.get(r['gate'] or '', r['gate'])
+    r['msg_type'] = studio.infer_msg_type(r)
+    r['msg_type_label'] = studio.MSG_TYPE_LABEL.get(r['msg_type'], r['msg_type'])
+    r['superseded_by'] = studio.report_superseded_by(conn, r)
+    r['stale_reason'] = studio.evaluate_stale(conn, r)
     ap = studio.one(conn, 'SELECT granted_at, expires_at, gate FROM approvals WHERE report_id=? ORDER BY id DESC LIMIT 1', r['id'])
     r['approval'] = ap
     f = studio.film(conn, r['film_id']) if r['film_id'] else None

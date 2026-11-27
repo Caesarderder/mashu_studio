@@ -1,14 +1,9 @@
 ## 怎么做
 
-这是一个**直接做**的任务。开工读当前工程的 `docs/indexes/docs.md`，缺失时读 `AGENTS.md`。用 `caesar-docs` 按需定位，找到方向就动手。项目规则附在本提示的最后。
+这是一个**直接做**的任务。开工按需读 `docs/indexes/docs.md`（没有就读 `AGENTS.md`），用 `caesar-docs` 定位目标与验证命令，找到方向就动手；项目规则附在末尾。
 
-- 先读 `mashu codex` 和 `mashu sync`，共享接口或提交有变化就同步。撞车先 `mashu peer <编号> "…"`，仍需裁决再 `mashu tell`。
-- 读需求 → 直接动手改 → 自测（项目有 `check.sh` 就跑）→ 只提交自己改的文件。
-- 不用先写方案等批准。改动大、方向不确定时，在回复里用几句话说清思路再动手；真拿不准才 `mashu ask`。
-- 改了界面（网页、页面样式、布局）：先按页截图，用 `mashu ask "界面改好了，请看截图" --options "确认|还要改（请写清哪页哪里）" --recommend 确认` 发给用户，截图在正文里写 `![说明](绝对路径)`；**收到「确认」之前不执行 `feature set 已完成`、不写完成状态的 handoff、不 finish**，用户要改就接着改；只回「还要改」没说哪里时，先一句话问清哪一页、哪个元素、想要什么效果，再动手，不直接改全页。
-- 标「已完成」前逐条对照验收标准：量化指标（花费、通过率、耗时等）没达标，要么补做到达标，要么 `mashu ask` 请子脑 / 用户接受「部分完成」；评测之后又改过代码、没重跑的，交接里写「未验证」。不把没达标的指标只写进遗留就标完成。（自迭代 #99）
-- 做完：`mashu feature set 1 已完成` → `mashu handoff --now "做了什么" --next "无" --files "改了哪些文件、哪些提交" --evidence "怎么验证的" --docs "回写节点或无需修改的理由"` → `mashu finish --reason "完成"`。
-
-收到“继续 …”时，系统会附上状态摘要和 handoff.md，接着做即可。`mashu feature status` 看状态；`mashu claim "src/x/**"` 声明改动范围（和别的任务同时改一个文件夹时）。
-
-- 用户要你打开文件夹、文件或网页时，用 `open <绝对路径或网址>` 真的打开，命令成功后再说「已打开」；不要只给路径让用户自己找。（自迭代 #88）
+- 并行协作：先看 `mashu codex` 和 `mashu sync`，共享接口或提交有变化就 `mashu send @crew "…"`；撞车先 `mashu send #<编号> "…"`，需要裁决再 `mashu send up --type fyi "…"`。多任务同目录用 `mashu claim "src/x/**"` 声明范围。
+- 读需求 → 直接改 → 自测（有 `check.sh` 就跑）→ 只提交自己改的文件；拿不准先说思路再做，真定不了再 `mashu send up --type ask`。
+- 改了界面：按页截图，用 `mashu send up "界面改好了，请看截图\n![说明](绝对路径)" --type ask --options "确认|还要改（请写清哪页哪里）" --recommend A` 确认；**收到确认前不标完成、不 finish**。
+- 做完对照验收标准：`mashu feature set 1 已完成` → `mashu handoff --now … --next "无" --files … --evidence … --docs …` → `mashu finish --reason "完成"`。
+- 收到「继续 …」按状态摘要和 handoff.md 接着做；`mashu feature status` 看状态。

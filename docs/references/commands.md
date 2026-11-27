@@ -27,26 +27,45 @@ related:
 
 ## 所有角色
 
+所有命令支持 `--json`（成功返回单行 `{"ok":true,"api_version":1,...}`，失败返回 `{"ok":false,"code":...,"error":...,"fix":...}`）；退出码：`0` 成功、`1` 一般错误、`2` 用法错误、`3` 找不到、`4` 需确认（确认信封）、`5` 被规则拦截、`6` 冲突。正文支持 `-` 从标准输入读取（避开 `$` 展开）。
+
+### 核心通信（6 个动词）
+
 | 命令 | 用途 |
 | --- | --- |
+| `mashu me [--json]` | 我是谁：角色、项目、功能、可发送对象地址与手头待办计数 |
+| `mashu inbox [--all] [--json]` | 收件箱：发给我的待处理、已过时（标建议 `close`）与用户挂久提醒；纯通报类（`fyi`/`done`）看过自动结案 |
+| `mashu send <对象> "…"\|- [--type ask\|approve\|fyi\|done\|blocked\|handoff] [--options "A\|B" --recommend A --why "…"] [--gate …] [--re <id>] [--supersedes <id>] [--key <去重键>]` | 按地址发消息：`user`、`boss`、`lead`、`up`、`#N`、`<项目>`、`<项目>#N`、`@crew`。`--supersedes` 和同功能新建同类卡会自动把旧卡标为「已被 #N 取代」并结案；`--key` 重试去重；权限由调度器按层级校验 |
+| `mashu reply <id> [--choice A] ["补充"\|-]` | 回答 / 批复上报；用选项编号（`A`/`B`/`1`/`2`）精准匹配选项，可另附补充说明 |
+| `mashu forward <id> <user\|up\|boss> "一句意见" [--recommend A --why "…"] [--confirm]` | 转交上报（原 `pass`）；审批卡转交用户需确认信封 `--confirm` |
+| `mashu close <id> --why "过时：…" [--silent] [--confirm]` | 结案（含过时清理与静默结案）；结案用户手上的卡需 `--confirm` |
+
+### 自描述与常用命令
+
+| 命令 | 用途 |
+| --- | --- |
+| `mashu help [命令]` | 查看命令用法与真实例子 |
+| `mashu schema --json` | 输出全部命令、参数、退出码、消息类型与地址约定 |
 | `mashu status [项目]` | 全局或某个项目的状态（含每个会话的详细状态与点对点等待） |
-| `mashu ask "…" --options "A|B" --recommend A --why "…" [--gate prod|irreversible] [--summary …]` | 请示（执行者 → 子脑；子脑 / 主脑 → 用户）。需要真人帮忙（登录、密钥、付款、线下）加 `--human`。自己上一条 ask 还没回（30 分钟内）时会被拦，让你合并；紧急且无关加 `--urgent`。正文超过 400 字或 3 个以上问号会被拒（一条只问一件事） |
-| `mashu tell "…"` | 通报，不需要回答 |
 | `mashu handoff --now … --next … [--open … --files … --evidence … --risk … --docs …]` / `--file PATH` | 写交接文档。`--docs` 记录回写节点或无需回写的理由 |
 | `mashu skills status [--json]` | 列出 caesar-docs 来源和各安装位置的版本、指纹及漂移 |
 | `mashu skills sync [--apply] [--managed-only] [--project ID]` | 默认预览。应用时备份并替换用户级链接，`--managed-only` 跳过用户级位置，`--project` 限定工程副本 |
 | `mashu finish --reason "…"` | 本阶段完成 / 交接 |
-| `mashu restart-server --reason "…"` | 重启网页服务与调度器（只给主脑；各会话不受影响，和网页「重启服务」按钮同一做法） |
+| `mashu restart-server --reason "…" --confirm` | 重启网页服务与调度器（只给主脑，需确认信封 `--confirm`；各会话不受影响） |
+
+### 兼容别名（旧通信命令全部保留）
+
+`ask`=`send up --type ask`、`tell`=`send up --type fyi`、`report`=`send boss`、`memo`=`send <项目>`、`note`=`send <项目>#<编号>`、`peer`=`send #N --type ask`（`--fyi` 为 `fyi`）、`sync`=`send @crew --type fyi`、`pass`=`forward <id> up`、`answer`=`reply`、`reports`=`inbox`。
 
 ## 主脑
 
 | 命令 | 用途 |
 | --- | --- |
 | `mashu scan` / `mashu add-project <path> [--title …]` | 看未登记的文件夹 / 登记项目 |
-| `mashu memo <项目> "…"` | 给子脑下指示（没在运行会自动启动），推动项目的主要方式 |
+| `mashu send <项目> "…"`（旧 `memo`） | 给子脑下指示（没在运行会自动启动），推动项目的主要方式 |
 | `mashu priority <项目>/<编号> <数字>` | 排队优先级，越大越先 |
-| `mashu start / stop / restart <项目>/<编号>` | 启动 / 停止 / 换新执行者；agent 调 stop 必须带 `--reason "为什么停、等谁"`，显示在功能频道并记进日志 |
-| `mashu reports` / `answer <id> "…"` / `pass <id> "意见" --recommend 选项 --why "…"` | 处理上报 |
+| `mashu start / stop / restart <项目>/<编号>` | 启动 / 停止 / 换新执行者；agent 调 stop 必须带 `--reason`；有生效中的上线/不可逆批准时返回退出码 4，需 `--confirm`（兼容 `--force`） |
+| `mashu inbox` / `reply <id> --choice A` / `forward <id> user "意见"` / `close <id> --why "…"` | 处理收件箱与过时卡 |
 | `mashu decide "…" [--why …] [--ratify]` | 记下你的决定：默认记为已执行（简报列出，用户可推翻）；拿不准、要用户点头的加 `--ratify` 挂“待追认” |
 | `mashu browser "任务" [--model …] [--cwd …] [--timeout 分钟]` | Code Mode 会话用不了浏览器：把浏览器的活交给不开 Code Mode 的独立 `claude -p --chrome` 会话，结果打印回来，记录在 `state/browser/`；长任务配 `run_in_background` |
 | `mashu say "…"` | 长任务中途在主对话说一句 |
@@ -64,19 +83,19 @@ related:
 | --- | --- |
 | `mashu new-feature <项目> <英文slug> --brief "需求原文" --plan <方案文件> [--title "中文标题"] [--workflow] [--touches <glob…>] [--account <id>] [--workdir <子目录>] [--preset <名或id>] [--cli claude\|gemini\|codex\|opencode] [--cli-account <id>] [--model <模型>] [--effort low\|medium\|high\|xhigh\|max]` | 新建功能（默认直接做）；优先用 `--preset <名或id>` 指定模型池预设（`mashu preset list` 可查，不能和 `--cli / --cli-account` 同时给），也可用 `--cli / --model / --effort` 单独指定，写进开工审批卡，用户可以在卡上改了再批准；批准时的配置存进 state.json 的 `exec`，执行者按它启动；`--workdir` 让执行者在工程里的某个已存在子目录里启动（项目适配器也可能在开功能时自己设，见 [项目资料制作规范](../workflows/project-assets.md)「项目适配器」）；麻薯开的功能必须带 `--plan`（需求 + 技术方案，已和用户谈清楚），开好后自动申请用户「批准开工」，批准后执行者才启动；`--touches` 预先声明改动范围，重叠时通知双方和子脑；`--account` 归哪个账号（项目有 `.mashu/accounts.json` 时，id 不存在会报错并列出可选；不写按 accounts.json 推，见 [项目资料制作规范](../workflows/project-assets.md)「accounts.json」）；有账号的项目 `mashu status` 的功能行带账号名 |
 | `mashu preset list [--json]` | 只读列出模型池预设，供 `new-feature --preset` 选用 |
-| `mashu start / stop / restart <项目>/<编号>` | 启动 / 停止 / 换新执行者（restart 会换一个新名字） |
-| `mashu note <项目>/<编号> "…"` | 给执行者补充指令 |
+| `mashu start / stop / restart <项目>/<编号>` | 启动 / 停止 / 换新执行者（restart 会换一个新名字；有生效批准时 stop 需 `--confirm`） |
+| `mashu send #<编号> "…"`（旧 `note`） | 给执行者补充指令 |
 | `mashu feature status --ref <项目>/<编号>` | 看某个功能的状态 |
 | `mashu feature block --ref <项目>/<编号> --text "暂停：等…"` / `--clear` | 标阻塞 / 暂停：执行者 finish 时不自动申请下一阶段、直接收工；解除后发消息再拉起 |
-| `mashu reports` / `answer` / `pass` | 处理上报；`pass` 把卡片发到项目对话给用户 |
+| `mashu inbox` / `reply` / `forward` / `close` | 处理收件箱；`forward <id> user` 发到项目对话给用户；`close` 清理过时卡 |
 | `mashu waive <项目>/<编号> --reason "…"` | 自动检查失败但不是这个功能造成的，豁免一次 |
-| `mashu report "…"` | 跨项目的事交给主脑 |
+| `mashu send boss "…"`（旧 `report`） | 跨项目的事交给主脑 |
 | `mashu decide "…" [--seq <编号-名称>]` / `mashu priority …` | 记决定 / 本项目优先级 |
 | `mashu playbook show film:<项目>` / `mashu retro <项目>` | 看工作流 / 复盘数据 |
 
 ## 执行者
 
-`mashu sync ["进展"]` 查看或发布项目进展。`mashu peer <编号> "消息" [--fyi]` 发给在线同项目执行者并抄送子脑；默认记为等待对方回复（对方回复、己方会话结束/换人或超过 `peer_wait_minutes` 默认 30 分钟后自动清除），加 `--fyi` 表示只通知不等回复。`mashu codex` 显示法典和当前分工，子脑可用 `mashu codex note "约定"` 追加。
+`mashu me` 查看身份与可发对象；`mashu inbox` 查看待办与点对点消息；`mashu send @crew "进展"`（旧 `sync`）发布项目进展；`mashu send #<编号> "消息" --type ask|fyi`（旧 `peer`）发给在线同项目执行者并抄送子脑（`ask` 记为等待对方回复，`fyi` 只通知不等回复）；`mashu codex` 显示法典和当前分工，子脑可用 `mashu codex note "约定"` 追加。
 
 见 [功能状态文件](../workflows/feature-state.md)（feature / ac / claim）。
 

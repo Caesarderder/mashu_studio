@@ -31,15 +31,15 @@ related:
 
 ## 要找子脑（超出本会话的事）
 
-- 需求 / 范围要变、和别的功能撞了、需要别人的资源或决定：`mashu ask "问题（背景、选项）" --summary "一句话" --options "A|B" --recommend A --why "一句理由"`，然后**立即结束本轮**，批复到了会唤醒你。
-- 只是告知（风险、外部阻塞、和别的功能改到同一处）：`mashu tell "…"`。
-- 生产操作、推送受保护分支、合并：会被拦截，先 `mashu ask --gate prod "操作、影响范围、回滚方式" --recommend 审批 --why "…"`，子脑批了就行。
+- 需求 / 范围要变、和别的功能撞了、需要别人的资源或决定：`mashu send up "问题（背景、选项）" --type ask --summary "一句话" --options "A|B" --recommend A --why "一句理由"`（旧别名 `mashu ask`），然后**立即结束本轮**，批复到了会唤醒你。
+- 只是告知（风险、外部阻塞、和别的功能改到同一处）：`mashu send up "…" --type fyi`（旧别名 `mashu tell`）。
+- 生产操作、推送受保护分支、合并：会被拦截，先 `mashu send up "操作、影响范围、回滚方式" --type approve --gate prod --recommend 审批 --why "…"`，子脑批了就行。
 - 不可逆操作（删库、删工程目录、强推覆盖历史）：`--gate irreversible`，要用户审批。审批后 2 小时内可执行；代码变了审批失效。
 
 ## 同一个项目里可能有别的执行者在并行
 
-- 同一项目可以同时跑几个执行者，开工先看 `mashu codex` 和 `mashu sync`，再用 `mashu claim <glob…>` 声明范围。撞车先 `mashu peer <编号> "…"` 协商，谈不拢再 `mashu tell` 子脑裁决。
-- 普通重叠会提醒双方。热点文件由首写者领取短租约，提交该文件或闲置到期后交给下一位。共享接口变更或提交后用 `mashu sync "…"` 写明改动和验证。
+- 同一项目可以同时跑几个执行者，开工先看 `mashu codex` 和 `mashu sync`，再用 `mashu claim <glob…>` 声明范围。撞车先 `mashu send #<编号> "…" --type ask`（旧别名 `mashu peer`）协商，谈不拢再 `mashu send up "…" --type fyi` 子脑裁决。
+- 普通重叠会提醒双方。热点文件由首写者领取短租约，提交该文件或闲置到期后交给下一位。共享接口变更或提交后用 `mashu send @crew "…" --type fyi`（旧别名 `mashu sync`）写明改动和验证。
 - 用户也会在外部会话里改代码：改文件前先看当前内容（diff），只做增量修改，不整文件覆盖。
 - 禁止 `git stash`、`git checkout .`、`git restore .`、`git reset --hard`、`git clean -f`、`git add -A`、`git add .`、`git commit -a`（会被拦截）。
 - 提交只加自己改过的文件：`git add <文件…> && git commit -m "[<项目>#<编号>] 说明"`。

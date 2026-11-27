@@ -243,6 +243,7 @@ function seqLabel(f, s) { return `${f.title} #${s.num ?? s.key}`; }
 function pct(x) { return x == null ? '未知' : `${Math.round(x * 100)}%`; }
 function num(n) { return n == null ? '—' : Number(n).toLocaleString(); }
 const KIND = { ask: '请示', confirm: '申请进入下一阶段', gate: '申请审批', tell: '通报', report: '汇报', 'stage-done': '阶段完成', 'sequence-done': '功能完成' };
+const MSG_TYPE = { ask: '请示', approve: '审批', fyi: '通报', done: '完成', blocked: '阻塞', handoff: '交接' };
 const NOTIFY = ['tell', 'report', 'stage-done', 'sequence-done'];
 const LEVEL = { producer: '子脑', assistant: '主脑', executive: '用户', crew: '执行者', 'self-iterate': '自迭代', external: '外部' };
 
@@ -1073,7 +1074,15 @@ function holderName(r) {
   return LEVEL[r.holder] || r.holder;
 }
 function closedLine(r) {
-  if (r.status === 'muted') return `<div class="done-line muted">${icon('moon', 13)}已静默，不处理 · ${clock(r.closed_at)}</div>`;
+  if (r.status === 'superseded' || r.superseded_by) {
+    const why = r.superseded_by ? `已被 #${r.superseded_by} 取代` : (r.stale_reason || '已被取代');
+    return `<div class="done-line muted">${icon('swap', 13)}${esc(why)}${r.closed_at ? ` · ${clock(r.closed_at)}` : ''}</div>`;
+  }
+  if (r.status === 'muted') return `<div class="done-line muted">${icon('moon', 13)}已静默，不处理${r.stale_reason ? `（${esc(r.stale_reason)}）` : ''} · ${clock(r.closed_at)}</div>`;
+  if (r.status === 'closed' && !NOTIFY.includes(r.kind)) {
+    const by = LEVEL[r.answered_by] || r.answered_by || '';
+    return `<div class="done-line muted">${icon('check', 13)}${by ? esc(by) : ''}已结案 · ${clock(r.closed_at)}${r.answer ? `：${esc(r.answer)}` : ''}</div>`;
+  }
   if (NOTIFY.includes(r.kind)) return `<div class="done-line muted">${icon('check', 13)}已送达主对话</div>`;
   const by = LEVEL[r.answered_by] || r.answered_by;
   const ok = (r.options || [])[0] === r.answer;
@@ -1228,16 +1237,26 @@ function renderCard(m) {
   if (!r) return `<div class="card" id="${domId}"><div class="card-main"><div class="ct muted">#${m.report_id} 加载中…</div></div></div>`;
   const notify = NOTIFY.includes(r.kind);
   const open = r.status === 'open';
-  const mine = open && !notify && r.holder === 'executive';
-  const canAct = open && !notify && (mine || expanded.has(r.id));
+  const superseded = r.status === 'superseded' || !!r.superseded_by;
+  const staleLabel = superseded ? (r.superseded_by ? `已被 #${r.superseded_by} 取代` : (r.stale_reason || '已被取代')) : (r.stale_reason ? `已过时：${r.stale_reason}` : '');
+  const isStale = superseded || (open && !!r.stale_reason);
+  const mtType = r.msg_type || (r.gate || r.kind === 'confirm' ? 'approve' : (notify ? 'fyi' : 'ask'));
+  const mtLabel = r.msg_type_label || MSG_TYPE[mtType] || mtType;
+  const mine = open && !notify && !isStale && r.holder === 'executive';
+  const canAct = open && !notify && (mine || expanded.has(r.id) || (r.holder === 'executive' && isStale));
   const seqCh = r.film_id ? (r.seq_key ? `${r.film_id}/${r.seq_key}` : r.film_id) : '';
   const cardMsg = messages.find((x) => x.kind === 'card' && x.report_id === r.id);
   const kindCls = r.gate ? 'gate' : (r.kind === 'confirm' ? 'confirm' : (notify ? 'note' : 'ask'));
   let link = '';
   if (primary && r.seq_key) link = goLink(`data-go="${esc(seqCh)}" data-focus="raised-${r.id}" title="去这个功能"`);
   else if (!primary && cardMsg) link = goLink(`data-go="${esc(cardMsg.channel)}" data-focus="card-${r.id}" title="${cardMsg.channel === MAIN ? '主对话' : '子脑对话'}里的卡片"`);
-  const stTag = notify ? '<span class="tag k-note">通知</span>' : (open ? '' : '<span class="tag k-done">已回复</span>');
-  const head = `<div class="ch">${stTag}<span class="tag k-${kindCls}">${KIND[r.kind] || r.kind}</span>
+  const stTag = superseded
+    ? `<span class="tag k-stale">${esc(staleLabel)}</span>`
+    : (r.stale_reason && open ? `<span class="tag k-stale">已过时</span>` : (notify ? '<span class="tag k-note">通知</span>' : (open ? '' : '<span class="tag k-done">已回复</span>')));
+  const typeTag = `<span class="tag mt-${esc(mtType)}">${esc(mtLabel)}</span>`;
+  const kindText = KIND[r.kind] || r.kind;
+  const kindTag = kindText !== mtLabel ? `<span class="tag k-${kindCls}">${esc(kindText)}</span>` : '';
+  const head = `<div class="ch">${stTag}${typeTag}${kindTag}
       <span class="origin">${esc(r.origin)}</span><span class="rid">#${r.id}</span><span class="time">${timeText(m.ts)}</span></div>`;
   // 通知类（阶段完成、通报……）：一行标题，正文折叠
   if (notify) {
@@ -1270,6 +1289,18 @@ function renderCard(m) {
   else if (open && !notify) foot = `<div class="done-line wait">${icon('clock', 13)}在${esc(holderName(r))}手上 · ${waited(r)}
       <button class="btn small" data-expand="${r.id}">直接批复</button></div>`;
   else if (!open) foot = closedLine(r);
+  if (isStale) {
+    const sumTitle = r.summary || firstLine(r.text, 70);
+    return `<div class="card stale ${kindCls} ${open ? '' : 'closed'}" id="${domId}">${cardAv(r)}
+      <div class="card-main">
+        <details class="card-stale-fold" data-dkey="st${r.id}" ${detailsOpen(`st${r.id}`)}>
+          <summary>${stTag}${typeTag}<span class="rid">#${r.id}</span><span class="stale-sum">${esc(sumTitle)}</span>${staleLabel ? `<span class="stale-why">${esc(staleLabel)}</span>` : ''}</summary>
+          <div class="stale-body">${head}<div class="ct">${md(r.text)}</div>
+          ${chips.length ? `<div class="chips">${chips.join('')}</div>` : ''}
+          ${acBox}${recLine}${route ? `<div class="route"><div class="route-h">各级意见</div>${route}</div>` : ''}${foot}</div>
+        </details>
+      </div>${link}</div>`;
+  }
   return `<div class="card ${kindCls} ${mine ? 'need' : ''} ${open ? '' : 'closed'}" id="${domId}">${cardAv(r)}
     <div class="card-main">${head}
     <div class="ct">${md(r.text)}</div>
@@ -1556,21 +1587,28 @@ function needRow(r, showWhere) {
   } else if (!r.gate && r.kind !== 'confirm' && opts.length && opts.length <= 4) {
     acts = opts.map((o) => `<button class="btn small ${m.recommend === o ? 'rec' : ''}" data-answer="${r.id}" data-text="${esc(o)}">${m.recommend === o ? icon('star', 12) : ''}${esc(o)}</button>`).join('');
   }
+  const mtType = r.msg_type || (r.gate || r.kind === 'confirm' ? 'approve' : 'ask');
+  const mtChip = `<span class="tag mt-${esc(mtType)}">${esc(r.msg_type_label || MSG_TYPE[mtType] || mtType)}</span>`;
   const chip = r.gate ? `<span class="tag k-gate">${esc(GATE[r.gate] || r.gate)}</span>` : (r.kind === 'confirm' ? '<span class="tag k-confirm">进下一阶段</span>' : '');
-  return `<div class="need-item${renderPanel.seen && !renderPanel.seen.has(r.id) ? ' enter' : ''}">
-    <div class="need-main" ${go}><div class="need-subj">${chip}${esc(r.summary || r.text)}</div>
-      <div class="need-o">#${r.id}${showWhere ? ` · ${esc(r.origin || '')}` : ''} · ${esc(waited(r))}</div></div>
+  const staleChip = r.stale_reason ? `<span class="tag k-stale" title="${esc(r.stale_reason)}">已过时</span>` : '';
+  return `<div class="need-item${r.stale_reason ? ' is-stale' : ''}${renderPanel.seen && !renderPanel.seen.has(r.id) ? ' enter' : ''}">
+    <div class="need-main" ${go}><div class="need-subj">${staleChip}${mtChip}${chip}${esc(r.summary || r.text)}</div>
+      <div class="need-o">#${r.id}${showWhere ? ` · ${esc(r.origin || '')}` : ''} · ${esc(waited(r))}${r.stale_reason ? ` · ${esc(r.stale_reason)}` : ''}</div></div>
     <div class="need-acts">${acts}<button class="btn small" ${go}>${r.gate === 'irreversible' ? '去审批' : (acts ? '详情' : '去回复')}${icon('arrow-ur', 12)}</button></div></div>`;
 }
 function needsHtml(list, showWhere) {
   if (!list.length) return `<h3>麻薯需要你</h3><div class="need-all-clear">${icon('check-c', 16)}没有等你的事，麻薯在自己推进</div>`;
+  const fresh = list.filter((r) => !r.stale_reason && !r.superseded_by && r.status !== 'superseded');
+  const stale = list.filter((r) => r.stale_reason || r.superseded_by || r.status === 'superseded');
   const groups = {};
-  for (const r of list) (groups[needCat(r)] = groups[needCat(r)] || []).push(r);
+  for (const r of fresh) (groups[needCat(r)] = groups[needCat(r)] || []).push(r);
   const counts = NEED_CATS.filter(([k]) => groups[k]).map(([k, t]) => `<span class="need-count c-${k}">${t} <b>${groups[k].length}</b></span>`).join('');
-  return `<h3>麻薯需要你 <span class="h3-sub">${list.length} 件</span></h3><div class="need-counts">${counts}</div>
+  const staleBox = stale.length ? `<details class="need-stale-fold" data-dkey="need-stale" ${detailsOpen('need-stale')}><summary>已过时 / 被取代 ${stale.length} 件（默认折叠）</summary>${stale.map((r) => needRow(r, showWhere)).join('')}</details>` : '';
+  if (!fresh.length) return `<h3>麻薯需要你</h3><div class="need-all-clear">${icon('check-c', 16)}没有活跃待处理事项</div>${staleBox}`;
+  return `<h3>麻薯需要你 <span class="h3-sub">${fresh.length} 件</span></h3><div class="need-counts">${counts}</div>
     ${NEED_CATS.filter(([k]) => groups[k]).map(([k, t, ic]) => `<div class="need-group c-${k}"><div class="need-h">${icon(ic, 13)}${t}</div>
       ${groups[k].map((r) => needRow(r, showWhere)).join('')}</div>`).join('')}
-    ${list.length > 1 ? `<button class="btn small" data-next="0">逐件处理${icon('arrow-d', 13)}</button>` : ''}`;
+    ${fresh.length > 1 ? `<button class="btn small" data-next="0">逐件处理${icon('arrow-d', 13)}</button>` : ''}${staleBox}`;
 }
 
 // 主脑 / 子脑本次会话的往来（右侧小列表）：只列当前会话开机以来收到、发出的，按时间倒序，不看历史（历史去「邮箱」）

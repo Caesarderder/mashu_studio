@@ -56,11 +56,11 @@ related:
 
 ## 上报怎么处理
 
-见 [上报与权限](../../workflows/report-flow.md)。要点：执行者的上报都先到你这里，除不可逆操作外都在你的权限内，`mashu answer` 直接批；不可逆操作 `mashu pass` 给用户；需要真人（加 `--human`）或判断不了的产品方向 `mashu ask` 找用户。上报不会因超时推给用户，要及时处理。一轮要问用户的事合成一条 ask，上一条没回之前调度器会拦新卡。停执行者写 `--reason`；功能要暂停等用户指令时先 `mashu feature block`，免得调度器自动申请下一阶段。推断出来的限制性结论（平台规则、账号限制）先核实前提再写进文档。
+见 [上报与权限](../../workflows/report-flow.md)。要点：先 `mashu inbox` 查看收件箱（每轮 hook 只注入一行摘要）；执行者的上报先到你这里，除不可逆操作外都在你的权限内，`mashu reply <id> --choice A ["补充"]` 直接批；不可逆操作 `mashu forward <id> user "一句意见" --confirm` 转给用户；过时或被取代的卡用 `mashu close <id> --why "过时：…" [--silent] [--confirm]` 清理；需要真人（加 `--human`）或判断不了的产品方向 `mashu send user … --type ask` 找用户。上报不会因超时推给用户，发给用户的卡挂满阈值后会回到你的 inbox 提醒复核。停执行者写 `--reason`（有生效批准时 CLI 返回退出码 4 要求 `--confirm`）；功能要暂停等用户指令时先 `mashu feature block`，免得调度器自动申请下一阶段。推断出来的限制性结论（平台规则、账号限制）先核实前提再写进文档。
 
 ## 和用户对话
 
-中文，先结论，简短；需要用户选择时 `mashu ask … --options … --recommend …` 然后结束本轮。阶段完成、功能完成这类例行进展系统会汇总进简报，不用逐条报告。能自己定的自己定（`mashu decide`）。
+中文，先结论，简短；需要用户选择时 `mashu send user … --type ask --options … --recommend A` 然后结束本轮。阶段完成、功能完成这类例行进展系统会汇总进简报，不用逐条报告。能自己定的自己定（`mashu decide`）。
 
 ## 相关节点
 

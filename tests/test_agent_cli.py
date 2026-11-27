@@ -305,5 +305,85 @@ class AgentCliStage2Tests(Base):
             self.assertEqual(j['api_version'], 1)
 
 
+class AgentCliStage3Tests(Base):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo('builda')
+        self.film, _ = studio.greenlight(self.conn, self.repo, 'builda', 'Builda')
+
+    def test_ac8_prompts_trimmed_and_placeholders_preserved(self):
+        """AC8：四份提示词模板总字数较改造前（9887 字）减少 ≥ 30%，且全部占位符完整保留。"""
+        root = Path(__file__).resolve().parent.parent / 'mashu' / 'prompts'
+        required_vars = {
+            'crew.md': ['{{name}}', '{{label}}', '{{seq}}', '{{film}}', '{{set_dir}}', '{{seq_dir}}',
+                        '{{entry}}', '{{docs}}', '{{manual}}', '{{kmap}}', '{{handoff}}'],
+            'direct.md': [],
+            'producer.md': ['{{title}}', '{{film}}', '{{film_path}}', '{{entry}}', '{{docs}}',
+                            '{{manual}}', '{{kdir}}', '{{kmap}}', '{{memory}}', '{{handoff}}'],
+            'assistant.md': ['{{home}}', '{{memory_index}}', '{{manual}}', '{{kmap}}', '{{handoff}}'],
+        }
+        total = 0
+        for name, placeholders in required_vars.items():
+            text = (root / name).read_text()
+            total += len(text)
+            for ph in placeholders:
+                self.assertIn(ph, text, f'{name} 缺少占位符 {ph}')
+        self.assertLessEqual(total, int(9887 * 0.7), f'总字数 {total} 未达到减少 ≥30%（≤{int(9887 * 0.7)}）')
+
+    def test_ac9_server_report_view_and_state_additive_fields(self):
+        """AC9：server.report_view 与 /api/state inbox 只增 msg_type、superseded_by、stale_reason。"""
+        import server
+        f, key, crew = studio.pitch(self.conn, 'builda', 'web-card', '测试网页卡片字段', playbook='direct')
+        r1 = studio.create_report(self.conn, 'ask', crew, 'builda', key, '第一版请示', options=['A', 'B'],
+                                  holder='executive', msg_type='ask')
+        r2 = studio.create_report(self.conn, 'ask', crew, 'builda', key, '第二版请示', options=['A', 'B'],
+                                  holder='executive', msg_type='ask', supersedes=r1['id'])
+        v1 = server.report_view(self.conn, studio.report(self.conn, r1['id']))
+        self.assertEqual(v1['msg_type'], 'ask')
+        self.assertEqual(v1['superseded_by'], r2['id'])
+        self.assertIn(f'#{r2["id"]}', v1['stale_reason'])
+        # 归档后 r2 标已过时
+        studio.web_seq_action(self.conn, self.film, key, 'archive', {})
+        v2 = server.report_view(self.conn, studio.report(self.conn, r2['id']))
+        self.assertEqual(v2['msg_type'], 'ask')
+        self.assertIn('已归档', v2['stale_reason'])
+        # 覆盖 meta 已经是字典时再调 report_superseded_by / evaluate_stale 不报错（原 /api/mail 500 回归）
+        v1_again = dict(v1)
+        self.assertIsInstance(v1_again['meta'], dict)
+        self.assertEqual(studio.report_superseded_by(self.conn, v1_again), r2['id'])
+        self.assertIn(f'#{r2["id"]}', studio.evaluate_stale(self.conn, v1_again))
+        # 对已解析的 dict 再次经过 report_meta 兼容
+        self.assertEqual(studio.report_meta(v1_again)['superseded_by'], r2['id'])
+
+    def test_reopened_done_feature_card_not_marked_stale(self):
+        """返工重开场景（如 #15 截图请示 #391）：功能 state 仍为已完成但有运行中执行者，或卡在完工后发出，不标过时。"""
+        f, key, crew = studio.pitch(self.conn, 'builda', 'rework-card', '返工截图确认', playbook='direct')
+        # 1) 阶段标为已完成，但执行者仍在运行（返工中）
+        data = studio.seq_state(f, key)
+        data['stages'][0]['status'] = '已完成'
+        data['stages'][0]['updated_at'] = studio.now_iso()
+        studio.save_state(f, key, data)
+        self.conn.execute('UPDATE cameras SET state="running", pane="%1" WHERE id=?', (crew['id'],))
+        self.conn.commit()
+        r_active = studio.create_report(self.conn, 'ask', crew, 'builda', key, '界面改好了，请看截图',
+                                        options=['确认', '还要改'], holder='executive', msg_type='ask')
+        # 即使 DB 之前被误标过，triage_reports 也会清掉
+        self.conn.execute('UPDATE reports SET stale_reason="所属功能已完成" WHERE id=?', (r_active['id'],))
+        self.conn.commit()
+        studio.triage_reports(self.conn, notify_remind=False)
+        self.assertFalse(studio.report(self.conn, r_active['id'])['stale_reason'])
+
+        # 2) 执行者退出后：如果是完工后发出的卡，仍不标过时
+        studio.end_camera(self.conn, crew['id'], 'wrap', 'done')
+        self.conn.execute('UPDATE reports SET created_at=? WHERE id=?', (time.time() + 60, r_active['id']))
+        self.conn.commit()
+        self.assertEqual(studio.evaluate_stale(self.conn, studio.report(self.conn, r_active['id'])), '')
+
+        # 3) 只有无活跃执行者且卡在完工之前遗留的旧卡，才标「所属功能已完成」
+        self.conn.execute('UPDATE reports SET created_at=? WHERE id=?', (time.time() - 3600, r_active['id']))
+        self.conn.commit()
+        self.assertEqual(studio.evaluate_stale(self.conn, studio.report(self.conn, r_active['id'])), '所属功能已完成')
+
+
 if __name__ == '__main__':
     unittest.main()

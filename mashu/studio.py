@@ -3320,9 +3320,36 @@ def infer_msg_type(r):
     return 'fyi'
 
 
+def report_meta(r):
+    """兼容原始 DB row（meta 为 JSON 字符串）和 server.report_view 已解析的 dict。"""
+    m = (r or {}).get('meta')
+    if isinstance(m, dict):
+        return m
+    if not m:
+        return {}
+    try:
+        val = json.loads(m)
+        return val if isinstance(val, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def report_options(r):
+    """兼容原始 DB row（options 为 JSON 字符串）和 server.report_view 已解析的 list。"""
+    o = (r or {}).get('options')
+    if isinstance(o, list):
+        return o
+    if not o:
+        return []
+    try:
+        val = json.loads(o)
+        return val if isinstance(val, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
 def report_superseded_by(conn, r):
-    m = r.get('meta') or '{}'
-    m = m if isinstance(m, dict) else json.loads(m)
+    m = report_meta(r)
     if m.get('superseded_by'):
         return m['superseded_by']
     row = one(conn, 'SELECT id FROM reports WHERE supersedes=? ORDER BY id DESC LIMIT 1', r['id'])
@@ -3331,7 +3358,7 @@ def report_superseded_by(conn, r):
 
 def resolve_choice(r, choice, extra_text=''):
     """把 --choice A/B/1/2 或选项文本精确映射为卡上的完整选项，彻底避免多写一字导致审批判定失败。"""
-    opts = json.loads(r.get('options') or '[]')
+    opts = report_options(r)
     if choice is None or choice == '':
         return extra_text, ''
     if not opts:
@@ -3381,7 +3408,7 @@ def supersede_report(conn, old_id, new_id, by_role, by_label):
     if not old or old['status'] != 'open' or old['id'] == new_id:
         return False
     reason = f'已被 #{new_id} 取代'
-    m = json.loads(old.get('meta') or '{}')
+    m = dict(report_meta(old))
     m['superseded_by'] = new_id
     conn.execute('UPDATE reports SET status="superseded", answer=?, answered_by=?, closed_at=?, stale_reason=?, meta=? WHERE id=?',
                  (reason, by_role or 'system', time.time(), reason, json.dumps(m, ensure_ascii=False), old_id))
@@ -3391,8 +3418,22 @@ def supersede_report(conn, old_id, new_id, by_role, by_label):
     return True
 
 
+def _seq_done_timestamp(data):
+    """从已完成功能的 stages[].updated_at 提取最后完工时间；解析不出则返回 None（宁可不标过时）。"""
+    ts_list = []
+    for st in (data or {}).get('stages') or []:
+        raw = st.get('updated_at')
+        if not raw:
+            continue
+        try:
+            ts_list.append(datetime.datetime.fromisoformat(raw).timestamp())
+        except (TypeError, ValueError):
+            continue
+    return max(ts_list) if ts_list else None
+
+
 def evaluate_stale(conn, r):
-    """判断上报是否已过时或被取代；返回中文原因或空串。"""
+    """判断上报是否已过时或被取代；返回中文原因或空串。判断不准时宁可返回空串，避免误杀有效卡。"""
     if r.get('status') == 'superseded':
         sb = report_superseded_by(conn, r)
         return r.get('stale_reason') or (f'已被 #{sb} 取代' if sb else '已被取代')
@@ -3414,8 +3455,15 @@ def evaluate_stale(conn, r):
         if r.get('gate') and r.get('gate') != 'kickoff' and has_approval(conn, f['id'], r['seq_key'], r['gate']):
             return '同类批准已生效'
         if seq_done(data) and infer_msg_type(r) in ('ask', 'approve', 'blocked'):
-            return '所属功能已完成'
-    return r.get('stale_reason') or ''
+            # 返工 / 仍在运行的执行者 / 完工之后新发出的请示都是有效卡，绝不能标过时
+            crew = active_crew(conn, f['id'], r['seq_key'])
+            if crew:
+                return ''
+            created = r.get('created_at') or 0
+            done_ts = _seq_done_timestamp(data)
+            if done_ts and created and created < done_ts:
+                return '所属功能已完成'
+    return ''
 
 
 def triage_reports(conn, notify_remind=True):
@@ -3432,7 +3480,7 @@ def triage_reports(conn, notify_remind=True):
         if notify_remind and r['holder'] == 'executive' and infer_msg_type(r) in ('ask', 'approve'):
             since = r['holder_since'] or r['created_at'] or now
             if now - since >= remind_sec:
-                m = json.loads(r.get('meta') or '{}')
+                m = dict(report_meta(r))
                 if not m.get('reminded_at'):
                     m['reminded_at'] = now
                     conn.execute('UPDATE reports SET meta=? WHERE id=?', (json.dumps(m, ensure_ascii=False), r['id']))
@@ -4167,8 +4215,8 @@ def _format_inbox_report(conn, r, role, reminded=False, auto_closed=False):
     mt = infer_msg_type(r)
     sr = evaluate_stale(conn, r)
     sb = report_superseded_by(conn, r)
-    opts = json.loads(r.get('options') or '[]')
-    m = json.loads(r.get('meta') or '{}')
+    opts = report_options(r)
+    m = report_meta(r)
     where, who = report_origin(conn, r)
     if r['status'] != 'open':
         suggested = ''
@@ -4205,7 +4253,7 @@ def collect_inbox(conn, cam, include_all=False, mark_fyi_read=False):
     now = time.time()
 
     def _is_reminded(r):
-        m = json.loads(r.get('meta') or '{}')
+        m = report_meta(r)
         if m.get('reminded_at'):
             return True
         return (r['holder'] == 'executive' and infer_msg_type(r) in ('ask', 'approve')
