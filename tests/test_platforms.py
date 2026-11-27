@@ -293,6 +293,37 @@ class TestCodexHooks(PlatBase):
         self.hookf('hook-stop', '--codex', crew, dict(session_id=sid, last_assistant_message='又一遍'))
         self.assertEqual(studio.one(self.conn, 'SELECT COUNT(*) n FROM messages')['n'], n)
 
+    def test_nested_cli_hooks_ignored(self):
+        """执行者在会话里再起 agy / codex exec 做实测：子会话继承 MASHU_SESSION，它的 hook 不能冒充执行者回复、改会话 ID。"""
+        key, crew = self.crew()
+        studio.meta_set(self.conn, f'camprov:{crew["id"]}', 'codex')
+        sid = '01a20c6f-9513-7a02-820d-00cef462b4e0'
+        studio.note_session(self.conn, crew, 'codex', sid)
+        self.conn.execute('UPDATE cameras SET state="running", last_active=? WHERE id=?', (time.time(), crew['id']))
+        self.conn.commit()
+        crew = studio.camera(self.conn, crew['id'])
+        # 平台不一致：codex 机位收到 agy 的 hook
+        self.hookf('hook-stop', '--agy', crew, dict(conversationId='22a6acb7-c3bc-4c8d-8256-07969daf1036'))
+        # 同平台嵌套：进程链上两层 CLI
+        saved = studio.agent_depth
+        studio.agent_depth = lambda: 2
+        try:
+            self.hookf('hook-stop', '--codex', crew, dict(session_id='child-sid', last_assistant_message='- caesar-docs: 子会话的回答'))
+            self.hookf('hook-session', '--codex', crew, dict(session_id='child-sid', source='startup'))
+        finally:
+            studio.agent_depth = saved
+        crew = studio.camera(self.conn, crew['id'])
+        self.assertEqual(crew['claude_sid'], sid)
+        self.assertEqual(crew['state'], 'running')
+        self.assertIsNone(studio.one(self.conn, 'SELECT * FROM messages WHERE kind="reply" AND channel=?', f'builda/{key}'))
+        # 执行者自己的 hook 照常
+        studio.agent_depth = lambda: 1
+        try:
+            self.hookf('hook-stop', '--codex', crew, dict(session_id=sid, last_assistant_message='做完了'))
+        finally:
+            studio.agent_depth = saved
+        self.assertEqual(studio.one(self.conn, 'SELECT text FROM messages WHERE kind="reply" AND channel=?', f'builda/{key}')['text'], '做完了')
+
     def test_launch_codex_isolated_home(self):
         before = tree_hash(self.user_codex)
         f, key, cam = studio.pitch(self.conn, 'builda', 'cx', '需求 cx')

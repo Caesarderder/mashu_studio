@@ -6418,6 +6418,45 @@ def env_camera(conn):
     return camera(conn, int(sid)) if sid and sid.isdigit() else None
 
 
+AGENT_BINS = {'codex', 'agy', 'claude', 'opencode', '.opencode'}
+
+
+def agent_depth():
+    """hook 进程往上数有几层 agent CLI（按进程名）。执行者在会话里再起 codex exec / agy -p 做实测时，
+    子会话继承了 MASHU_SESSION 和麻薯 hooks，它的 hook 上面就有两层 CLI。"""
+    try:
+        out = subprocess.run(['ps', '-A', '-o', 'pid=,ppid=,comm='], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return 0
+    parent, name = {}, {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            parent[int(parts[0])] = int(parts[1])
+            name[int(parts[0])] = os.path.basename(parts[2].strip())
+    n, pid, seen = 0, os.getppid(), set()
+    while pid > 1 and pid in parent and pid not in seen:
+        seen.add(pid)
+        n += name.get(pid) in AGENT_BINS
+        pid = parent[pid]
+    return n
+
+
+def hook_camera(conn, fmt):
+    """hooks 用的机位：MASHU_SESSION 指的机位，但排除嵌套子会话——平台和机位启动时记的不一致（codex 会话里跑 agy），
+    或进程链上有两层以上 agent CLI（codex 会话里跑 codex exec）。否则子会话的回复会被当成执行者的回复发出去、
+    还会把机位的会话 ID 改成子会话的（mashu #13 实测时发生过）。"""
+    c = env_camera(conn)
+    if not c:
+        return None
+    want = 'gemini' if fmt == 'agy' else fmt
+    prov = meta_get(conn, f'camprov:{c["id"]}')
+    if (prov and prov != want) or agent_depth() >= 2:
+        log_event(conn, 'nested-hook', c, level='info', fmt=fmt, camprov=prov or '')
+        return None
+    return c
+
+
 def read_payload():
     try:
         return json.load(sys.stdin)
@@ -6505,7 +6544,7 @@ def agy_tool_payload(payload):
 def cmd_hook_prompt(args):
     payload = read_payload()
     conn = db()
-    c = env_camera(conn)
+    c = hook_camera(conn, hook_fmt(args))
     if not c:
         return
     if getattr(args, 'agy', False):          # agy 的 PreInvocation：每次调模型前都来，invocationNum=0 才是用户新发的一轮
@@ -6580,7 +6619,7 @@ def cmd_hook_stop(args):
 
 def _hook_stop(payload, agy, fmt='claude'):
     conn = db()
-    c = env_camera(conn)
+    c = hook_camera(conn, 'agy' if agy else fmt)
     if not c:
         return
     if fmt in ('codex', 'opencode'):
@@ -6648,7 +6687,7 @@ def cmd_hook_notify(args):
     payload = read_payload()
     msg = payload.get('message') or ''
     conn = db()
-    c = env_camera(conn)
+    c = hook_camera(conn, hook_fmt(args))
     if c and re.search(r'permission|权限|approve', msg, re.I):
         notice(conn, channel_of(c), f'「{c["name"]}」在等权限确认：{msg}（到 tmux {session_name()} 的 {window_name(c)} 窗口处理）')
         if c['role'] != 'assistant':
@@ -6785,7 +6824,7 @@ def codex_tool_calls(payload):
 def opencode_tool_calls(payload):
     """麻薯 OpenCode 插件转来的 tool.execute.before（tool + args）→ 麻薯内部的 [(工具名, 参数)]。"""
     conn = db()
-    c = env_camera(conn)
+    c = env_camera(conn)       # 安全拦截对嵌套子会话照样生效，不用 hook_camera
     f = film(conn, c['film_id']) if c and c['film_id'] else None
     mcp = ((f or {}).get('safety') or {}).get('mcp_tools') or []
     return plat.opencode_tool(payload.get('tool'), payload.get('args'), hook_cwd(payload), mcp)
@@ -6803,7 +6842,7 @@ def record_docs_usage(conn, c, f, tool, ti):
 
 def _pretool(tool, ti):
     conn = db()
-    c = env_camera(conn)
+    c = env_camera(conn)       # 安全拦截对嵌套子会话照样生效，不用 hook_camera
     if not c:
         return
     f = film(conn, c['film_id']) if c['film_id'] else None
@@ -6903,7 +6942,7 @@ def session_context(conn, c):
 def cmd_hook_session(args):
     payload = read_payload()
     conn = db()
-    c = env_camera(conn)
+    c = hook_camera(conn, hook_fmt(args))
     if not c:
         return
     if not getattr(args, 'agy', False):
