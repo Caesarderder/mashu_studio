@@ -8,14 +8,16 @@
 
 | 功能 | 执行者 | 交付 / 状态 | 方案 |
 | --- | --- | --- | --- |
-| #11 并行调度 + 法典 + 协作板 + 点对点 | 原来你什么都不要 | 已提交 6e00cb8，回归通过，用户已确认界面；服务 04:05 已重启，已生效 | `.mashu/plans/parallel-codex.md` |
-| #12 semrush | 我怀念的 | 网页开的会话，目标待子脑确认；目前只声明了 `.mashu/features/12-semrush/**` | 无 |
+| #13 caesar-docs 治理 | 很好 | 进行中（#279 用户批准开工） | `.mashu/plans/docs-governance.md`，依据 `.mashu/drafts/caesar-docs-audit-2026-11-27.md` |
+| #11 并行调度 + 法典 + 协作板 + 点对点 | — | 已完成（6e00cb8），服务 04:05 重启后已生效 | `.mashu/plans/parallel-codex.md` |
+| #12 semrush | — | 已归档 | 无 |
 
 **验收**：每个功能的 AC 写在方案里；改 Python 的功能完成后，由用户点「重启服务」，子脑用 curl 核对接口后才算上线。
 
 **待决**：
 - `mashu/studio.py` 工作区有一处未提交改动（`BROWSER_PROMPT` 加了「不要起无头 Chrome」一条），归属待确认。**不是你写的就不要暂存或提交它**。
-- #12 要改代码前，先 `mashu claim` 声明范围并 `mashu sync` 一句说明要动哪些函数。
+- #13 在 studio.py 改 `skill_host`、`claude_cmd`/`agy_cmd`/`opencode_cmd`、check 流程、handoff/finish；别的功能要碰这些函数先 `mashu peer` #13。
+- #13 只读 caesar 各仓库文档；caesar 工程副本同步要等 caesar #7 docs-hardening 结单或先和它确认。
 
 ## 模块分工与接口
 
@@ -35,7 +37,7 @@
 ### 接口约定
 - 新的 CLI 子命令、hook 注入段、`/api/*` 接口：在下面「接口变更记录」写一行（调用方、参数、返回、验证命令）。
 - 改了数据库表结构或 `state/studio.json` 格式，要写迁移，并在 sync 里说明。
-- `collaboration_context` / `project_codex` / `parallel_roster` 由 #11 定义，别的功能要改先 `mashu peer` #11（#11 结单后归子脑）。
+- `collaboration_context` / `project_codex` / `parallel_roster` 由 #11 定义，别的功能要改先 `mashu peer` #11（#11 已结单，现归子脑）。
 
 ## 共享文件
 
