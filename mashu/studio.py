@@ -3263,6 +3263,36 @@ def close_report(conn, rid, answer, by, status='answered'):
     conn.commit()
 
 
+_PUNCT = re.compile(r'[\s，。,.！!？?：:；;、"“”「」『』（）()+＋/／·-]+')
+
+
+def user_chat(conn, channel, text, target):
+    """用户在对话里直接发话（网页输入框）。这个对话里如果有等用户回的卡（执行者 / 子脑在这个对话发起、现在在用户手上）：
+    - 话正好是卡上某个选项（忽略空格标点）→ 当成点了这个选项，走正常批复（闸门、开工审批也照常生效）；
+    - 否则这个对话里只有一张普通请示（不是闸门、不是阶段确认）→ 这句话就是回答：卡收起，话照常送给对方。
+    其余情况只发话，卡留着。返回消息 id。"""
+    film_id, seq = split_channel(channel)
+    if seq:
+        seq = find_seq(conn, require_film(conn, film_id), seq)['key']
+    role = 'crew' if seq else 'producer'
+    opens = [r for r in open_reports(conn, 'executive') if r['film_id'] == film_id and (r['seq_key'] or None) == (seq or None)
+             and r['source_role'] == role and not json.loads(r['meta'] or '{}').get('external')]
+    key = _PUNCT.sub('', text)
+    hits = [(r, o) for r in opens for o in json.loads(r['options'] or '[]') if key and _PUNCT.sub('', o) == key]
+    if len(hits) == 1:
+        r, opt = hits[0]
+        answer_report(conn, r['id'], None, opt)
+        return one(conn, 'SELECT MAX(id) n FROM messages')['n']
+    mid = post(conn, 'executive', channel, 'chat', text, target=target)
+    plain = [r for r in opens if r['kind'] == 'ask' and not r['gate']]
+    if len(plain) == 1:
+        r = plain[0]
+        close_report(conn, r['id'], text, 'executive')
+        add_route(conn, r['id'], action='answer', who='用户', level='executive', note=f'在对话里直接回复：{text[:200]}')
+        notice(conn, channel, f'#{r["id"]} 用户已在对话里回复，卡片已收起')
+    return mid
+
+
 def is_approval(r, text):
     opts = json.loads(r['options'] or '[]')
     return bool(opts) and text.strip() == opts[0]

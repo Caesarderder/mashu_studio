@@ -316,6 +316,27 @@ class TestStudio(Base):
         self.assertEqual((st['used'], st['max']), (2, 1))
         self.assertEqual([x['label'] for x in st['by_account']], ['Claude', 'Codex cx-9'])
 
+    def test_user_chat_answers_open_card(self):
+        """用户不点卡片、直接在功能对话里回：话是某个选项就当点了它；否则唯一的普通请示收起；闸门卡不会被随口一句话批掉。"""
+        key, crew = self.pitch('chat-answer')
+        self.tick()
+        crew = self.cam(crew['id'])
+        ch = f'builda/{key}'
+        mk = lambda **kw: studio.create_report(self.conn, 'ask', crew, 'builda', key, '选哪个？', holder='executive', **kw)
+        r1 = mk(options=['异星荒漠+生物机械遗迹', '冷色废墟'])
+        studio.user_chat(self.conn, ch, '异星荒漠 + 生物机械遗迹。', f'crew:builda/{key}')
+        r1 = studio.report(self.conn, r1['id'])
+        self.assertEqual((r1['status'], r1['answer']), ('answered', '异星荒漠+生物机械遗迹'))
+        r2 = mk(options=['A', 'B'])
+        studio.user_chat(self.conn, ch, '都不要，换个思路', f'crew:builda/{key}')
+        r2 = studio.report(self.conn, r2['id'])
+        self.assertEqual((r2['status'], r2['answer']), ('answered', '都不要，换个思路'))
+        g = studio.create_report(self.conn, 'gate', crew, 'builda', key, '要推送', options=['批准', '不批准'], gate='irreversible', holder='executive')
+        studio.user_chat(self.conn, ch, '等等再说', f'crew:builda/{key}')
+        self.assertEqual(studio.report(self.conn, g['id'])['status'], 'open')
+        studio.user_chat(self.conn, ch, '批准', f'crew:builda/{key}')
+        self.assertEqual(studio.report(self.conn, g['id'])['status'], 'answered')
+
     def test_report_chain_up_to_executive_and_answer_back(self):
         key, crew = self.pitch('export-csv')
         self.tick()

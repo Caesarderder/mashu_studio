@@ -425,7 +425,9 @@ class Handler(BaseHTTPRequestHandler):
                 film_id, seq = studio.split_channel(channel)
                 f = studio.require_film(conn, film_id)
                 target = f'crew:{f["id"]}/{studio.find_seq(conn, f, seq)["key"]}' if seq else f'producer:{f["id"]}'
-            return {'id': studio.post(conn, 'executive', channel, 'chat', text, target=target)}
+            if channel == 'assistant':
+                return {'id': studio.post(conn, 'executive', channel, 'chat', text, target=target)}
+            return {'id': studio.user_chat(conn, channel, text, target)}
         if path == '/api/mute':        # 静默：不处理这件上报，维持现状
             r = studio.mute_report(conn, int(data['report_id']))
             return {'ok': True, 'status': r['status']}
