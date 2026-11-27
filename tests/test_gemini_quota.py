@@ -275,6 +275,18 @@ class TestStudioGeminiQuota(PlatBase):
         lim_unk = studio.collect_limits()['gemini']
         self.assertEqual(lim_unk['source'], 'api_placeholder')
 
+        # status_data 增 today_usage（含主脑 + 各项目今日 token 与费用汇总）
+        today = studio.today()
+        self.conn.execute(
+            'INSERT INTO usage(day, film_id, camera_id, tokens_in, tokens_out, cache_read, cache_write, cost) '
+            'VALUES(?, NULL, 1, 1000, 500, 0, 0, 0.05), (?, "builda", 2, 2000, 1000, 500, 0, 0.15)',
+            (today, today),
+        )
+        self.conn.commit()
+        st = studio.status_data(self.conn)
+        self.assertEqual(st['today_usage']['tokens'], 5000)
+        self.assertAlmostEqual(st['today_usage']['cost'], 0.2, places=4)
+
 
 if __name__ == '__main__':
     unittest.main()

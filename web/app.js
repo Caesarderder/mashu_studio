@@ -626,103 +626,364 @@ function acctBadge(data) {
   const list = (data && data.accounts) || [];
   return list.length > 1 ? `<i class="q-n" title="${esc(acctTip(data))}">${list.length}号</i>` : '';
 }
-function renderRateLimitRow(name, data) {
-  if (!data) return '';
-  if (data.billing === 'usage') return `<div class="q-plat-row"><span class="q-plat-name">${name}${acctBadge(data)}</span><span class="q-plat-vals">按量</span></div>`;
-  if (data.installed === false) {
-    return `<div class="q-plat-row q-dim" title="${name} 未安装"><span class="q-plat-name">${name}</span><span class="q-plat-vals">未安装</span></div>`;
+// ---------- 左下角可视化用量面板（#18：紧凑卡 + 进度条 + 浮层详情，高度 ≤220px 自动折叠）----------
+let quotaPopProv = null;
+function quotaRemTone(remPct) {
+  if (remPct == null) return '';
+  if (remPct < 15) return 'hi';
+  if (remPct <= 30) return 'mid';
+  return 'ok';
+}
+function quotaAgeShort(at) {
+  if (!at) return '';
+  const mins = Math.max(0, Math.round((Date.now() / 1000 - at) / 60));
+  if (mins < 1) return '刚刚';
+  if (mins < 60) return `${mins}分前`;
+  if (mins < 1440) return `${Math.floor(mins / 60)}h前`;
+  return `${Math.floor(mins / 1440)}天前`;
+}
+function quotaAgeLong(at) {
+  if (!at) return '';
+  const mins = Math.max(0, Math.round((Date.now() / 1000 - at) / 60));
+  if (mins < 1) return '刚刚';
+  if (mins < 60) return `${mins} 分钟前`;
+  if (mins < 1440) return `${Math.floor(mins / 60)} 小时前`;
+  return `${Math.floor(mins / 1440)} 天前`;
+}
+function slotsForProv(prov) {
+  const max = Number((state.stages && state.stages.max) || 5);
+  const by = (state.stages && state.stages.by_account) || [];
+  let used = 0;
+  const perAcct = {};
+  for (const x of by) {
+    const k = String(x.key || '');
+    if (k === prov || k.startsWith(`${prov}:`)) {
+      const n = Number(x.used || 0);
+      used += n;
+      const aid = k.includes(':') ? k.split(':')[1] : '';
+      if (aid) perAcct[aid] = n;
+    }
+  }
+  return { used, max, perAcct };
+}
+function slotCellsHtml(used, max, tip = '') {
+  const cap = Math.max(1, Math.min(8, Number(max || 5)));
+  const fill = Math.max(0, Math.min(cap, Number(used || 0)));
+  let cells = '';
+  for (let i = 0; i < cap; i++) cells += `<i class="${i < fill ? 'on' : ''}"></i>`;
+  return `<span class="qf-slots" title="${esc(tip || `在跑执行者 ${used}/${max}`)}"><span class="qf-cells">${cells}</span><span class="qf-sc">${used}/${max}</span></span>`;
+}
+function qfBarUsed(lbl, w, titlePrefix) {
+  if (!w || w.used_percentage == null) return `<span class="qf-w dim"><i class="qf-wl">${lbl}</i><span class="qf-na">-</span></span>`;
+  const used = Math.max(0, Math.min(100, Math.round(Number(w.used_percentage))));
+  const rem = 100 - used;
+  const cls = quotaRemTone(rem);
+  const rst = w.resets_at ? resetCompact(w.resets_at) : '';
+  const tip = `${titlePrefix} ${lbl === '5h' ? '5 小时' : '每周'}已用 ${used}%（剩 ${rem}%）${w.resets_at ? `，${resetText(w.resets_at)}` : ''}`;
+  return `<span class="qf-w ${cls}" title="${esc(tip)}"><i class="qf-wl">${lbl}</i><i class="qf-bar"><i style="width:${used}%"></i></i><b>${used}%</b>${rst ? `<i class="qf-rt">${rst}</i>` : ''}</span>`;
+}
+function qfBarRem(lbl, b, titlePrefix) {
+  if (!b || b.remaining == null) return `<span class="qf-w dim"><i class="qf-wl">${lbl}</i><span class="qf-na">-</span></span>`;
+  const rem = Math.max(0, Math.min(100, Math.round(Number(b.remaining) * 100)));
+  const used = 100 - rem;
+  const cls = quotaRemTone(rem);
+  const rst = b.reset ? resetCompact(b.reset) : '';
+  const tip = `${titlePrefix} ${lbl === '5h' ? '5 小时' : '每周'}剩 ${rem}%（已用 ${used}%）${b.reset ? `，${resetText(b.reset)}` : ''}`;
+  return `<span class="qf-w ${cls}" title="${esc(tip)}"><i class="qf-wl">${lbl}</i><i class="qf-bar"><i style="width:${rem}%"></i></i><b>剩${rem}%</b>${rst ? `<i class="qf-rt">${rst}</i>` : ''}</span>`;
+}
+function qfBarCost(lbl, amount, refMax, tip) {
+  const v = Number(amount || 0);
+  const pct = v > 0 ? Math.max(6, Math.min(100, Math.round((v / Math.max(refMax, v)) * 100))) : 0;
+  return `<span class="qf-w cost" title="${esc(tip)}"><i class="qf-wl">${lbl}</i><i class="qf-bar"><i style="width:${pct}%"></i></i><b>$${v.toFixed(2)}</b></span>`;
+}
+function shortAcctLabel(a) {
+  const s = (a.label || a.email || a.id || '').replace(/@.*$/, '');
+  return s.length > 7 ? `${s.slice(0, 6)}…` : s;
+}
+function shortGroupLabel(g) {
+  const s = g.label || g.name || '';
+  if (/gemini/i.test(s)) return 'Gem';
+  if (/claude|gpt/i.test(s)) return 'C/G';
+  return s.length > 5 ? s.slice(0, 5) : s;
+}
+function qfCard(prov, name, slots, ageTxt, ageTip, bodyHtml, miniHtml, cardTip, extraHead = '', dim = false) {
+  return `<div class="qf-card${dim ? ' q-dim' : ''}" data-quota-pop="${prov}" title="${esc(cardTip)}" role="button" tabindex="0">
+    <div class="qf-h">
+      <span class="qf-name">${esc(name)}${extraHead}</span>
+      ${slots}
+      ${ageTxt ? `<span class="qf-age" title="${esc(ageTip || `更新于 ${ageTxt}`)}">${esc(ageTxt)}</span>` : ''}
+    </div>
+    <div class="qf-b">${bodyHtml}</div>
+    <div class="qf-mini">${miniHtml}</div>
+  </div>`;
+}
+function renderClaudeCard(data) {
+  const sl = slotsForProv('claude');
+  const slots = slotCellsHtml(sl.used, sl.max, `Claude 在跑执行者 ${sl.used}/${sl.max}`);
+  if (!data || data.installed === false) {
+    const msg = data && data.installed === false ? '未安装' : '等会话的状态栏报上来';
+    return qfCard('claude', 'Claude', slots, '', '', `<div class="qf-empty">${msg}</div>`, `<span class="qf-empty">${msg}</span>`, `Claude：${msg}`, '', data && data.installed === false);
   }
   const f5 = data.five_hour, fw = data.seven_day;
+  const has = (f5 && f5.used_percentage != null) || (fw && fw.used_percentage != null);
+  if (!has) {
+    return qfCard('claude', 'Claude', slots, '', '', '<div class="qf-empty">等会话的状态栏报上来</div>', '<span class="qf-empty">等状态栏</span>', 'Claude：等受管会话的状态栏报上来（点开看详情）');
+  }
   const p5 = f5 && f5.used_percentage != null ? Math.round(Number(f5.used_percentage)) : null;
   const pw = fw && fw.used_percentage != null ? Math.round(Number(fw.used_percentage)) : null;
-  if (p5 == null && pw == null) {
-    return `<div class="q-plat-row" title="${name} 等待会话报上额度"><span class="q-plat-name">${name}</span><span class="q-plat-vals q-dim">等会话报上来</span></div>`;
-  }
-  const item = (label, p, r) => {
-    if (p == null) return '';
-    const cls = p >= 90 ? 'hi' : p >= 70 ? 'mid' : '';
-    const rTxt = r ? `<i class="q-rst">·${resetCompact(r)}</i>` : '';
-    const tDesc = r ? `，${resetText(r)}` : '';
-    return `<span class="q-item ${cls}" title="${name} ${label}额度已用 ${p}%${tDesc}">${label} <b>${p}%</b>${rTxt}</span>`;
-  };
-  return `<div class="q-plat-row" ${data.accounts ? `title="${esc(acctTip(data))}"` : ''}>
-    <span class="q-plat-name">${name}${acctBadge(data)}</span>
-    <span class="q-plat-vals">
-      ${item('5h', p5, f5 && f5.resets_at)}
-      ${item('周', pw, fw && fw.resets_at)}
-      ${quotaStaleTag(data.at)}
-    </span>
-  </div>`;
+  const worstUsed = Math.max(p5 ?? 0, pw ?? 0);
+  const age = quotaAgeShort(data.at);
+  const tip = [
+    p5 != null ? `5 小时：已用 ${p5}%（剩 ${100 - p5}%）${f5.resets_at ? `，${resetText(f5.resets_at)}` : ''}` : '',
+    pw != null ? `每周：已用 ${pw}%（剩 ${100 - pw}%）${fw.resets_at ? `，${resetText(fw.resets_at)}` : ''}` : '',
+    data.at ? `更新于 ${quotaAgeLong(data.at)}` : '',
+    '点击查看完整详情',
+  ].filter(Boolean).join('\n');
+  const body = `<div class="qf-row">${qfBarUsed('5h', f5, 'Claude')}${qfBarUsed('周', fw, 'Claude')}</div>`;
+  const mini = `<span class="qf-w ${quotaRemTone(100 - worstUsed)}"><i class="qf-bar"><i style="width:${worstUsed}%"></i></i><b>${p5 != null ? `5h ${p5}%` : ''}${p5 != null && pw != null ? ' · ' : ''}${pw != null ? `周 ${pw}%` : ''}</b></span>`;
+  return qfCard('claude', 'Claude', slots, age, data.at ? `更新于 ${quotaAgeLong(data.at)}` : '', body, mini, tip);
 }
-function renderOpenCodeRow(data) {
-  if (!data) return '';
-  if (data.installed === false) {
-    return `<div class="q-plat-row q-dim" title="OpenCode 未安装"><span class="q-plat-name">OpenCode</span><span class="q-plat-vals">未安装</span></div>`;
+function renderCodexCard(data) {
+  const sl = slotsForProv('codex');
+  const cxAccts = cliAccts('codex');
+  const accList = cxAccts.length ? cxAccts : ((data && data.accounts) || []);
+  const multi = accList.length > 1;
+  const slTip = multi && Object.keys(sl.perAcct).length
+    ? `Codex 在跑执行者共 ${sl.used}（每号≤${sl.max}）：` + accList.map((a) => `${acctName(a)} ${sl.perAcct[a.id] || 0}/${sl.max}`).join('，')
+    : `Codex 在跑执行者 ${sl.used}/${sl.max}`;
+  const slots = slotCellsHtml(sl.used, sl.max, slTip);
+  const badge = multi ? `<i class="q-n">${accList.length}号</i>` : '';
+  if (data && data.installed === false) {
+    return qfCard('codex', 'Codex', slots, '', '', '<div class="qf-empty">未安装</div>', '<span class="qf-empty">未安装</span>', 'Codex 未安装', '', true);
+  }
+  const latestAt = accList.reduce((m, a) => Math.max(m, (a.quota && a.quota.at) || 0), (data && data.at) || 0) || null;
+  const age = quotaAgeShort(latestAt);
+  if (accList.length) {
+    let worstUsed = null;
+    const rows = accList.map((a) => {
+      const q = a.quota || {};
+      const name = shortAcctLabel(a);
+      const aRun = sl.perAcct[a.id] || 0;
+      const lbl = multi ? `<span class="qf-tag" title="${esc(acctName(a))}${aRun ? `（在跑 ${aRun}/${sl.max}）` : ''}">${esc(name)}</span>` : '';
+      if (a.kind === 'api' || q.billing === 'usage') {
+        return `<div class="qf-row">${lbl}<span class="qf-empty">按量计费</span></div>`;
+      }
+      const f5 = q.five_hour, fw = q.seven_day;
+      const has = (f5 && f5.used_percentage != null) || (fw && fw.used_percentage != null);
+      if (!has) return `<div class="qf-row">${lbl}<span class="qf-empty">等会话报上来</span></div>`;
+      const u = Math.max(f5?.used_percentage ?? 0, fw?.used_percentage ?? 0);
+      worstUsed = worstUsed == null ? u : Math.max(worstUsed, u);
+      return `<div class="qf-row">${lbl}${qfBarUsed('5h', f5, acctName(a))}${qfBarUsed('周', fw, acctName(a))}</div>`;
+    });
+    const tip = `${acctTip({ account: data && data.account, accounts: accList })}${latestAt ? `\n更新于 ${quotaAgeLong(latestAt)}` : ''}\n点击查看全部账号详情`;
+    const mini = worstUsed != null
+      ? `<span class="qf-w ${quotaRemTone(100 - worstUsed)}"><i class="qf-bar"><i style="width:${Math.round(worstUsed)}%"></i></i><b>最高 ${Math.round(worstUsed)}%</b></span>`
+      : '<span class="qf-empty">等会话报上来</span>';
+    return qfCard('codex', 'Codex', slots, age, latestAt ? `更新于 ${quotaAgeLong(latestAt)}` : '', rows.join(''), mini, tip, badge);
+  }
+  const f5 = data && data.five_hour, fw = data && data.seven_day;
+  const has = (f5 && f5.used_percentage != null) || (fw && fw.used_percentage != null);
+  if (!has) {
+    return qfCard('codex', 'Codex', slots, '', '', '<div class="qf-empty">等会话报上来</div>', '<span class="qf-empty">等会话报上来</span>', 'Codex：等会话报上额度（点开看详情）');
+  }
+  const worstUsed = Math.max(f5?.used_percentage ?? 0, fw?.used_percentage ?? 0);
+  const body = `<div class="qf-row">${qfBarUsed('5h', f5, 'Codex')}${qfBarUsed('周', fw, 'Codex')}</div>`;
+  const mini = `<span class="qf-w ${quotaRemTone(100 - worstUsed)}"><i class="qf-bar"><i style="width:${Math.round(worstUsed)}%"></i></i><b>${Math.round(worstUsed)}%</b></span>`;
+  return qfCard('codex', 'Codex', slots, age, latestAt ? `更新于 ${quotaAgeLong(latestAt)}` : '', body, mini, `Codex：点击查看详情`);
+}
+function renderGeminiCard(data) {
+  const sl = slotsForProv('gemini');
+  const slots = slotCellsHtml(sl.used, sl.max, `Gemini 在跑执行者 ${sl.used}/${sl.max}`);
+  if (!data || data.installed === false) {
+    return qfCard('gemini', 'Gemini', slots, '', '', '<div class="qf-empty">未安装</div>', '<span class="qf-empty">未安装</span>', 'Gemini (agy) 未安装', '', true);
+  }
+  const gmAcct = cliAccts('gemini')[0];
+  const err = data.error || (gmAcct && gmAcct.error) || '';
+  if (!data.available || !geminiQuotaReal(data)) {
+    const lastAt = data.at || (gmAcct && gmAcct.last_check) || null;
+    const ageStr = lastAt ? quotaAgeLong(lastAt) : '';
+    const reason = data.reason || err || (data.source === 'api_placeholder' ? '未能从 agy /quota 获取真实额度（旧接口仅返回占位值）' : 'agy /quota 暂无额度数据');
+    const txt = `额度未知${ageStr ? ` · ${ageStr}` : ''}`;
+    return qfCard('gemini', 'Gemini', slots, '', '', `<div class="qf-empty">${esc(txt)}</div>`, `<span class="qf-empty">${esc(txt)}</span>`, `Gemini：${reason}\n点击查看详情`);
+  }
+  const age = quotaAgeShort(data.at);
+  const ageTxt = err && age ? `${age} ⓘ` : age;
+  const ageTip = err ? `${err}（保留 ${quotaAgeLong(data.at)} 的数据）` : (data.at ? `更新于 ${quotaAgeLong(data.at)}` : '');
+  const groups = (data.groups || []).filter((g) => Array.isArray(g.buckets) && g.buckets.length);
+  const rows = [];
+  if (groups.length) {
+    for (const g of groups) {
+      const h5 = g.buckets.find((b) => b.window === '5h') || null;
+      const wk = g.buckets.find((b) => b.window === 'weekly') || null;
+      const gLabel = g.label || g.name || 'Gemini';
+      rows.push(`<div class="qf-row"><span class="qf-tag" title="${esc(g.description || gLabel)}">${esc(shortGroupLabel(g))}</span>${qfBarRem('5h', h5, gLabel)}${qfBarRem('周', wk, gLabel)}</div>`);
+    }
+  } else {
+    const w = geminiPrimaryWindows(data);
+    rows.push(`<div class="qf-row">${qfBarRem('5h', w.h5, 'Gemini')}${qfBarRem('周', w.wk, 'Gemini')}</div>`);
+  }
+  const minRem = Math.max(0, Math.min(100, Math.round(Number(data.remaining) * 100)));
+  const wMain = geminiPrimaryWindows(data);
+  const miniTxt = (wMain.h5 || wMain.wk)
+    ? [wMain.h5 ? `5h剩${Math.round(wMain.h5.remaining * 100)}%` : '', wMain.wk ? `周剩${Math.round(wMain.wk.remaining * 100)}%` : ''].filter(Boolean).join(' · ')
+    : `剩${minRem}%`;
+  const mini = `<span class="qf-w ${quotaRemTone(minRem)}"><i class="qf-bar"><i style="width:${minRem}%"></i></i><b>${miniTxt}</b></span>`;
+  const tip = `${geminiQuotaTip(data, err)}\n点击查看各模型组完整额度`;
+  return qfCard('gemini', 'Gemini', slots, ageTxt, ageTip, rows.join(''), mini, tip);
+}
+function renderOpenCodeCard(data) {
+  const sl = slotsForProv('opencode');
+  const slots = slotCellsHtml(sl.used, sl.max, `OpenCode 在跑执行者 ${sl.used}/${sl.max}`);
+  if (!data || data.installed === false) {
+    return qfCard('opencode', 'OpenCode', slots, '', '', '<div class="qf-empty">未安装</div>', '<span class="qf-empty">未安装</span>', 'OpenCode 未安装', '', true);
   }
   if (data.today == null && data.week == null) {
-    return `<div class="q-plat-row" title="OpenCode 等待花费数据"><span class="q-plat-name">OpenCode</span><span class="q-plat-vals q-dim">等数据</span></div>`;
+    return qfCard('opencode', 'OpenCode', slots, '', '', '<div class="qf-empty">暂无花费数据</div>', '<span class="qf-empty">暂无花费</span>', 'OpenCode：等待花费数据（点开看详情）');
   }
-  const tStr = `$${Number(data.today || 0).toFixed(2)}`;
-  const wStr = `$${Number(data.week || 0).toFixed(2)}`;
-  return `<div class="q-plat-row" title="OpenCode 今日花费 ${tStr}，本周花费 ${wStr}">
-    <span class="q-plat-name">OpenCode</span>
-    <span class="q-plat-vals">
-      <span class="q-item" title="今日花费">今日 <b>${tStr}</b></span>
-      <span class="q-item" title="本周花费">本周 <b>${wStr}</b></span>
-      ${quotaStaleTag(data.at)}
-    </span>
-  </div>`;
+  const today = Number(data.today || 0), week = Number(data.week || 0);
+  const age = quotaAgeShort(data.at);
+  const refDay = Math.max(week, 5), refWeek = Math.max(week, 20);
+  const body = `<div class="qf-row">${qfBarCost('今日', today, refDay, `OpenCode 今日花费 $${today.toFixed(2)}`)}${qfBarCost('本周', week, refWeek, `OpenCode 本周花费 $${week.toFixed(2)}`)}</div>`;
+  const mini = `<span class="qf-w cost"><b>今日 $${today.toFixed(2)} · 周 $${week.toFixed(2)}</b></span>`;
+  const tip = `OpenCode 按量计费\n今日花费：$${today.toFixed(2)}\n本周花费：$${week.toFixed(2)}${data.at ? `\n更新于 ${quotaAgeLong(data.at)}` : ''}\n点击查看详情`;
+  return qfCard('opencode', 'OpenCode', slots, age, data.at ? `更新于 ${quotaAgeLong(data.at)}` : '', body, mini, tip);
 }
-function renderGeminiRow(data) {
-  if (!data) return '';
-  if (data.installed === false) {
-    return `<div class="q-plat-row q-dim" title="Gemini (agy) 未安装"><span class="q-plat-name">Gemini</span><span class="q-plat-vals">未安装</span></div>`;
-  }
-  if (data.available && geminiQuotaReal(data)) {
-    const w = geminiPrimaryWindows(data);
-    const stale = geminiAgeLabel(data.at, Boolean(data.error));
-    const staleHtml = stale ? `<i class="q-rst" title="${esc(data.error || `${stale}的数据`)}">·${esc(stale)}</i>` : '';
-    const rowTip = geminiQuotaTip(data, data.error) || acctTip(data);
-    if (w.h5 || w.wk) {
-      const part = (label, b) => {
-        if (!b || b.remaining == null) return '';
-        const r = Math.round(b.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
-        const tDesc = b.reset ? `，${resetText(b.reset)}` : '';
-        return `<span class="q-item ${cls}" title="Gemini ${label}窗口剩余 ${r}%${tDesc}">${label}<b>${r}%</b></span>`;
-      };
-      const items = [part('5 小时剩 ', w.h5), part('周剩 ', w.wk)].filter(Boolean).join('<span class="q-sep">·</span>');
-      return `<div class="q-plat-row" title="${esc(rowTip)}">
-        <span class="q-plat-name">Gemini${acctBadge(data)}</span>
-        <span class="q-plat-vals q-gm-vals">${items}${staleHtml}</span></div>`;
+function todayUsageSummary() {
+  if (state.today_usage && state.today_usage.tokens != null) return state.today_usage;
+  let tokens = 0, cost = 0, hasCost = false;
+  for (const f of (state.films || [])) {
+    if (f.budget) {
+      tokens += Number(f.budget.today_tokens || 0);
+      if (f.budget.today_cost != null) { cost += Number(f.budget.today_cost || 0); hasCost = true; }
     }
-    const r = Math.round(data.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
-    return `<div class="q-plat-row" title="${esc(rowTip)}">
-      <span class="q-plat-name">Gemini${acctBadge(data)}</span>
-      <span class="q-plat-vals">
-        <span class="q-item ${cls}" title="各组里剩得最少的${data.low_model ? `：${esc(data.low_model)}` : ''}${data.reset ? `，${resetText(data.reset)}` : ''}">剩 <b>${r}%</b>${data.reset ? `<i class="q-rst">·${resetCompact(data.reset)}</i>` : ''}</span>
-        ${staleHtml}
-      </span></div>`;
   }
-  const reason = data.reason || (data.source === 'api_placeholder' ? '未能从 agy /quota 获取真实额度（旧接口仅返回占位值）' : 'agy /quota 暂无额度数据');
-  return `<div class="q-plat-row" title="Gemini：${esc(reason)}">
-    <span class="q-plat-name">Gemini</span>
-    <span class="q-plat-vals q-dim">额度未知</span>
-  </div>`;
+  return { tokens, cost: hasCost && cost > 0 ? cost : null };
 }
-function quotaHtml() {
-  const L = state.limits;
-  if (!L || (!L.claude && !L.codex && !L.opencode && !L.gemini && !L.five_hour && !L.seven_day)) {
-    return '<div class="quota"><div class="q-stale">额度：等受管会话的状态栏报上来</div></div>';
-  }
+function sideFootHtml() {
+  const L = state.limits || {};
   const claude = L.claude || (L.five_hour || L.seven_day ? L : null);
-  const rows = [
-    renderRateLimitRow('Claude', claude),
-    renderRateLimitRow('Codex', L.codex),
-    renderOpenCodeRow(L.opencode),
-    renderGeminiRow(L.gemini),
-  ].filter(Boolean).join('');
-  return `<div class="quota">${rows}</div>`;
+  const cards = [
+    renderClaudeCard(claude),
+    renderCodexCard(L.codex),
+    renderGeminiCard(L.gemini),
+    renderOpenCodeCard(L.opencode),
+  ].join('');
+  const tu = todayUsageSummary();
+  const tokTxt = `今日 ${fmtTok(tu.tokens || 0)}${tu.cost ? ` · $${Number(tu.cost).toFixed(2)}` : ''}`;
+  const tokTip = `今日 token 总数：${(tu.tokens || 0).toLocaleString()}${tu.cost ? `\n今日费用：$${Number(tu.cost).toFixed(4)}` : ''}`;
+  const st = state.stages || { used: 0, max: 5, by_account: [] };
+  const byAcct = st.by_account || [];
+  const execTip = `执行者并发槽：每个账号各自最多同时 ${st.max} 个（项目不限并发）` + (byAcct.length ? '\n' + byAcct.map((x) => `${x.label}：${x.used}/${st.max}`).join('\n') : '');
+  const desks = state.desks || { used: 0, max: 3 };
+  const reads = state.reads && state.reads.used ? ` · 只读 ${state.reads.used}/${state.reads.max}` : '';
+  return `<div class="qf-wrap">${cards}</div>
+    <div class="qf-sum">
+      <span class="qf-st" title="${esc(tokTip)}">${esc(tokTxt)}</span>
+      <span class="qf-st" title="${esc(execTip)}">执行 <b>${st.used || 0}</b>（每号≤${st.max}）</span>
+      <span class="qf-st" title="同时在岗的子脑${reads ? `；${reads.slice(3)}` : ''}">子脑 <b>${desks.used}/${desks.max}</b></span>
+    </div>`;
 }
+function quotaPopHtml(prov) {
+  const L = state.limits || {}, V = state.vendors || {};
+  const rst = (w) => (w && w.resets_at ? resetText(w.resets_at) : '');
+  const sl = slotsForProv(prov);
+  const slots = slotCellsHtml(sl.used, sl.max);
+  let title = PROV_CN[prov] || prov, body = '', at = null;
+  if (prov === 'claude') {
+    const cl = L.claude || (L.five_hour || L.seven_day ? L : {}) || {};
+    const ce = V.claude || {};
+    at = cl.at;
+    body = `<div class="qpop-sub">${esc(ce.email || '本机 Claude 登录')}${ce.org_type ? ` · ${esc(ce.org_type.replace(/^claude_/, ''))}` : ''}</div>`
+      + quotaBars([
+        ['5 小时', cl.five_hour ? cl.five_hour.used_percentage : null, cl.five_hour ? rst(cl.five_hour) : '等会话的状态栏报上来'],
+        ['本周', cl.seven_day ? cl.seven_day.used_percentage : null, cl.seven_day ? rst(cl.seven_day) : '等会话的状态栏报上来'],
+      ]);
+  } else if (prov === 'codex') {
+    const cx = cliAccts('codex');
+    const list = cx.length ? cx : ((L.codex && L.codex.accounts) || []);
+    at = list.reduce((m, a) => Math.max(m, (a.quota && a.quota.at) || 0), (L.codex && L.codex.at) || 0) || null;
+    if (list.length) {
+      body = list.map((a) => {
+        const q = a.quota || {};
+        const run = sl.perAcct[a.id] || 0;
+        const head = `<div class="qpop-sub"><b>${esc(acctName(a))}</b> <span class="ac-id">${esc(a.id)}</span>${a.plan ? ` <i class="ac-plan">${esc(a.plan)}</i>` : ''} · <span class="ac-st acs-${esc(a.disabled ? 'off' : a.status || '')}">${esc(a.disabled ? '已禁用' : a.status_cn || a.status || '')}</span> · 执行 ${run}/${sl.max}</div>`;
+        if (a.kind === 'api' || q.billing === 'usage') return head + `<div class="hint">按量计费${a.base_url ? ` · ${esc(a.base_url)}` : ''}</div>`;
+        return head + quotaBars([
+          ['5 小时', q.five_hour ? q.five_hour.used_percentage : null, q.five_hour ? rst(q.five_hour) : '等会话报上来'],
+          ['本周', q.seven_day ? q.seven_day.used_percentage : null, q.seven_day ? rst(q.seven_day) : '等会话报上来'],
+        ]);
+      }).join('');
+    } else {
+      const c = L.codex || {};
+      body = quotaBars([
+        ['5 小时', c.five_hour ? c.five_hour.used_percentage : null, c.five_hour ? rst(c.five_hour) : '等会话报上来'],
+        ['本周', c.seven_day ? c.seven_day.used_percentage : null, c.seven_day ? rst(c.seven_day) : '等会话报上来'],
+      ]);
+    }
+  } else if (prov === 'gemini') {
+    title = 'Gemini（agy）';
+    const gm = cliAccts('gemini')[0];
+    const gq = (gm && gm.quota) || L.gemini || {};
+    const err = (gm && gm.error) || (L.gemini && L.gemini.error) || '';
+    at = gq.at;
+    const head = `<div class="qpop-sub">${esc(gm ? acctName(gm) : '本机 agy 登录')}${gm && gm.status_cn ? ` · ${esc(gm.status_cn)}` : ''}${err ? ` · <span class="qpop-err">${esc(err)}</span>` : ''}</div>`;
+    if (geminiQuotaReal(gq)) {
+      const groups = (gq.groups || []).filter((g) => Array.isArray(g.buckets) && g.buckets.length);
+      if (groups.length) {
+        body = head + groups.map((g) => {
+          const rows = g.buckets.map((b) => ({ name: `${g.label || g.name} · ${b.window_label || b.window}`, remaining: b.remaining, reset: b.reset }));
+          return `<div class="qpop-grp"><div class="qpop-gh">${esc(g.label || g.name)}${g.description ? ` <span class="hint-inline">${esc(g.description)}</span>` : ''}</div>${geminiQuotaBars(rows)}</div>`;
+        }).join('');
+      } else {
+        body = head + geminiQuotaBars(gq.models || []);
+      }
+    } else {
+      body = head + `<div class="hint">额度未知（未能从 agy /quota 获取真实额度${err ? `：${esc(err)}` : ''}）</div>`;
+    }
+  } else if (prov === 'opencode') {
+    const oc = L.opencode || {};
+    at = oc.at;
+    body = oc.today != null || oc.week != null
+      ? `<div class="vd-q"><div class="vd-qr"><span>今日花费</span><b class="vd-unk">$${Number(oc.today || 0).toFixed(2)}</b></div><div class="vd-qr"><span>本周花费</span><b class="vd-unk">$${Number(oc.week || 0).toFixed(2)}</b></div></div>`
+      : `<div class="hint">${oc.installed === false ? '未安装 OpenCode' : '暂无花费数据'}</div>`;
+  }
+  return `<div class="qpop-hd"><b>${esc(title)}</b>${slots}${at ? `<span class="qf-age">更新于 ${esc(quotaAgeLong(at))}</span>` : ''}<button class="qpop-x" data-qpop-close title="关闭">×</button></div>
+    <div class="qpop-body">${body}</div>
+    <div class="qpop-ft"><button class="btn small primary" data-qpop-go="${esc(prov)}">去模型池 →</button></div>`;
+}
+function closeQuotaPop() {
+  quotaPopProv = null;
+  const el = $('#quotaPop');
+  if (el) el.remove();
+}
+function openQuotaPop(prov) {
+  if (quotaPopProv === prov && $('#quotaPop')) return closeQuotaPop();
+  quotaPopProv = prov;
+  let el = $('#quotaPop');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'quotaPop';
+    el.className = 'qpop';
+    document.body.appendChild(el);
+  }
+  el.innerHTML = quotaPopHtml(prov);
+}
+document.addEventListener('click', (ev) => {
+  const close = ev.target.closest('[data-qpop-close]');
+  if (close) return closeQuotaPop();
+  const goBtn = ev.target.closest('[data-qpop-go]');
+  if (goBtn) {
+    const prov = goBtn.dataset.qpopGo;
+    closeQuotaPop();
+    setView('accounts');
+    requestAnimationFrame(() => { const card = $(`#vd-${prov}`); if (card) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); });
+    return;
+  }
+  const card = ev.target.closest('[data-quota-pop]');
+  if (card) { ev.stopPropagation(); openQuotaPop(card.dataset.quotaPop); return; }
+  if (quotaPopProv && !ev.target.closest('#quotaPop')) closeQuotaPop();
+});
+document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && quotaPopProv) closeQuotaPop(); });
 
 // ---------- 按账号分组（#8）：项目有 .mashu/accounts.json 时，侧栏、项目页功能列表、工作流面板按账号分组 / 筛选；没有就完全照旧 ----------
 let acctSel = loadJSON('mashu.acct', {});          // 项目 id → 工作流面板选中的账号 id（缺省 = 全部）
@@ -854,11 +1115,13 @@ function renderSide() {
   }
   const setH = (sel, h) => { const e = $(sel); if (e._html !== h) { e.innerHTML = h; e._html = h; } };
   setH('#slate', html.join(''));
-  const byAcct = state.stages.by_account || [];
-  const execTxt = byAcct.length ? byAcct.map((x) => `${esc(x.label)} ${x.used}/${state.stages.max}`).join(' · ') : `0（每号≤${state.stages.max}）`;
-  setH('#sideFoot', `${quotaHtml()}<div class="run-stat"><span title="执行者并发槽：每个账号（Claude、每个 Codex 号…）各自最多同时 ${state.stages.max} 个，总数不限">执行 ${execTxt}</span>
-    ${state.reads && state.reads.used ? `<span title="只读阶段（分阶段工作流里的方案等）并发槽">只读 ${state.reads.used}/${state.reads.max}</span>` : ''}
-    <span title="同时在岗的子脑">子脑 ${state.desks.used}/${state.desks.max}</span></div>`);
+  setH('#sideFoot', sideFootHtml());
+  const sf = $('#sideFoot');
+  if (sf) {
+    sf.classList.remove('qf-compact');
+    if (sf.scrollHeight > 220) sf.classList.add('qf-compact');
+  }
+  if (quotaPopProv && $('#quotaPop')) $('#quotaPop').innerHTML = quotaPopHtml(quotaPopProv);
   const tr = $('#tabsRight');
   const tmuxCmd = `tmux attach -t ${state.tmux || 'mashu-studio'}`;
   const rt = state.runtime || null;
@@ -2224,14 +2487,14 @@ function vendCard(id, title, sub, body, acts = '') {
 function quotaBars(rows) {
   return `<div class="vd-q">${rows.map(([label, pctUsed, tip]) => {
     if (pctUsed == null) return `<div class="vd-qr"><span>${esc(label)}</span><span class="q-dim vd-unk">${esc(tip || '未知')}</span></div>`;
-    const p = Math.max(0, Math.min(100, Math.round(pctUsed))), cls = p >= 90 ? 'hi' : p >= 70 ? 'mid' : '';
+    const p = Math.max(0, Math.min(100, Math.round(pctUsed))), cls = p > 85 ? 'hi' : p >= 70 ? 'mid' : '';
     return `<div class="vd-qr" title="${esc(tip || '')}"><span>${esc(label)}</span><i class="vd-bar ${cls}"><i style="width:${p}%"></i></i><b class="${cls}">已用 ${p}%</b><span class="q-dim">${esc(tip || '')}</span></div>`;
   }).join('')}</div>`;
 }
 function geminiQuotaBars(models) {
   return `<div class="vd-q">${models.map((m) => {
     if (m.remaining == null) return `<div class="vd-qr"><span>${esc(m.name)}</span><span class="q-dim vd-unk">额度未知</span></div>`;
-    const r = Math.max(0, Math.min(100, Math.round(m.remaining * 100))), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
+    const r = Math.max(0, Math.min(100, Math.round(m.remaining * 100))), cls = r < 15 ? 'hi' : r <= 30 ? 'mid' : '';
     const tip = m.reset ? resetText(m.reset) : '';
     return `<div class="vd-qr" title="${esc(tip || m.name)}"><span>${esc(m.name)}</span><i class="vd-bar ${cls}"><i style="width:${r}%"></i></i><b class="${cls}">剩 ${r}%</b><span class="q-dim">${esc(tip)}</span></div>`;
   }).join('')}</div>`;

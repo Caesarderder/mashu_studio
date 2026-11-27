@@ -9016,6 +9016,8 @@ def status_data(conn):
         waited_by_seq.setdefault((w['film_id'], w['to_seq']), []).append(wb_item)
     spend = {r['film_id']: r for r in rows(conn, 'SELECT film_id, SUM(tokens_in+tokens_out+cache_read+cache_write) tokens, '
                                                  'SUM(cost) cost FROM usage WHERE day=? GROUP BY film_id', day)}
+    today_tokens = sum(int(r.get('tokens') or 0) for r in spend.values())
+    today_cost = round(sum(float(r.get('cost') or 0) for r in spend.values()), 4)
     for f in films(conn):
         seqs = []
         acc = film_accounts(f)
@@ -9128,6 +9130,7 @@ def status_data(conn):
         self_iterate_pending=selfiter_call('pending_count', conn, default=0),
         tmux=session_name(), stage_names=STAGES, approval_ttl_hours=cfg('approval_ttl_hours'),
         live=live_map, limits=read_limits(), cli_accounts=cli_accounts(), vendors=vendor_info(),
+        today_usage=dict(tokens=today_tokens, cost=today_cost if today_cost > 0 else None),
         prefs={r['k'][5:]: json.loads(r['v'] or '{}') for r in rows(conn, 'SELECT k, v FROM meta WHERE k LIKE "pref:%"')},
         pref_defaults=pref_defaults,
         presets=ps, role_presets=rp, preset_fallback_pct=cfg('preset_fallback_pct'),
