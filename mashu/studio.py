@@ -1533,7 +1533,8 @@ def check_exec(v):
     if not st['ok']:
         raise ValueError(f'{PROV_LABEL[cli]} 现在不能用：{st["reason"]}')
     model, effort = (v.get('model') or '').strip(), (v.get('effort') or '').strip()
-    if model and not valid_model(cli, model):
+    api_models = _API_MODELS.get((v.get('account') or '').strip(), []) if cli == 'codex' else []
+    if model and not valid_model(cli, model) and model not in api_models:
         raise ValueError(f'{PROV_LABEL[cli]} 不认识模型 {model}')
     if effort and effort not in EFFORTS:
         raise ValueError(f'思考程度只能是 {" / ".join(EFFORTS)}：{effort}')
@@ -1900,6 +1901,7 @@ GEMINI_SINGLE = ('Gemini 只管本机 agy 当前登录的这一个号（续期 +
 ACCOUNTS_THREADED = True                              # 测试里设 False：体检同步跑
 _ACCT_JOB = {}
 _ACCT_Q = {}
+_API_MODELS = {}
 
 
 def pool():
@@ -1927,6 +1929,8 @@ def find_codex_rollout(sid):
 
 def codex_acct_quota(a):
     """Codex 号的额度：它自己目录里 rollout 的 rate_limits（本机默认号再加上 ~/.codex/sessions）。缓存 60 秒。"""
+    if a.get('kind') == 'api':
+        return {'billing': 'usage'}
     hit = _ACCT_Q.get(a['id'])
     if hit and time.time() - hit[0] < 60:
         return hit[1]
@@ -1946,6 +1950,8 @@ def cli_accounts(platform=None):
     for a in out:
         if a['platform'] == 'codex':
             a['quota'] = codex_acct_quota(a)
+            if a.get('kind') == 'api':
+                a['models'] = _API_MODELS.get(a['id'], [])
         a['default'] = defaults.get(a['platform']) == a['id']
         a['used'] = acct.used_pct(a)
     if any(a['platform'] == 'gemini' for a in out):
@@ -2041,6 +2047,12 @@ def accounts_check(force=False, only=None):
         if not force and time.time() - (a.get('last_check') or 0) < (600 if a['platform'] == 'gemini' else 1800):
             continue
         try:
+            if a.get('kind') == 'api':
+                models = acct.api_models(a.get('base_url'), (a.get('credentials') or {}).get('OPENAI_API_KEY', ''))
+                _API_MODELS[a['id']] = models
+                p.update(a['id'], status='ok', error='', last_check=time.time())
+                res.append((a['id'], '正常（按量）'))
+                continue
             if a['platform'] == 'gemini':
                 if a.get('status') == 'revoked' and not force:
                     continue
@@ -2319,6 +2331,18 @@ def account_action(action, data=None):
     if action == 'check-all':
         res = accounts_check(force=True)
         return dict(result='；'.join(f'{x}：{r}' for x, r in res) or '账号池是空的')
+    if action == 'add-codex-api':
+        name = str(data.get('name') or '').strip()
+        base_url = str(data.get('base_url') or '').strip().rstrip('/')
+        key = str(data.get('api_key') or '').strip()
+        if not name:
+            raise ValueError('请输入名称')
+        models = acct.api_models(base_url, key)
+        b = p.add('codex', kind='api', source='api', label=name, base_url=base_url,
+                  credentials={'OPENAI_API_KEY': key}, status='ok', last_check=time.time())
+        _API_MODELS[b['id']] = models
+        _LIMITS_CACHE['at'] = 0
+        return dict(result=f'已添加 {account_label(b)}')
     if action in ('add-gemini-rt', 'add-gemini-login', 'activate') or (action == 'relogin' and a and a['platform'] == 'gemini'):
         raise ValueError(GEMINI_SINGLE)
     if action == 'import-local':
@@ -2331,6 +2355,8 @@ def account_action(action, data=None):
         ensure_local_account('gemini')
         b = gemini_ops().import_rt(data.get('rt') or '')
         return dict(result=f'已导入 {account_label(b)}' + (f'，额度剩 {round(b["quota"]["remaining"] * 100)}%' if (b.get('quota') or {}).get('remaining') is not None else ''))
+    if action == 'relogin' and a and a.get('kind') == 'api':
+        raise ValueError('API 号请体检或删除后重新添加')
     if action in ('add-codex', 'add-gemini-login', 'relogin'):
         kind = 'codex' if action == 'add-codex' else 'gemini' if action == 'add-gemini-login' else a['platform']
         jid = _login_job(kind, aid if action == 'relogin' and kind == 'codex' else None, device=data.get('device', True) not in (False, 'false', '0'))
@@ -2679,7 +2705,7 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
     if a and a.get('source') != 'local':
         pool().sync_codex_to_home(a['id'], home_dir)
     home = plat.build_codex_home(home_dir, CODEX_USER_HOME, skills, extra=plat.codex_hooks_toml(shlex.quote(str(BIN / 'mashu'))),
-                                 link_auth=home_dir == codex_home())
+                                 link_auth=home_dir == codex_home(), api_base_url=a.get('base_url') if a and a.get('kind') == 'api' else None)
     auth = home / 'auth.json'
     if home_dir == codex_home() and auth.exists() and not auth.is_symlink():
         notice(conn, channel_of(c), f'{auth} 变成了普通文件（Codex 刷新登录时换掉了软链接）：麻薯的 Codex 会话和你自己的登录可能不同步，'
@@ -2700,7 +2726,9 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
         meta_set(conn, f'provider:{sid}', 'codex')
     if not no_prompt:
         cmd += ['--', as_file('prompt', c['prompt'] or '开工')]
-    return cmd, sid, {'CODEX_HOME': str(home)}, []
+    # 避免从 tmux 服务继承的 API 密钥覆盖这个账号的 auth.json。
+    pre = ['unset OPENAI_API_KEY CODEX_API_KEY'] if a and a.get('kind') == 'api' else []
+    return cmd, sid, {'CODEX_HOME': str(home)}, pre
 
 
 def opencode_cmd(conn, c, cwd, sid, as_file, no_prompt):
@@ -4567,7 +4595,7 @@ def session_limits_for(conn, cam, prov, all_limits=None):
         hit = next((a for a in accs if aid and a.get('id') == aid), None)
         if hit and isinstance(hit.get('quota'), dict):
             q = hit['quota']
-            return dict(five_hour=q.get('five_hour'), seven_day=q.get('seven_day'), at=q.get('at'), account=hit.get('id'))
+            return dict(five_hour=q.get('five_hour'), seven_day=q.get('seven_day'), billing=q.get('billing'), at=q.get('at'), account=hit.get('id'))
         return dict(five_hour=cx.get('five_hour'), seven_day=cx.get('seven_day'), at=cx.get('at'), account=aid or cx.get('account'))
     if prov == 'gemini':
         gm = L.get('gemini') if isinstance(L.get('gemini'), dict) else {}
@@ -5150,7 +5178,8 @@ def set_pref(conn, channel, **kw):
         if k not in kw or kw[k] is None:
             continue
         v = (kw[k] or '').strip()
-        if v and (not valid_model(key_prov[k], v) if k != 'effort' else v not in EFFORTS):
+        api_models = _API_MODELS.get(p.get('xacct'), []) if k == 'xmodel' else []
+        if v and (not valid_model(key_prov[k], v) and v not in api_models if k != 'effort' else v not in EFFORTS):
             raise ValueError(f'不支持的{"思考程度" if k == "effort" else "模型"}：{v}')
         if v:
             p[k] = v
@@ -5334,7 +5363,7 @@ def collect_limits(home=None):
         accs = cli_accounts() if home is None else []
     except Exception:
         accs = []
-    brief = lambda a: {k: a.get(k) for k in ('id', 'label', 'email', 'plan', 'status', 'status_cn', 'disabled', 'default', 'active', 'quota', 'used', 'source')}  # noqa: E731
+    brief = lambda a: {k: a.get(k) for k in ('id', 'label', 'email', 'plan', 'kind', 'status', 'status_cn', 'disabled', 'default', 'active', 'quota', 'used', 'source')}  # noqa: E731
     cx = [a for a in accs if a['platform'] == 'codex']
     if cx:
         d = next((a for a in cx if a['default']), cx[0])
@@ -7560,7 +7589,9 @@ def platform_selfcheck(prov):
 
 def fmt_account(a):
     q = a.get('quota') or {}
-    if a['platform'] == 'gemini':
+    if a.get('kind') == 'api':
+        qs = '按量'
+    elif a['platform'] == 'gemini':
         qs = f'剩 {round(q["remaining"] * 100)}%（{q.get("low_model") or ""}）' if q.get('remaining') is not None else '额度未知'
     else:
         parts = [f'{k} 用了 {round(w["used_percentage"])}%' for k, w in (('5h', q.get('five_hour')), ('周', q.get('seven_day')))
@@ -7588,6 +7619,16 @@ def cmd_account(args):
         return
     if act == 'add':
         if args.target == 'codex':
+            if args.api:
+                if args.key_file:
+                    path = Path(args.key_file)
+                    if path.stat().st_mode & 0o077:
+                        raise ValueError('密钥文件权限须为 0600')
+                    key = path.read_text().strip()
+                else:
+                    key = sys.stdin.readline().strip()
+                print(account_action('add-codex-api', dict(name=args.name, base_url=args.base_url, api_key=key))['result'])
+                return
             ensure_local_account('codex')
             p = pool()
             a = p.add('codex', source='login', label='（登录中）')
@@ -7832,6 +7873,10 @@ def main(argv=None):
     s.add_argument('action', choices=['list', 'add', 'import-local', 'check', 'refresh', 'default', 'disable', 'enable', 'remove'])
     s.add_argument('target', nargs='?', help='add / import-local：codex 或 gemini；其余：号 ID（cx-1、gm-2…）')
     s.add_argument('--device', action='store_true', help='Codex：用设备码登录（不在本机浏览器里登录时用）')
+    s.add_argument('--api', action='store_true', help='添加 Codex API 号，密钥从标准输入读取')
+    s.add_argument('--name', help='API 号名称')
+    s.add_argument('--base-url', help='兼容 Responses 的 API 地址')
+    s.add_argument('--key-file', help='读取密钥的 0600 文件')
     s = sub.add_parser('platforms', help='各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型，--check 跑一遍安全拦截自检')
     s.add_argument('--check', action='store_true')
     s = sub.add_parser('opencode-models', help='OpenCode 可选模型；--refresh 跑 opencode models --verbose 更新缓存')

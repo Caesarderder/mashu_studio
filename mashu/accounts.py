@@ -111,6 +111,23 @@ def http(method, url, data=None, headers=None, timeout=20):
     return HTTP(method, url, data=data, headers=headers, timeout=timeout)
 
 
+def api_models(base_url, key):
+    url = urllib.parse.urlsplit(str(base_url or '').strip())
+    if url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password or url.query or url.fragment:
+        raise AccountError('请求地址须为不含凭据、查询参数的 HTTP(S) 地址')
+    if not key or '\n' in key or '\r' in key:
+        raise AccountError('请输入有效的 API key')
+    try:
+        code, body = http('GET', base_url.rstrip('/') + '/models', headers={'Authorization': 'Bearer ' + key})
+    except AccountError:
+        raise AccountError('连不上 API 服务') from None
+    if code in (401, 403):
+        raise AccountError('API key 无效或无权限')
+    if code != 200 or not isinstance(body, dict) or not isinstance(body.get('data'), list):
+        raise AccountError(f'读取模型列表失败（HTTP {code}）')
+    return sorted({x['id'] for x in body['data'] if isinstance(x, dict) and isinstance(x.get('id'), str)})
+
+
 def _err_code(body):
     if isinstance(body, dict):
         e = body.get('error')
@@ -161,7 +178,7 @@ class Pool:
         for a in accs:
             if a['id'] == want:
                 return a
-        return next((a for a in accs if a.get('source') == 'local'), accs[0] if accs else None)
+        return next((a for a in accs if a.get('source') == 'local'), next((a for a in accs if a.get('kind') != 'api'), None))
 
     def add(self, platform, **meta):
         if platform not in PLATFORMS:
@@ -243,6 +260,8 @@ class Pool:
         home = Path(home)
         ap = home / 'auth.json'
         cred = dict(a.get('credentials') or {})
+        if a.get('kind') == 'api' and cred.get('OPENAI_API_KEY'):
+            cred['auth_mode'] = 'apikey'
         disk = None if (ap.is_symlink() or not ap.exists()) else read_json(ap)
         disk_ok = isinstance(disk, dict) and bool((disk.get('tokens') or {}).get('refresh_token') or disk.get('OPENAI_API_KEY'))
         cred_ok = bool((cred.get('tokens') or {}).get('refresh_token') or cred.get('OPENAI_API_KEY'))
@@ -296,7 +315,7 @@ class Pool:
         """给网页 / 命令行看的（不含令牌）。"""
         out = []
         for a in self.list(platform):
-            v = {k: a.get(k) for k in ('id', 'platform', 'label', 'email', 'plan', 'source', 'status', 'disabled', 'created',
+            v = {k: a.get(k) for k in ('id', 'platform', 'label', 'email', 'plan', 'source', 'kind', 'base_url', 'status', 'disabled', 'created',
                                        'last_refresh', 'last_check', 'error', 'quota')}
             v['status_cn'] = STATUS_CN.get(a.get('status'), a.get('status') or '')
             v['error'] = redact(v.get('error') or '')
@@ -332,7 +351,10 @@ def pick(accounts, want=None, default_id=None):
         why = '不存在' if not a else '已禁用' if a.get('disabled') else STATUS_CN.get(a.get('status'), a.get('status') or '不可用')
         cand, _ = pick(accs, None, default_id)
         return cand, f'指定的 {want} {why}，改为自动选'
-    cand = [a for a in accs if usable(a)]
+    default = next ( (a for a in accs if a.get('id') == default_id and a.get('kind') == 'api' and usable(a)), None)
+    if default:
+        return default, '默认 API 号'
+    cand = [a for a in accs if usable(a) and a.get('kind') != 'api']
     if not cand:
         return None, '没有能用的号'
 

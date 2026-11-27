@@ -287,6 +287,10 @@ details.bubble[open] summary { margin-bottom: 6px; }
 .form input, .form textarea { background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 8px 11px; outline: none; }
 .form input:focus, .form textarea:focus { border-color: var(--line-strong); }
 .form textarea { min-height: 100px; resize: vertical; }
+.api-form { max-width: 560px; gap: 12px; }
+.api-form label, .api-field { display: flex; flex-direction: column; gap: 6px; }
+.api-form select, .api-field select { width: 100%; padding: 8px 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--card); }
+.api-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .meter { height: 6px; background: var(--card-2); border-radius: 3px; overflow: hidden; margin-top: 4px; }
 .meter i { display: block; height: 100%; background: var(--green); }
 .meter i.warn { background: var(--amber); }
@@ -312,6 +316,7 @@ details.bubble[open] summary { margin-bottom: 6px; }
 .modal { position: fixed; inset: 0; background: rgba(41, 38, 27, .35); display: flex; align-items: center; justify-content: center; z-index: 50; backdrop-filter: blur(2px); }
 .modal[hidden] { display: none; }
 .modal-box { background: var(--main); border: 1px solid var(--line); border-radius: 16px; padding: 20px; width: min(1100px, 94vw); max-height: 90vh; overflow: auto; box-shadow: 0 12px 40px rgba(41, 38, 27, .18); }
+.modal-box.api-dialog { width: min(600px, 94vw); }
 .modal-box .screen { height: auto; min-height: 60vh; font-size: 12px; overflow: auto; border-radius: 10px; }
 .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 14px; line-height: 1.6; }
 

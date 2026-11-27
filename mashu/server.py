@@ -470,8 +470,10 @@ class Handler(BaseHTTPRequestHandler):
             f, created = studio.greenlight(conn, data.get('path', ''), data.get('id') or None, data.get('title') or None)
             return {'film': f['id'], 'created': created, 'producer': f['producer_name']}
         if path == '/api/pitch':
+            aid = (data.get('cli_account') or '').strip()
+            ex = studio.check_exec({'cli': 'codex', 'account': aid}) if aid else None
             f, key, cam = studio.pitch(conn, data['film'], data['slug'], data['brief'], data.get('title') or None,
-                                          workflow=bool(data.get('workflow')))
+                                          workflow=bool(data.get('workflow')), exec_cfg=ex)
             return {'key': key, 'crew': cam['name']}
         if path == '/api/reveal':      # 聊天里的文件 / 文件夹：在访达里打开（文件选中显示，文件夹直接打开）
             import subprocess

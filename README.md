@@ -75,6 +75,8 @@ tmux attach -t mashu-studio    # 看 / 接管所有会话：desk = 主脑，film
 
 ## 用法
 
+Codex 账号池支持兼容 OpenAI Responses 的 API 号：在「账号池」选择「加 API 号」，填写名称、请求地址和密钥并通过连接测试。API 号按量计费，只有手动选中或设为默认号时使用；密钥不会出现在普通配置导出中。
+
 在主对话里直接跟麻薯说，例如：
 
 - “把 ~/workspace/my-app 登记成项目，加一个导出 CSV 的功能”

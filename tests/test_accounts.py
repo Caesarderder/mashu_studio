@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -20,10 +22,98 @@ from test_studio import studio, wait_for  # noqa: E402
 from test_platforms import PlatBase  # noqa: E402
 import accounts as acct  # noqa: E402
 import platforms as plat  # noqa: E402
+import config_file as cfgfile  # noqa: E402
 
 RT1 = '1//0gFAKE-refresh-token-number-one-abcdefghijklmnopqrstuvwxyz'
 RT2 = '1//0gFAKE-refresh-token-number-two-abcdefghijklmnopqrstuv0002'
 CX_RT = 'rt_FAKEcodexrefreshtokenABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+
+
+class TestApiAccounts(unittest.TestCase):
+    def test_migration_export_and_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            secret = 'test-secret-for-api-account'
+            cfgfile.write_json(home / 'studio.json', {'schema_version': 1, 'providers': {'zhaolaoban': {
+                'name': '赵老板', 'base_url': 'https://example.test/v1', 'api_key': secret}}})
+            cfgfile.migrate_if_needed(home)
+            pool = acct.Pool(home / 'accounts', home / 'studio.json')
+            a = pool.list('codex')[0]
+            self.assertEqual(a['kind'], 'api')
+            self.assertNotIn('zhaolaoban', cfgfile.read_config(home / 'studio.json')['providers'])
+            self.assertNotIn(secret, json.dumps(pool.view()))
+            self.assertNotIn(secret, json.dumps(cfgfile._sanitize_config_for_export(cfgfile.read_config(home / 'studio.json'))))
+            runtime = home / 'runtime'
+            pool.sync_codex_to_home(a['id'], runtime)
+            self.assertEqual(cfgfile.read_json(runtime / 'auth.json')['auth_mode'], 'apikey')
+            self.assertEqual(stat.S_IMODE((runtime / 'auth.json').stat().st_mode), 0o600)
+            self.assertIsNone(acct.pick(pool.view())[0])
+            self.assertEqual(acct.pick(pool.view(), a['id'])[0]['id'], a['id'])
+            self.assertEqual(acct.pick(pool.view(), default_id=a['id'])[0]['id'], a['id'])
+            pool.update(a['id'], label='新名称')
+            self.assertEqual(pool.get(a['id'])['label'], '新名称')
+            pool.remove(a['id'])
+            self.assertFalse(pool.list())
+
+    def test_api_models_and_config(self):
+        old = acct.HTTP
+        acct.HTTP = lambda *args, **kwargs: (200, {'data': [{'id': 'model-a'}]})
+        try:
+            self.assertEqual(acct.api_models('https://example.test/v1', 'secret'), ['model-a'])
+            acct.HTTP = lambda *args, **kwargs: (401, {'error': 'bad key'})
+            with self.assertRaisesRegex(acct.AccountError, 'API key 无效'):
+                acct.api_models('https://example.test/v1', 'secret')
+            with self.assertRaises(acct.AccountError):
+                acct.api_models('https://user:pass@example.test/v1', 'secret')
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                user = root / 'user'
+                user.mkdir()
+                (user / 'config.toml').write_text('model_provider = "custom"\n[model_providers.custom]\nbase_url = "https://old.test"\n'
+                                                  '[model_providers."mashu_api"]\nbase_url = "https://previous.test"\n')
+                home = plat.build_codex_home(root / 'home', user, api_base_url='https://example.test/v1', link_auth=False)
+                text = (home / 'config.toml').read_text()
+                self.assertEqual(text.count('model_provider = '), 1)
+                self.assertIn('model_provider = "mashu_api"', text)
+                self.assertIn('base_url = "https://example.test/v1"', text)
+                self.assertIn('[model_providers.custom]', text)
+                try:
+                    import tomllib
+                except ImportError:
+                    pass
+                else:
+                    parsed = tomllib.loads(text)
+                    self.assertEqual(parsed['model_providers'][parsed['model_provider']]['wire_api'], 'responses')
+        finally:
+            acct.HTTP = old
+
+    @unittest.skipUnless(os.environ.get('MASHU9_LIVE_CONFIG'), '未启用付费接口实测')
+    def test_live_api_codex_reply(self):
+        raw = cfgfile.read_json(os.environ['MASHU9_LIVE_CONFIG'], {})
+        provider = (raw.get('providers') or {}).get('zhaolaoban') or {}
+        if not provider:
+            account = next((a for a in (raw.get('accounts') or {}).get('items', []) if a.get('kind') == 'api' and a.get('label') == '赵老板'), {})
+            provider = {'base_url': account.get('base_url'), 'api_key': (account.get('credentials') or {}).get('OPENAI_API_KEY')}
+        self.assertTrue(provider.get('api_key') and provider.get('base_url'), '缺少待迁移的 API 账号')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user = root / 'user'
+            user.mkdir()
+            home = plat.build_codex_home(root / 'codex', user, link_auth=False, api_base_url=provider['base_url'])
+            with (home / 'config.toml').open('a') as config:
+                config.write('request_max_retries = 0\nstream_max_retries = 0\n')
+            env = dict(os.environ, CODEX_HOME=str(home))
+            for name in ('OPENAI_API_KEY', 'CODEX_API_KEY', 'MASHU_SESSION', 'TMUX'):
+                env.pop(name, None)
+            exe = shutil.which('codex')
+            self.assertTrue(exe, '找不到 Codex CLI')
+            pool = acct.Pool(root / 'accounts', root / 'studio.json')
+            a = pool.add('codex', kind='api', source='api', credentials={'OPENAI_API_KEY': provider['api_key']})
+            pool.sync_codex_to_home(a['id'], home)
+            result = subprocess.run([exe, 'exec', '--skip-git-repo-check', '-m', 'gpt-5.4-mini', '只回复：测试通过'],
+                                    cwd=tmp, env=env, capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, acct.redact(result.stderr[-1500:], [provider['api_key']]))
+            self.assertTrue(result.stdout.strip(), 'Codex 未返回文字')
 
 
 def jwt(claims):
@@ -365,6 +455,24 @@ class TestStudioPool(PlatBase):
         self.assertEqual(studio.codex_acct_home(self.local), studio.HOME / 'codex-home')
         self.assertFalse((self.p.root / 'codex' / 'cx-1' / 'auth.json').exists())
         self.assertEqual(self.p.default('codex')['id'], 'cx-1')
+
+    def test_api_account_launch_and_redaction(self):
+        secret = 'fixture-api-secret-do-not-log'
+        acct.HTTP = lambda *args, **kwargs: (200, {'data': [{'id': 'model-a'}]})
+        studio.account_action('add-codex-api', {'name': '测试号', 'base_url': 'https://example.test/v1', 'api_key': secret})
+        account = next(a for a in self.p.list('codex') if a.get('kind') == 'api')
+        self.assertNotIn(secret, json.dumps(studio.account_action('list')))
+        f, key, cam = studio.pitch(self.conn, 'builda', 'api-test', '需求', touches=['a/**'])
+        studio.set_pref(self.conn, f'builda/{key}', provider='codex')
+        studio.set_pref(self.conn, f'builda/{key}', xacct=account['id'])
+        studio.tick(self.conn)
+        log = wait_for(lambda: self.flog('codex', key))
+        self.assertTrue(log)
+        self.assertNotIn(secret, log)
+        self.assertEqual(studio.meta_get(self.conn, f'camacct:{cam["id"]}'), account['id'])
+        runtime = studio.codex_acct_home(account)
+        self.assertEqual(cfgfile.read_json(runtime / 'auth.json')['auth_mode'], 'apikey')
+        self.assertEqual(studio.codex_acct_quota(account)['billing'], 'usage')
 
     def test_launch_picks_account_home(self):
         rollout(studio.HOME / 'codex-home', '0199aaaa-0001', 80, 30)        # 本机号用了 80%

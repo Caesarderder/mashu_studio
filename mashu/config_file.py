@@ -262,12 +262,18 @@ def migrate_if_needed(home):
     gemini_dir = acc_dir / 'gemini'
     cred_files = sorted(gemini_dir.glob('*/cred.json')) if gemini_dir.is_dir() else []
 
+    def has_legacy_api(raw):
+        providers = raw.get('providers') if isinstance(raw, dict) else None
+        provider = providers.get('zhaolaoban') if isinstance(providers, dict) else None
+        return isinstance(provider, dict) and bool(provider.get('api_key'))
+
     raw_fast = read_json(conf, None) if conf.exists() else None
     needs = (
         tok_file.exists()
         or idx_file.exists()
         or clients_file.exists()
         or bool(cred_files)
+        or has_legacy_api(raw_fast)
         or (conf.exists() and not is_sectioned(raw_fast))
     )
     if not needs:
@@ -286,6 +292,7 @@ def migrate_if_needed(home):
             or idx_file.exists()
             or clients_file.exists()
             or bool(cred_files)
+            or has_legacy_api(raw)
             or (conf.exists() and not is_sectioned(raw))
         )
         if not needs_locked:
@@ -301,6 +308,19 @@ def migrate_if_needed(home):
 
         cfg = normalize_config(raw)
         _ensure_provider_refs(cfg)
+
+        provider = cfg['providers'].get('zhaolaoban')
+        if isinstance(provider, dict) and provider.get('api_key'):
+            _backup_file(conf, bdir / 'studio.json')
+            if 'studio.json' not in migrated_files:
+                migrated_files.append('studio.json')
+            items = cfg['accounts']['items']
+            nums = [int(m.group(1)) for a in items for m in [re.fullmatch(r'cx-(\d+)', a.get('id', ''))] if m]
+            items.append(dict(id=f'cx-{max(nums + [0]) + 1}', platform='codex', kind='api', source='api',
+                              label=provider.get('name') or '赵老板', base_url=provider.get('base_url') or provider.get('url') or '',
+                              credentials={'OPENAI_API_KEY': provider['api_key']}, status='ok', disabled=False,
+                              created=time.time(), last_check=None, error='', quota=None))
+            del cfg['providers']['zhaolaoban']
 
         if tok_file.exists():
             _backup_file(tok_file, bdir / 'token')
@@ -651,6 +671,8 @@ def _sanitize_config_for_export(cfg):
             'email': a.get('email') or '',
             'plan': a.get('plan') or '',
             'source': a.get('source') or '',
+            'kind': a.get('kind') or '',
+            'base_url': a.get('base_url') or '',
             'credentials': OMITTED,
         })
     safe_providers = {k: _redact_provider_value(v) for k, v in (norm.get('providers') or {}).items()}

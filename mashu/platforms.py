@@ -225,7 +225,7 @@ def toml_str(s):
     return json.dumps(str(s), ensure_ascii=False)
 
 
-def build_codex_home(home, user_home, skills=None, extra='', link_auth=True):
+def build_codex_home(home, user_home, skills=None, extra='', link_auth=True, api_base_url=None):
     """建麻薯专用的 CODEX_HOME（不改用户的 ~/.codex）：
     - config.toml：用户 config.toml 的副本（去掉 hooks / 插件 / 项目信任），用户的改了就重抄；Codex 自己往里写的信任只落在这份副本；
     - auth.json（和 auth.lock）：软链接到用户的，登录状态共用，Codex 刷新令牌时写回同一个文件；
@@ -239,14 +239,27 @@ def build_codex_home(home, user_home, skills=None, extra='', link_auth=True):
         src = (user_home / 'config.toml').read_text()
     except OSError:
         src = ''
-    text = codex_config_text(src) + extra
+    text = codex_config_text(src)
+    if api_base_url:
+        lines, section, skip = [], False, False
+        for line in text.splitlines(keepends=True):
+            head = re.match(r'\s*\[\[?\s*([^\]]+?)\s*\]\]?', line)
+            if head:
+                section = True
+                skip = bool(re.fullmatch(r'''model_providers\s*\.\s*(?:mashu_api|"mashu_api"|'mashu_api')(?:\s*\..*)?''', head.group(1).strip()))
+            if skip or (not section and re.match(r'\s*(?:model_provider|cli_auth_credentials_store)\s*=', line)):
+                continue
+            lines.append(line)
+        text = 'model_provider = "mashu_api"\ncli_auth_credentials_store = "file"\n' + ''.join(lines) + '\n[model_providers.mashu_api]\nname = "Mashu API"\nbase_url = ' + toml_str(api_base_url) + '\nwire_api = "responses"\nrequires_openai_auth = true\n'
+    text += extra
     cfgp = home / 'config.toml'
     mark = home / '.mashu-source-config'
-    if not cfgp.exists() or (mark.read_text() if mark.exists() else None) != src + extra:
+    marker = src + extra + (api_base_url or '')
+    if not cfgp.exists() or (mark.read_text() if mark.exists() else None) != marker:
         tmp = home / '.config.toml.mashu-tmp'
         tmp.write_text(text)
         os.replace(tmp, cfgp)
-        mark.write_text(src + extra)
+        mark.write_text(marker)
     for name in ('auth.json', 'auth.lock', 'AGENTS.md') if link_auth else ('AGENTS.md',):
         target, link = user_home / name, home / name
         if not target.exists():

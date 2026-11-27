@@ -476,7 +476,7 @@ function acctTip(data) {
   if (!list.length) return '';
   return list.map((a) => {
     const q = a.quota || {};
-    const v = q.remaining != null ? `剩 ${Math.round(q.remaining * 100)}%` : [q.five_hour && q.five_hour.used_percentage != null ? `5h ${Math.round(q.five_hour.used_percentage)}%` : '',
+    const v = q.billing === 'usage' ? '按量' : q.remaining != null ? `剩 ${Math.round(q.remaining * 100)}%` : [q.five_hour && q.five_hour.used_percentage != null ? `5h ${Math.round(q.five_hour.used_percentage)}%` : '',
       q.seven_day && q.seven_day.used_percentage != null ? `周 ${Math.round(q.seven_day.used_percentage)}%` : ''].filter(Boolean).join(' ') || '额度未知';
     return `${a.id === data.account ? '▶ ' : '   '}${acctName(a)}：${v}${a.disabled ? '（禁用）' : a.status !== 'ok' ? `（${a.status_cn}）` : ''}`;
   }).join('\n');
@@ -487,6 +487,7 @@ function acctBadge(data) {
 }
 function renderRateLimitRow(name, data) {
   if (!data) return '';
+  if (data.billing === 'usage') return `<div class="q-plat-row"><span class="q-plat-name">${name}${acctBadge(data)}</span><span class="q-plat-vals">按量</span></div>`;
   if (data.installed === false) {
     return `<div class="q-plat-row q-dim" title="${name} 未安装"><span class="q-plat-name">${name}</span><span class="q-plat-vals">未安装</span></div>`;
   }
@@ -734,6 +735,10 @@ function plats() {
     { id: 'gemini', label: 'Gemini', ok: true, model_key: 'gmodel', default_key: 'gmodels', models: state.gemini_model_choices || [] }];
 }
 function platOf(id) { return plats().find((x) => x.id === id) || plats()[0]; }
+function modelsFor(prov, aid) {
+  const a = cliAccts(prov).find((x) => x.id === aid) || cliAccts(prov).find((x) => !aid && x.default);
+  return (a && a.kind === 'api' && a.models && a.models.length) ? a.models : (platOf(prov).models || []);
+}
 function provOpts(cur, withDefault) {
   return plats().map((x) => `<option value="${x.id}" ${x.id === cur ? 'selected' : ''} ${x.ok || x.id === cur ? '' : 'disabled'} title="${esc(x.ok ? (x.version ? `${x.label} ${x.version}` : x.label) : x.reason)}">${esc(x.label)}${x.ok ? '' : '（不可用）'}</option>`).join('');
 }
@@ -759,7 +764,7 @@ function sessCtl(ch, role, cam, buttons) {
       <span class="sp-sep">·</span>
       <label class="sel" title="${esc(full)}
 ${esc(pl.label)} 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。第一项 = 用默认。切换时会话在原窗格重开，对话不丢${prov === 'opencode' && !(pl.models || []).length ? '。还没有 OpenCode 模型列表：到「会话监控」的默认设置里点刷新' : ''}">
-        <select data-pref="${esc(pl.model_key)}" data-ch="${esc(ch)}">${opts(pl.models || [], p.mk(prov), p.dmk(prov), prov === 'claude' ? shortModel(nowModel) : nowModel, '默认模型')}</select></label>
+        <select data-pref="${esc(pl.model_key)}" data-ch="${esc(ch)}">${opts(modelsFor(prov, ((state.prefs || {})[ch] || {})[ACCT_PREF[prov]] || (featExec(ch) || {}).account), p.mk(prov), p.dmk(prov), prov === 'claude' ? shortModel(nowModel) : nowModel, '默认模型')}</select></label>
       <span class="sp-sep">·</span>
       <label class="sel eff" title="思考程度${cam && cam.effort ? `（现在：${esc(cam.effort)}）` : ''}。Codex / OpenCode 会换成这个模型支持的最接近一档。切换时会话在原窗格重开，对话不丢">
         <select data-pref="effort" data-ch="${esc(ch)}">${opts(state.effort_choices || [], p.effort, p.de, cam && cam.effort, '默认思考')}</select></label>
@@ -874,8 +879,8 @@ function closedLine(r) {
   return `<div class="done-line ok">${icon('check', 13)}${esc(by)}批复 · ${clock(r.closed_at)}：${esc(r.answer)}</div>`;
 }
 // 开工审批卡：执行者用哪个 CLI / 模型 / 思考程度，默认填好（开功能时指定的，或执行者默认），可以改了再批准
-function kickModelOpts(prov, cur) {
-  const list = platOf(prov).models || [];
+function kickModelOpts(prov, cur, aid) {
+  const list = modelsFor(prov, aid);
   return '<option value="">默认模型</option>' + (cur && !list.includes(cur) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : '')
     + list.map((x) => `<option value="${esc(x)}" ${x === cur ? 'selected' : ''}>${esc(x)}</option>`).join('');
 }
@@ -885,7 +890,7 @@ function kickExecHtml(r) {
   return `<div class="kick-exec" data-kick="${r.id}" title="批准后执行者按这里的配置启动；之后在对话的 ⚙ 里改，只影响新会话">
     <span class="ke-l">${icon('terminal', 13)}执行者</span>
     <select data-kick-cli="${r.id}">${provOpts(ex.cli || 'claude')}</select>
-    <select data-kick-model="${r.id}">${kickModelOpts(ex.cli || 'claude', ex.model || '')}</select>
+    <select data-kick-model="${r.id}">${kickModelOpts(ex.cli || 'claude', ex.model || '', ex.account)}</select>
     <select data-kick-effort="${r.id}"><option value="">默认思考</option>${(state.effort_choices || []).map((x) => `<option value="${esc(x)}" ${x === ex.effort ? 'selected' : ''}>思考 ${esc(x)}</option>`).join('')}</select>
     <select data-kick-acct="${r.id}" title="账号池里的号（自动 = 开工时挑额度剩得最多的）" ${ACCT_PREF[ex.cli] && cliAccts(ex.cli).length ? '' : 'hidden'}>${acctOpts(ex.cli, ex.account || '')}</select>
   </div>`;
@@ -905,6 +910,7 @@ document.addEventListener('change', (ev) => {
     const m = box.querySelector('[data-kick-model]'); if (m) m.innerHTML = kickModelOpts(s.value, '');
     const a = box.querySelector('[data-kick-acct]'); if (a) { a.innerHTML = acctOpts(s.value, ''); a.hidden = !(ACCT_PREF[s.value] && cliAccts(s.value).length); }
   }
+  if (s.dataset.kickAcct) { const m = box.querySelector('[data-kick-model]'); if (m) m.innerHTML = kickModelOpts(box.querySelector('[data-kick-cli]').value, m.value, s.value); }
   kickSel[box.dataset.kick] = kickExecOf(box.dataset.kick, box.parentElement);
 });
 function muteBtn(r) { return `<button class="btn ghost mute" data-mute="${r.id}" title="静默：不处理这件事、不叫醒任何人，维持现状">${icon('moon', 13)}静默</button>`; }
@@ -1211,7 +1217,7 @@ function detailHtml(d) {
     : (d.provider === 'opencode'
       ? [L.today != null ? chip('今日花费', `$${(+L.today).toFixed(2)}`, L.week != null ? `本周 $${(+L.week).toFixed(2)}` : '') : '',
         L.week != null ? chip('本周花费', `$${(+L.week).toFixed(2)}`) : '']
-      : [lim('5h', L.five_hour), lim('7d', L.seven_day)]);
+      : L.billing === 'usage' ? [chip('额度', '按量')] : [lim('5h', L.five_hour), lim('7d', L.seven_day)]);
   const stat = [
     chip('模型', m.display_name || m.id || ''), chip('思考', (st.effort || {}).level || ''), d.code_mode ? chip('Code Mode', '开') : '',
     chip('目录', cwd, ws.project_dir || ''),
@@ -1789,9 +1795,10 @@ document.addEventListener('click', async (ev) => {
 let acctJob = loadJSON('mashu.acctjob', null);
        // 正在进行的网页登录：{ id, platform }
 function cliAccts(prov) { return (state.cli_accounts || []).filter((a) => !prov || a.platform === prov); }
-function acctName(a) { return a ? (a.label || a.email || a.id) : ''; }
+function acctName(a) { return a ? (a.label || a.email || a.id) + (a.kind === 'api' ? ' · API' : '') : ''; }
 function acctQuota(a) {
   const q = a.quota || {};
+  if (a.kind === 'api') return '<span>按量</span>';
   if (a.platform === 'gemini') {
     if (q.remaining == null) return '<span class="q-dim">额度未知</span>';
     const r = Math.round(q.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
@@ -1813,14 +1820,14 @@ function acctRow(a) {
   const btn = (act, label, title, cls = '') => `<button class="btn small ${cls}" data-acct-act="${act}" data-acct="${esc(a.id)}" title="${esc(title)}">${label}</button>`;
   return `<div class="ac-row ${a.disabled ? 'dim' : ''}">
     <span class="ac-id">${esc(a.id)}</span>
-    <span class="ac-name" title="${esc(a.email || '')}">${esc(acctName(a))}${a.plan ? ` <i class="ac-plan">${esc(a.plan)}</i>` : ''}${tags}</span>
+    <span class="ac-name" title="${esc(a.base_url || a.email || '')}">${esc(acctName(a))}${a.plan ? ` <i class="ac-plan">${esc(a.plan)}</i>` : ''}${tags}</span>
     <span class="ac-st acs-${esc(st || '')}" title="${esc(a.error || '')}">${esc(a.disabled ? '已禁用' : a.status_cn || a.status || '')}${a.error ? ' ⓘ' : ''}</span>
     <span class="ac-q">${acctQuota(a)}</span>
     <span class="ac-t" title="最近续期 / 体检">${a.last_refresh ? `续期 ${ago(a.last_refresh)}前` : ''}${a.last_check ? ` · 体检 ${ago(a.last_check)}前` : ''}</span>
     <span class="ac-acts">
       ${a.default || a.platform === 'gemini' ? '' : btn('default', '设为默认', '没指定号、额度又差不多时优先用它；左下角显示默认号的额度')}
       ${btn('check', '体检', a.platform === 'gemini' ? '用 RT 续期并查一次额度' : '读登录状态；池里的号超过 7 天没续期会用 RT 续一次')}
-      ${a.platform === 'codex' && a.source !== 'local' ? btn('relogin', '重新登录', '在这个号目录里重新跑 codex login（设备码）') : ''}
+      ${a.platform === 'codex' && a.source !== 'local' && a.kind !== 'api' ? btn('relogin', '重新登录', '在这个号目录里重新跑 codex login（设备码）') : ''}
       ${a.platform === 'gemini' ? '' : btn(a.disabled ? 'enable' : 'disable', a.disabled ? '启用' : '禁用', a.disabled ? '重新参与自动选号' : '自动选号不再选它（指定了也会改为自动）')}
       ${btn('remove', '删除', a.source === 'local' && a.platform === 'codex' ? '只取消登记，不动 ~/.codex 里你自己的登录' : '删掉这个号的登录文件和记录', 'danger')}
     </span></div>`;
@@ -1860,10 +1867,11 @@ function acctPageHtml() {
   const cx = cliAccts('codex');
   const codex = vendCard('codex', 'Codex', '每个号一个独立的 CODEX_HOME，几个执行者可以同时用不同的号；本机号和 ~/.codex 共用登录（不复制，避免 RT 轮换掉登录）',
     (cx.length ? cx.map(acctRow).join('') : '<div class="hint">还没有 Codex 号：先「登记本机登录」，再加别的号</div>')
-    + cx.filter((a) => a.quota).map((a) => `<div class="vd-sub">${esc(acctName(a))}</div>` + quotaBars([
+    + cx.filter((a) => a.quota && a.kind !== 'api').map((a) => `<div class="vd-sub">${esc(acctName(a))}</div>` + quotaBars([
       ['5 小时', a.quota.five_hour ? a.quota.five_hour.used_percentage : null, rst(a.quota.five_hour)],
       ['本周', a.quota.seven_day ? a.quota.seven_day.used_percentage : null, rst(a.quota.seven_day)]])).join(''),
-    `<button class="btn small primary" data-acct-add="codex-device" title="打开 OpenAI 的设备登录页，输入一次性码（码在点了以后才生成，15 分钟有效）">${icon('plus', 13)}加号（设备码）</button>
+    `<button class="btn small primary" data-acct-add="codex-api">${icon('plus', 13)}加 API 号</button>
+     <button class="btn small primary" data-acct-add="codex-device" title="打开 OpenAI 的设备登录页，输入一次性码（码在点了以后才生成，15 分钟有效）">${icon('plus', 13)}加号（设备码）</button>
      <button class="btn small" data-acct-add="codex-browser" title="在本机浏览器里打开 OpenAI 登录页（codex login）">${icon('plus', 13)}加号（本机浏览器）</button>
      <button class="btn small" data-acct-add="codex-local" title="把 ~/.codex 里你自己的登录登记成默认号（只登记，不复制）">登记本机登录</button>`);
   const gm = cliAccts('gemini'), g = gm[0], gq = (g && g.quota) || {};
@@ -1875,7 +1883,7 @@ function acctPageHtml() {
     oc.today != null || oc.week != null ? `<div class="vd-q"><div class="vd-qr"><span>今日花费</span><b class="vd-unk">$${Number(oc.today || 0).toFixed(2)}</b></div><div class="vd-qr"><span>本周花费</span><b class="vd-unk">$${Number(oc.week || 0).toFixed(2)}</b></div></div>`
       : `<div class="hint">${V.opencode && V.opencode.installed === false ? '没装 OpenCode' : '还没有花费数据'}</div>`);
   const rules = vendCard('rules', '选号与体检', '',
-    `<ul class="vd-rules"><li><b>Codex 选号</b>：对话 ⚙ 里指定的号 &gt; 开工卡上定的号 &gt; 自动（状态正常、没禁用、额度剩得最多；一样多时默认号优先）。只在新会话开工时选，会话中途不换号。</li>
+    `<ul class="vd-rules"><li><b>Codex 选号</b>：对话 ⚙ 里指定的号 &gt; 开工卡上定的号 &gt; 自动（状态正常、没禁用、额度剩得最多；一样多时默认号优先）。API 号仅手动选择或设为默认时使用。只在新会话开工时选，会话中途不换号。</li>
       <li><b>体检</b>：后台每 10 分钟（Gemini）/ 30 分钟（Codex）一次：Gemini 快过期前用 RT 续期并查额度；Codex 读登录状态，麻薯自己持有的号超过 7 天没续期就续一次（本机号让 Codex 自己续）。</li>
       <li><b>令牌</b>：只存在 <code>state/accounts/</code>（0600）和各自的登录文件里，页面和日志里不显示。删掉 <code>state/accounts/</code> 就回到单号。</li>
       <li><b>风险</b>：号由你自己提供；多号轮换可能违反服务条款、有封号风险（Gemini 因此只留单号）。</li></ul>`,
@@ -1932,6 +1940,16 @@ document.addEventListener('click', async (ev) => {
     if (ca) { b.textContent = '体检中…'; await acctApi({ action: 'check-all' }); await acctRefresh(); return; }
     if (add) {
       const k = add.dataset.acctAdd;
+      if (k === 'codex-api') {
+        openModal(`<h2>加 Codex API 号</h2><div class="form api-form"><label>名称<input id="apiName" autocomplete="off"></label><label>请求地址<input id="apiBase" placeholder="https://example.com/v1" autocomplete="off"></label><label>API key<input id="apiKey" type="password" autocomplete="off"></label><p class="hint">保存前会检查模型列表；使用此号按量计费。</p><div class="api-actions"><button class="btn" data-close>取消</button><button class="btn primary" id="apiSave">测试并保存</button></div></div>`);
+        $('#modalBox').classList.add('api-dialog');
+        $('#apiSave').onclick = async () => {
+          const button = $('#apiSave'); button.disabled = true;
+          try { await acctApi({ action: 'add-codex-api', name: $('#apiName').value, base_url: $('#apiBase').value, api_key: $('#apiKey').value }); closeModal(); await acctRefresh(); }
+          catch (e) { toast(e.message); } finally { button.disabled = false; }
+        };
+        return;
+      }
       if (k === 'codex-local' || k === 'gemini-local') { await acctApi({ action: 'import-local', platform: k.split('-')[0] }); await acctRefresh(); return; }
       if (k === 'codex-device' || k === 'codex-browser') return await acctStartJob({ action: 'add-codex', device: k === 'codex-device' }, 'codex');
     }
@@ -2265,7 +2283,7 @@ async function renderSelfIter() {
 
 // ---------- 弹窗 ----------
 function openModal(html) { $('#modalBox').innerHTML = html; $('#modal').hidden = false; }
-function closeModal() { $('#modal').hidden = true; zoomCam = null; $('#modalBox').innerHTML = ''; $('#modalBox').classList.remove('wide'); if (view === 'wall') refreshScreens(); }
+function closeModal() { $('#modal').hidden = true; zoomCam = null; $('#modalBox').innerHTML = ''; $('#modalBox').classList.remove('wide', 'api-dialog'); if (view === 'wall') refreshScreens(); }
 function greenlightModal() {
   openModal(`<h2>登记项目：把一个工程文件夹交给麻薯电脑秘书</h2>
     <div class="form"><input id="glPath" placeholder="工程文件夹路径，例如 ~/workspace/my-app"><input id="glTitle" placeholder="项目名（可选，默认用文件夹名）">
@@ -2278,6 +2296,7 @@ function pitchModal(fid) {
   openModal(`<h2>${esc(f.title)} · 新功能</h2><div class="form">
     <input id="ptSlug" placeholder="英文短名，例如 export-csv"><input id="ptTitle" placeholder="中文标题（可选）">
     <textarea id="ptBrief" placeholder="需求：要做什么、为什么、已知信息"></textarea>
+    ${cliAccts('codex').length ? `<label class="api-field">执行者使用的 Codex 账号（可选）<select id="ptCodexAccount">${acctOpts('codex', '')}</select></label>` : ''}
     ${(f.playbook.stages || []).length > 1 ? `<label class="hint" style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="ptFlow" style="width:auto">按项目工作流「${esc(f.playbook.name)}」分阶段：${esc(f.playbook.stages.join(' → '))}</label>` : ''}
     <div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn" data-close>取消</button><button class="btn primary" id="ptGo" data-film="${esc(fid)}">创建</button></div></div>
     <p class="hint" style="margin-top:14px">默认直接做：一个执行者从头做到尾，不分阶段。一般更推荐直接跟麻薯说，她会交给这个项目的子脑安排。</p>`);
@@ -2452,6 +2471,17 @@ async function setPref(kind, v) {
 }
 async function sessAction(btn) {
   const kind = btn.dataset.sess;
+  if (kind === 'new-session' && chProvider(current) === 'codex' && cliAccts('codex').length) {
+    const ch = current, selected = ((state.prefs || {})[ch] || {}).xacct || '';
+    openModal(`<h2>新会话</h2><div class="form api-form"><p>新会话不会带上当前对话上下文。</p><label>Codex 账号<select id="newSessionAccount">${acctOpts('codex', selected)}</select></label><div class="api-actions"><button class="btn" data-close>取消</button><button class="btn primary" id="newSessionGo">开始新会话</button></div></div>`);
+    $('#modalBox').classList.add('api-dialog');
+    $('#newSessionGo').onclick = async () => {
+      const button = $('#newSessionGo'); button.disabled = true;
+      try { await api('/api/camera', { action: 'pref', channel: ch, xacct: $('#newSessionAccount').value }); await api('/api/camera', { action: 'new-session', channel: ch }); closeModal(); await refresh(); }
+      catch (e) { toast(e.message); button.disabled = false; }
+    };
+    return;
+  }
   if (kind === 'new-session' && !btn.classList.contains('confirm')) {     // 新会话会丢掉当前对话上下文：点两下确认
     const html = btn.innerHTML;
     btn.classList.add('confirm'); btn.textContent = '再点一次确认';
@@ -2653,7 +2683,7 @@ document.addEventListener('click', async (ev) => {
   }
   if (t.id === 'ptGo') {
     try {
-      const d = await api('/api/pitch', { film: t.dataset.film, slug: $('#ptSlug').value.trim(), title: $('#ptTitle').value.trim(), brief: $('#ptBrief').value.trim(), workflow: !!$('#ptFlow')?.checked });
+      const d = await api('/api/pitch', { film: t.dataset.film, slug: $('#ptSlug').value.trim(), title: $('#ptTitle').value.trim(), brief: $('#ptBrief').value.trim(), workflow: !!$('#ptFlow')?.checked, cli_account: $('#ptCodexAccount')?.value || '' });
       closeModal(); toast(`方案执行者「${d.crew}」排队中`); await refresh(); go(`${t.dataset.film}/${d.key}`);
     } catch (e) { toast(e.message); }
   }
