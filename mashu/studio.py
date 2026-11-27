@@ -3321,7 +3321,8 @@ def infer_msg_type(r):
 
 
 def report_superseded_by(conn, r):
-    m = json.loads(r.get('meta') or '{}')
+    m = r.get('meta') or '{}'
+    m = m if isinstance(m, dict) else json.loads(m)
     if m.get('superseded_by'):
         return m['superseded_by']
     row = one(conn, 'SELECT id FROM reports WHERE supersedes=? ORDER BY id DESC LIMIT 1', r['id'])
