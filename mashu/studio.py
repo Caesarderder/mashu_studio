@@ -5268,6 +5268,37 @@ def crew_linger_guard(conn):
             notice(conn, channel_of(c), f'「{c["name"]}」收工：{why}')
 
 
+BG_WAKE_GRACE = 300       # 还有别的后台任务在跑时，最早结束的那个等满这么久也叫醒
+
+
+def bg_done_wake(conn, alive=None):
+    """Codex / Gemini / OpenCode 后台任务结束不会自己唤起会话（Claude 会）：空闲会话在上一轮结束后有后台任务跑完，
+    且没有别的还在跑（或最早结束的已等满 BG_WAKE_GRACE），就投一句提醒。同一段空闲只叫一次（meta 记 last_stop）。
+    （11-27 caesar #15「橄榄树」lockf 测量 16:50 前跑完，空闲到 18:01 才被手动叫醒，caesar #431）"""
+    alive = alive_panes() if alive is None else alive
+    now = time.time()
+    for c in rows(conn, f'SELECT * FROM cameras WHERE state IN {LIVE} AND last_stop>=last_active AND wrap_reason IS NULL'):
+        if c['pane'] not in alive or not c['last_stop'] or cam_provider(conn, c) == 'claude':
+            continue
+        key = f'bgwake:{c["id"]}'
+        if meta_get(conn, key) == repr(c['last_stop']):
+            continue
+        d = live_detail_of(conn, c)
+        items = (d.get('shells') or []) + (d.get('agents') or [])
+        running = [x for x in items if x.get('state') == 'running']
+        ended = [x for x in items if x.get('state') != 'running' and (x.get('end') or 0) > c['last_stop'] + 1]
+        if not ended:
+            continue
+        if running and now - min(x['end'] for x in ended) < BG_WAKE_GRACE:
+            continue
+        meta_set(conn, key, repr(c['last_stop']))
+        names = '、'.join(dict.fromkeys(str(x.get('desc') or x.get('tool') or '后台任务').splitlines()[0][:40] for x in ended))
+        rest = f'；还有 {len(running)} 个在跑' if running else ''
+        post(conn, 'system', channel_of(c), 'notice', f'后台任务已结束（{names}{rest}），请核对结果并继续',
+             target=target_of(c))
+        log_event(conn, 'bg-wake', c, ended=len(ended), running=len(running))
+
+
 def report_timeouts(conn):
     for r in rows(conn, 'SELECT * FROM reports WHERE status="open" AND holder IN ("producer","assistant")'):
         minutes = cfg('urgent_timeout_minutes') if (r['gate'] or r['kind'] == 'confirm') else cfg('report_timeout_minutes')
@@ -5570,6 +5601,7 @@ def _tick(conn):
         if c['last_stop'] >= c['last_active']:
             handle_wrap(conn, c)
     crew_linger_guard(conn)
+    bg_done_wake(conn, alive)
     adapters_tick(conn, threaded=ADAPTER_THREADED)
     accounts_tick(conn)
     refresh_running_usage(conn)

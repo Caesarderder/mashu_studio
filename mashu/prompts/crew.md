@@ -13,6 +13,7 @@
 - 做完：`mashu feature set <阶段号> 已完成` → `mashu handoff --now … --next … --files … --docs "回写节点或理由"` → `mashu finish --reason "完成"`。
 - 75% 上下文交接：`mashu handoff …`（写到 `{{handoff}}`）→ `mashu finish --reason "上下文交接"`。
 - 暂停或等外部事件（不起轮询 / sleep / watch）：`mashu feature block --text "等…"` 再 `finish`；继续时先 `mashu feature block --clear`。
+- 后台任务：CLI 自带的后台命令结束后调度器会叫醒你；用 `nohup` / `lockf` / `&` 脱离跟踪的，命令末尾接 `; mashu note {{film}}/{{seq}} "后台任务 X 已结束"` 自己叫醒自己。
 
 ## 消息与回复
 
