@@ -566,13 +566,59 @@ function quotaStaleTag(at) {
   return `<i class="q-rst" title="${age} 分钟前的数据">·${s}</i>`;
 }
 // 账号池：左下角显示默认号（Gemini 是本机当前号）的数字，悬停列出所有号
+function geminiQuotaReal(q) {
+  return Boolean(q && q.source !== 'api_placeholder' && q.remaining != null);
+}
+function geminiPrimaryWindows(q) {
+  const groups = (q && q.groups) || [];
+  let g = groups.find((x) => /gemini/i.test(x.label || x.name || '')) || groups[0];
+  let h5 = null, wk = null;
+  if (g && Array.isArray(g.buckets)) {
+    h5 = g.buckets.find((b) => b.window === '5h') || null;
+    wk = g.buckets.find((b) => b.window === 'weekly') || null;
+  }
+  if (!h5 && !wk && Array.isArray(q && q.models)) {
+    const gm = q.models.filter((m) => /gemini/i.test(m.group || m.name || ''));
+    const list = gm.length ? gm : q.models;
+    h5 = list.find((m) => m.window === '5h' || /5\s*小时/.test(m.name || '')) || null;
+    wk = list.find((m) => m.window === 'weekly' || /每周/.test(m.name || '')) || null;
+  }
+  return { h5, wk };
+}
+function geminiAgeLabel(at, force = false) {
+  if (!at) return '';
+  const age = Math.round((Date.now() / 1000 - at) / 60);
+  if (!force && age < 15) return '';
+  const mins = Math.max(1, age);
+  if (force) return mins >= 60 ? `${Math.floor(mins / 60)} 小时前` : `${mins} 分钟前`;
+  return mins >= 60 ? `${Math.floor(mins / 60)}h前` : `${mins}分前`;
+}
+function geminiQuotaTip(q, err = '') {
+  const lines = ((q && q.models) || []).map((m) => `${m.name} 剩 ${Math.round(m.remaining * 100)}%${m.reset ? `（${resetText(m.reset)}）` : ''}`);
+  if (q && q.at) {
+    const mins = Math.max(0, Math.round((Date.now() / 1000 - q.at) / 60));
+    if (mins >= 1) lines.push(`更新于 ${mins} 分钟前`);
+  }
+  if (err) lines.push(err);
+  return lines.join('\n');
+}
 function acctTip(data) {
   const list = (data && data.accounts) || [];
   if (!list.length) return '';
   return list.map((a) => {
     const q = a.quota || {};
-    const v = q.billing === 'usage' ? '按量' : q.remaining != null ? `剩 ${Math.round(q.remaining * 100)}%` : [q.five_hour && q.five_hour.used_percentage != null ? `5h ${Math.round(q.five_hour.used_percentage)}%` : '',
-      q.seven_day && q.seven_day.used_percentage != null ? `周 ${Math.round(q.seven_day.used_percentage)}%` : ''].filter(Boolean).join(' ') || '额度未知';
+    let v = '';
+    if (q.billing === 'usage') v = '按量';
+    else if (q.source === 'api_placeholder') v = '额度未知';
+    else if (q.remaining != null) {
+      const w = geminiPrimaryWindows(q);
+      v = (w.h5 || w.wk)
+        ? [w.h5 ? `5 小时剩 ${Math.round(w.h5.remaining * 100)}%` : '', w.wk ? `周剩 ${Math.round(w.wk.remaining * 100)}%` : ''].filter(Boolean).join(' · ')
+        : `剩 ${Math.round(q.remaining * 100)}%`;
+    } else {
+      v = [q.five_hour && q.five_hour.used_percentage != null ? `5h ${Math.round(q.five_hour.used_percentage)}%` : '',
+        q.seven_day && q.seven_day.used_percentage != null ? `周 ${Math.round(q.seven_day.used_percentage)}%` : ''].filter(Boolean).join(' ') || '额度未知';
+    }
     return `${a.id === data.account ? '▶ ' : '   '}${acctName(a)}：${v}${a.disabled ? '（禁用）' : a.status !== 'ok' ? `（${a.status_cn}）` : ''}`;
   }).join('\n');
 }
@@ -632,19 +678,35 @@ function renderGeminiRow(data) {
   if (data.installed === false) {
     return `<div class="q-plat-row q-dim" title="Gemini (agy) 未安装"><span class="q-plat-name">Gemini</span><span class="q-plat-vals">未安装</span></div>`;
   }
-  if (data.available && data.remaining != null) {
+  if (data.available && geminiQuotaReal(data)) {
+    const w = geminiPrimaryWindows(data);
+    const stale = geminiAgeLabel(data.at, Boolean(data.error));
+    const staleHtml = stale ? `<i class="q-rst" title="${esc(data.error || `${stale}的数据`)}">·${esc(stale)}</i>` : '';
+    const rowTip = geminiQuotaTip(data, data.error) || acctTip(data);
+    if (w.h5 || w.wk) {
+      const part = (label, b) => {
+        if (!b || b.remaining == null) return '';
+        const r = Math.round(b.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
+        const tDesc = b.reset ? `，${resetText(b.reset)}` : '';
+        return `<span class="q-item ${cls}" title="Gemini ${label}窗口剩余 ${r}%${tDesc}">${label}<b>${r}%</b></span>`;
+      };
+      const items = [part('5 小时剩 ', w.h5), part('周剩 ', w.wk)].filter(Boolean).join('<span class="q-sep">·</span>');
+      return `<div class="q-plat-row" title="${esc(rowTip)}">
+        <span class="q-plat-name">Gemini${acctBadge(data)}</span>
+        <span class="q-plat-vals q-gm-vals">${items}${staleHtml}</span></div>`;
+    }
     const r = Math.round(data.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
-    return `<div class="q-plat-row" title="${esc(acctTip(data))}">
+    return `<div class="q-plat-row" title="${esc(rowTip)}">
       <span class="q-plat-name">Gemini${acctBadge(data)}</span>
       <span class="q-plat-vals">
-        <span class="q-item ${cls}" title="各模型里剩得最少的${data.low_model ? `：${esc(data.low_model)}` : ''}${data.reset ? `，${resetText(data.reset)}` : ''}">剩 <b>${r}%</b>${data.reset ? `<i class="q-rst">·${resetCompact(data.reset)}</i>` : ''}</span>
-        ${quotaStaleTag(data.at)}
+        <span class="q-item ${cls}" title="各组里剩得最少的${data.low_model ? `：${esc(data.low_model)}` : ''}${data.reset ? `，${resetText(data.reset)}` : ''}">剩 <b>${r}%</b>${data.reset ? `<i class="q-rst">·${resetCompact(data.reset)}</i>` : ''}</span>
+        ${staleHtml}
       </span></div>`;
   }
-  const reason = data.reason || 'agy CLI 未提供额度查询接口';
+  const reason = data.reason || (data.source === 'api_placeholder' ? '未能从 agy /quota 获取真实额度（旧接口仅返回占位值）' : 'agy /quota 暂无额度数据');
   return `<div class="q-plat-row" title="Gemini：${esc(reason)}">
     <span class="q-plat-name">Gemini</span>
-    <span class="q-plat-vals q-dim">无额度数据</span>
+    <span class="q-plat-vals q-dim">额度未知</span>
   </div>`;
 }
 function quotaHtml() {
@@ -1510,9 +1572,15 @@ function detailHtml(d) {
   const cwd = (ws.current_dir || st.cwd || '').replace(/^\/Users\/[^/]+/, '~');
   const chip = (k, v, t = '') => v === '' || v == null ? '' : `<span class="sd-chip" ${t ? `title="${esc(t)}"` : ''}><i>${esc(k)}</i>${esc(v)}</span>`;
   const lim = (k, x) => x && x.used_percentage != null ? chip(k, `${Math.round(x.used_percentage)}%`, resetIn(x.resets_at)) : '';
+  const gmWin = d.provider === 'gemini' && geminiQuotaReal(L) ? geminiPrimaryWindows(L) : null;
   const limChips = d.provider === 'gemini'
-    ? [L.remaining != null ? chip('额度', `剩 ${Math.round(L.remaining * 100)}%`,
-        [L.low_model ? `最低 ${L.low_model}` : '', L.reset ? resetText(L.reset) : ''].filter(Boolean).join(' · ')) : '']
+    ? [geminiQuotaReal(L)
+        ? chip('额度',
+            (gmWin && (gmWin.h5 || gmWin.wk))
+              ? [gmWin.h5 ? `5 小时剩 ${Math.round(gmWin.h5.remaining * 100)}%` : '', gmWin.wk ? `周剩 ${Math.round(gmWin.wk.remaining * 100)}%` : ''].filter(Boolean).join(' · ')
+              : `剩 ${Math.round(L.remaining * 100)}%`,
+            geminiQuotaTip(L, L.error) || [L.low_model ? `最低 ${L.low_model}` : '', L.reset ? resetText(L.reset) : ''].filter(Boolean).join(' · '))
+        : L.source === 'api_placeholder' ? chip('额度', '额度未知', '未能从 agy /quota 获取真实额度') : '']
     : (d.provider === 'opencode'
       ? [L.today != null ? chip('今日花费', `$${(+L.today).toFixed(2)}`, L.week != null ? `本周 $${(+L.week).toFixed(2)}` : '') : '',
         L.week != null ? chip('本周花费', `$${(+L.week).toFixed(2)}`) : '']
@@ -2075,10 +2143,24 @@ function acctQuota(a) {
   const q = a.quota || {};
   if (a.kind === 'api') return '<span>按量</span>';
   if (a.platform === 'gemini') {
-    if (q.remaining == null) return '<span class="q-dim">额度未知</span>';
+    if (!geminiQuotaReal(q)) return '<span class="q-dim">额度未知</span>';
+    const w = geminiPrimaryWindows(q);
+    const stale = geminiAgeLabel(q.at, Boolean(a.error));
+    const tip = geminiQuotaTip(q, a.error);
+    if (w.h5 || w.wk) {
+      const parts = [];
+      if (w.h5) {
+        const r = Math.round(w.h5.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
+        parts.push(`<span class="q-item ${cls}">5 小时剩 <b>${r}%</b></span>`);
+      }
+      if (w.wk) {
+        const r = Math.round(w.wk.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
+        parts.push(`<span class="q-item ${cls}">周剩 <b>${r}%</b></span>`);
+      }
+      return `<span class="q-gm-inline" title="${esc(tip)}">${parts.join('<span class="q-sep">·</span>')}${stale ? `<i class="q-rst">（${esc(stale)}）</i>` : ''}</span>`;
+    }
     const r = Math.round(q.remaining * 100), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
-    const models = (q.models || []).map((m) => `${m.name} 剩 ${Math.round(m.remaining * 100)}%${m.reset ? `（${resetText(m.reset)}）` : ''}`).join('\n');
-    return `<span class="q-item ${cls}" title="${esc(models || '')}">最低剩 <b>${r}%</b>${q.low_model ? ` · ${esc(q.low_model)}` : ''}</span>`;
+    return `<span class="q-item ${cls}" title="${esc(tip)}">最低剩 <b>${r}%</b>${q.low_model ? ` · ${esc(q.low_model)}` : ''}${stale ? `<i class="q-rst">（${esc(stale)}）</i>` : ''}</span>`;
   }
   const it = (label, w) => {
     if (!w || w.used_percentage == null) return '';
@@ -2128,6 +2210,14 @@ function quotaBars(rows) {
     if (pctUsed == null) return `<div class="vd-qr"><span>${esc(label)}</span><span class="q-dim vd-unk">${esc(tip || '未知')}</span></div>`;
     const p = Math.max(0, Math.min(100, Math.round(pctUsed))), cls = p >= 90 ? 'hi' : p >= 70 ? 'mid' : '';
     return `<div class="vd-qr" title="${esc(tip || '')}"><span>${esc(label)}</span><i class="vd-bar ${cls}"><i style="width:${p}%"></i></i><b class="${cls}">已用 ${p}%</b><span class="q-dim">${esc(tip || '')}</span></div>`;
+  }).join('')}</div>`;
+}
+function geminiQuotaBars(models) {
+  return `<div class="vd-q">${models.map((m) => {
+    if (m.remaining == null) return `<div class="vd-qr"><span>${esc(m.name)}</span><span class="q-dim vd-unk">额度未知</span></div>`;
+    const r = Math.max(0, Math.min(100, Math.round(m.remaining * 100))), cls = r <= 10 ? 'hi' : r <= 30 ? 'mid' : '';
+    const tip = m.reset ? resetText(m.reset) : '';
+    return `<div class="vd-qr" title="${esc(tip || m.name)}"><span>${esc(m.name)}</span><i class="vd-bar ${cls}"><i style="width:${r}%"></i></i><b class="${cls}">剩 ${r}%</b><span class="q-dim">${esc(tip)}</span></div>`;
   }).join('')}</div>`;
 }
 function presetsSectionHtml() {
@@ -2260,9 +2350,14 @@ function acctPageHtml() {
      <button class="btn small" data-acct-add="codex-browser" title="在本机浏览器里打开 OpenAI 登录页（codex login）">${icon('plus', 13)}加号（本机浏览器）</button>
      <button class="btn small" data-acct-add="codex-local" title="把 ~/.codex 里你自己的登录登记成默认号（只登记，不复制）">登记本机登录</button>`);
   const gm = cliAccts('gemini'), g = gm[0], gq = (g && g.quota) || {};
-  const gemini = vendCard('gemini', 'Gemini（agy）', '只管本机 agy 当前登录的这一个号：后台用 RT 续期、查额度；不加第二个号、不切号（Google 在封第三方工具走 Antigravity 登录、多号轮换的号）。要换号就自己在终端运行 agy 重新登录，麻薯会自动跟上',
-    (g ? acctRow(g) : '<div class="hint">还没登记：点「登记 / 同步本机 agy 登录」</div>')
-    + ((gq.models || []).length ? `<details class="vd-models"><summary>各模型剩余额度（${gq.models.length} 个，最低的是 ${esc(gq.low_model || '')}）</summary>${quotaBars(gq.models.map((m) => [m.name, (1 - m.remaining) * 100, m.reset ? resetText(m.reset) : '']))}</details>` : ''),
+  const gmReal = geminiQuotaReal(gq);
+  const gmAge = gmReal ? geminiAgeLabel(gq.at, Boolean(g && g.error)) : '';
+  const gmBody = !g ? '<div class="hint">还没登记：点「登记 / 同步本机 agy 登录」</div>'
+    : acctRow(g) + (gmReal && (gq.models || []).length
+      ? `<details class="vd-models" open><summary>各组剩余额度（${gq.models.length} 个窗口，最低的是 ${esc(gq.low_model || '')}${gmAge ? ` · ${esc(gmAge)}` : ''}）</summary>${geminiQuotaBars(gq.models)}</details>`
+      : `<div class="hint">额度未知${g.error ? `（${esc(g.error)}）` : '（未能从 agy /quota 获取真实额度）'}</div>`);
+  const gemini = vendCard('gemini', 'Gemini（agy）', '只管本机 agy 当前登录的这一个号：后台用 RT 续期，通过 agy /quota 查各组剩余额度；不加第二个号、不切号（Google 在封第三方工具走 Antigravity 登录、多号轮换的号）。要换号就自己在终端运行 agy 重新登录，麻薯会自动跟上',
+    gmBody,
     `<button class="btn small" data-acct-add="gemini-local" title="把本机 agy 现在的登录（钥匙串）登记进来；已经登记过的会换成现在这个号">登记 / 同步本机 agy 登录</button>`);
   const opencode = vendCard('opencode', 'OpenCode', '按量付费，没有账号额度；提供方和密钥在 OpenCode 自己的配置里',
     oc.today != null || oc.week != null ? `<div class="vd-q"><div class="vd-qr"><span>今日花费</span><b class="vd-unk">$${Number(oc.today || 0).toFixed(2)}</b></div><div class="vd-qr"><span>本周花费</span><b class="vd-unk">$${Number(oc.week || 0).toFixed(2)}</b></div></div>`

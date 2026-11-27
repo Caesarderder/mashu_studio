@@ -2264,8 +2264,21 @@ def accounts_check(force=False, only=None):
             if a['platform'] == 'gemini':
                 if a.get('status') == 'revoked' and not force:
                     continue
+                prev_q = a.get('quota') if isinstance(a.get('quota'), dict) else None
                 b = gemini_ops().check(a['id'])
-                res.append((a['id'], f'{b["status"]}' + (f'，额度剩 {round(b["quota"]["remaining"] * 100)}%' if (b.get('quota') or {}).get('remaining') is not None else '')))
+                bq = b.get('quota') or {}
+                if (prev_q and prev_q.get('source') == 'agy_cli' and prev_q.get('remaining') is not None
+                        and (not bq or bq.get('source') == 'api_placeholder')):
+                    b = p.update(a['id'], quota=prev_q)
+                    bq = prev_q
+                if bq.get('remaining') is not None and bq.get('source') != 'api_placeholder':
+                    age = ''
+                    if b.get('error') and bq.get('at'):
+                        mins = max(1, round((time.time() - bq['at']) / 60))
+                        age = f'（{mins} 分钟前，刷新失败保留旧值）'
+                    res.append((a['id'], f'{b["status"]}，额度剩 {round(bq["remaining"] * 100)}%{age}'))
+                else:
+                    res.append((a['id'], f'{b["status"]}，额度未知' + (f'（{b["error"]}）' if b.get('error') else '')))
                 continue
             home = codex_acct_home(a)
             if a.get('source') != 'local':
@@ -5872,9 +5885,11 @@ def session_limits_for(conn, cam, prov, all_limits=None):
         if hit and isinstance(hit.get('quota'), dict):
             q = hit['quota']
             return dict(available=q.get('remaining') is not None, remaining=q.get('remaining'), reset=q.get('reset'),
-                        low_model=q.get('low_model'), at=q.get('at'), account=hit.get('id'))
+                        low_model=q.get('low_model'), source=q.get('source') or '', groups=q.get('groups') or [],
+                        models=q.get('models') or [], error=hit.get('error') or '', at=q.get('at'), account=hit.get('id'))
         return dict(available=bool(gm.get('available')), remaining=gm.get('remaining'), reset=gm.get('reset'),
-                    low_model=gm.get('low_model'), at=gm.get('at'), account=aid or gm.get('account'),
+                    low_model=gm.get('low_model'), source=gm.get('source') or '', groups=gm.get('groups') or [],
+                    models=gm.get('models') or [], error=gm.get('error') or '', at=gm.get('at'), account=aid or gm.get('account'),
                     reason=gm.get('reason') or '')
     if prov == 'opencode':
         oc = L.get('opencode') if isinstance(L.get('opencode'), dict) else {}
@@ -7167,7 +7182,7 @@ def collect_limits(home=None):
     gemini_data = {
         'installed': gemini_installed,
         'available': False,
-        'reason': 'agy CLI 不报额度：到「模型池」登记本机 agy 登录，麻薯用它查各模型剩余额度',
+        'reason': 'agy CLI 不报额度：到「模型池」登记本机 agy 登录，麻薯通过 agy /quota 查各组剩余额度',
     }
 
     # 5. 账号池（#4）：Codex、Gemini 显示默认号的数字，accounts 里是所有号（悬停显示）
@@ -7175,7 +7190,7 @@ def collect_limits(home=None):
         accs = cli_accounts() if home is None else []
     except Exception:
         accs = []
-    brief = lambda a: {k: a.get(k) for k in ('id', 'label', 'email', 'plan', 'kind', 'status', 'status_cn', 'disabled', 'default', 'active', 'quota', 'used', 'source')}  # noqa: E731
+    brief = lambda a: {k: a.get(k) for k in ('id', 'label', 'email', 'plan', 'kind', 'status', 'status_cn', 'disabled', 'default', 'active', 'quota', 'used', 'source', 'error')}  # noqa: E731
     cx = [a for a in accs if a['platform'] == 'codex']
     if cx:
         d = next((a for a in cx if a['default']), cx[0])
@@ -7184,9 +7199,12 @@ def collect_limits(home=None):
     if gm:
         d = next((a for a in gm if a.get('active')), None) or next((a for a in gm if a['default']), gm[0])
         q = d.get('quota') or {}
+        src = q.get('source') or ''
         gemini_data = dict(installed=True, available=q.get('remaining') is not None, remaining=q.get('remaining'), reset=q.get('reset'),
-                           low_model=q.get('low_model'), at=q.get('at'), account=d['id'], accounts=[brief(a) for a in gm],
-                           reason='' if q.get('remaining') is not None else f'{account_label(d)} 还没查到额度（{d.get("status_cn")}）')
+                           low_model=q.get('low_model'), source=src, groups=q.get('groups') or [], models=q.get('models') or [],
+                           error=d.get('error') or '', at=q.get('at'), account=d['id'], accounts=[brief(a) for a in gm],
+                           reason=('未能从 agy /quota 获取真实额度（旧接口仅返回占位值）' if src == 'api_placeholder'
+                                   else '' if q.get('remaining') is not None else f'{account_label(d)} 还没查到额度（{d.get("status_cn")}）'))
 
     res = {
         'claude': claude_data if claude_data else {'installed': True, 'waiting': True},
@@ -10106,7 +10124,20 @@ def fmt_account(a):
     if a.get('kind') == 'api':
         qs = '按量'
     elif a['platform'] == 'gemini':
-        qs = f'剩 {round(q["remaining"] * 100)}%（{q.get("low_model") or ""}）' if q.get('remaining') is not None else '额度未知'
+        if q.get('source') == 'api_placeholder' or q.get('remaining') is None:
+            qs = '额度未知'
+        elif q.get('groups'):
+            gparts = []
+            for g in q['groups']:
+                bs = [f'{b.get("window_label") or b.get("window") or ""}剩 {round(b["remaining"] * 100)}%'
+                      for b in (g.get('buckets') or []) if b.get('remaining') is not None]
+                if bs:
+                    gparts.append(f'{g.get("label") or g.get("name") or ""}：{" / ".join(bs)}')
+            qs = '；'.join(gparts) or f'剩 {round(q["remaining"] * 100)}%'
+            if a.get('error') and q.get('at'):
+                qs += f'（{max(1, round((time.time() - q["at"]) / 60))} 分钟前）'
+        else:
+            qs = f'剩 {round(q["remaining"] * 100)}%' + (f'（{q.get("low_model")}）' if q.get('low_model') else '')
     else:
         parts = [f'{k} 用了 {round(w["used_percentage"])}%' for k, w in (('5h', q.get('five_hour')), ('周', q.get('seven_day')))
                  if isinstance(w, dict) and w.get('used_percentage') is not None]

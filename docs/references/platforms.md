@@ -16,6 +16,7 @@ validated_by:
   - tests/test_platforms.py
   - tests/test_live_parsers.py
   - tests/test_accounts.py
+  - tests/test_gemini_quota.py
   - tests/test_config_file.py
   - manual-real-session
 tags:
@@ -99,7 +100,7 @@ related:
 - **Claude**：来自受管会话状态栏回报的 `rate_limits`，写入 `state/ratelimits.json`；包含 5 小时（`five_hour`）与本周（`seven_day`）的百分比及重置时间。
 - **Codex**：来自 rollout 会话记录（`state/codex-home/sessions` 与 `~/.codex/sessions`）中 `token_count` 事件携带的 `rate_limits` 字段（`primary` 为 5 小时 300 分钟窗口，`secondary` 为周 10080 分钟窗口）。只读扫描最新 rollout 文件。
 - **OpenCode**：按量付费，从本地 `~/.local/share/opencode/opencode.db` 只读汇总今日（0 点起）与本周（周一 0 点起）的会话花费（`cost`）。
-- **Gemini（agy）**：agy CLI 自己不报额度；模型池里有 Gemini 号时，麻薯用它的 RT 换 access_token 调 Code Assist 的 `fetchAvailableModels`，显示各模型里剩得最少的比例（见下节「模型池」）。没导入号时显示「无额度数据」。
+- **Gemini（agy）**：模型池里有本机 Gemini 号时，麻薯优先跑 `agy -p /quota --output-format json`（不耗 token，超时 30 秒），从 `command.data.groups[].buckets[]` 按模型组解析 5 小时与每周两个窗口（1970 重置时间表示未用过，记为空），左下角显示 Gemini 组的「5 小时剩 X% · 周剩 Y%」，模型池卡片按「各组剩余额度」展示各窗口；`agy /quota` 失败或超时时保留上一次真实值并标注时间；旧的 Code Assist `fetchAvailableModels` 对个人号仅返回 100% 占位值，仅作兜底（标 `source: "api_placeholder"`），没有真实值时显示「额度未知」，不显示 100%。
 - **模型池**：Codex 显示默认号的数字，多号时名字后面标「N号」，悬停列出所有号；Gemini 只有本机当前登录这一个号。
 - **服务端节流与缓存**：`studio.read_limits()` 对各平台只读汇总，内存缓存 60 秒，避免前端轮询频繁扫盘或开库；Claude 收到新状态栏时立即失效缓存。
 
@@ -154,7 +155,7 @@ Codex 也支持兼容 OpenAI Responses 的 API 号：在模型池点「加 API �
 ### 额度
 
 - Codex：每个号自己目录里 rollout 的 `rate_limits`（本机号再加 `~/.codex/sessions`），用这个号跑过会话才有。
-- Gemini：`POST cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels`（Bearer access_token），每个有 `displayName` 的模型的 `quotaInfo.remainingFraction` / `resetTime`；账号不能用 agy 聊天（例如要验证账号）时这个接口照样能查。
+- Gemini：优先跑本机 `agy -p /quota --output-format json`（不耗 token，超时 30 秒，仅对本机 agy 当前登录号），按模型组解析 5 小时与每周两个窗口并记录 `source: "agy_cli"` 与 `groups`（`1970-01-01` 重置时间记为空，`remaining` 取所有窗口最低值供备选预设判断）；失败或超时时保留上一次真实额度并标出更新时间；旧的 `POST cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` 对个人号返回 100% 占位值，仅作最后兜底并标 `source: "api_placeholder"`，前端与 CLI 显示「额度未知」。
 
 ### 回滚
 

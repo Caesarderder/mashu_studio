@@ -37,6 +37,7 @@ GOOGLE_SCOPES = ('openid https://www.googleapis.com/auth/cloud-platform https://
 KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT = 'gemini', 'antigravity'
 KEYRING_PREFIX = 'go-keyring-base64:'
 AGY_TOKEN_FILE = Path.home() / '.gemini' / 'jetski-standalone-oauth-token'    # agy 的备用凭据文件（存在才同步改）
+AGY_QUOTA_TIMEOUT = 30
 
 
 class AccountError(ValueError):
@@ -326,9 +327,11 @@ class Pool:
 # ---------- 选号 ----------
 
 def used_pct(a):
-    """这个号额度用掉的百分比（越小越好）：Codex 取 5 小时和本周里大的那个；Gemini 取各模型剩余比例最小的那个。不知道 = None。"""
+    """这个号额度用掉的百分比（越小越好）：Codex 取 5 小时和本周里大的那个；Gemini 取各组窗口剩余比例最小的那个（占位值视为未知）。不知道 = None。"""
     q = (a or {}).get('quota') or {}
     if a.get('platform') == 'gemini':
+        if q.get('source') == 'api_placeholder':
+            return None
         r = q.get('remaining')
         return None if r is None else round((1 - float(r)) * 100, 1)
     return window_used_pct(q)
@@ -540,13 +543,47 @@ class Gemini:
         code, body = http('GET', GOOGLE_USERINFO_URL, headers={'Authorization': f'Bearer {at}'})
         return body if code == 200 and isinstance(body, dict) else {}
 
-    def quota(self, at):
-        """Code Assist 的 fetchAvailableModels：每个模型的剩余比例和重置时间。
-        返回 dict(remaining=最小剩余比例, reset=对应的重置时间戳, models=[{id, name, remaining, reset}], at)。"""
+    def agy_quota(self, timeout=AGY_QUOTA_TIMEOUT):
+        """运行本机 agy -p /quota --output-format json（不耗 token），按模型组解析 5 小时 / 每周两个窗口。"""
+        env = dict(os.environ)
+        env.pop('MASHU_SESSION', None)
+        try:
+            r = subprocess.run([self.agy_exe, '-p', '/quota', '--output-format', 'json'],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            raise AccountError(f'agy /quota 超时（>{timeout} 秒）')
+        except OSError as exc:
+            raise AccountError(f'运行 agy /quota 失败：{exc}')
+        if r.returncode != 0:
+            err = redact((r.stderr or r.stdout or '').strip())[:200]
+            raise AccountError(f'agy /quota 返回错误（退出码 {r.returncode}）' + (f'：{err}' if err else ''))
+        try:
+            body = json.loads(r.stdout or '{}')
+        except ValueError:
+            raise AccountError(f'agy /quota 输出不是合法 JSON：{redact((r.stdout or "").strip())[:160]}')
+        q = parse_agy_quota(body)
+        if q.get('remaining') is None:
+            st = body.get('status') if isinstance(body, dict) else ''
+            raise AccountError(f'agy /quota 未返回有效额度窗口' + (f'（status={st}）' if st else ''))
+        return q
+
+    def quota(self, at=None, *, use_agy=True, allow_fallback=True):
+        """查 Gemini 额度：优先跑本机 agy -p /quota --output-format json（source=agy_cli）；
+        拿不到时再以旧的 fetchAvailableModels 兜底（source=api_placeholder，个人号会返回 100% 占位值）。
+        返回 dict(remaining=最小剩余比例, reset=对应重置时间戳, low_model=组·窗口名, models=[...], groups=[...], source, at)。"""
+        agy_err = ''
+        if use_agy:
+            try:
+                return self.agy_quota()
+            except AccountError as exc:
+                agy_err = str(exc)
+        if not allow_fallback or not at:
+            raise AccountError(agy_err or '查 Gemini 额度失败：缺少 access_token')
         code, body = http('POST', CODE_ASSIST_MODELS_URL, {}, headers={'Authorization': f'Bearer {at}', 'Content-Type': 'application/json',
                                                                        'User-Agent': 'antigravity'})
         if code != 200 or not isinstance(body, dict):
-            raise AccountError(f'查 Gemini 额度失败：HTTP {code} {redact(_err_code(body))}')
+            msg = f'查 Gemini 额度失败：HTTP {code} {redact(_err_code(body))}'
+            raise AccountError(f'{agy_err}；兜底接口也失败：{msg}' if agy_err else msg)
         return parse_quota(body)
 
     # --- 凭据（统一存在主文件 studio.json 里）---
@@ -577,13 +614,27 @@ class Gemini:
             return c['access_token']
 
     def check(self, aid):
-        """体检：续期（需要时）+ 查额度，写回元数据。返回更新后的号。"""
+        """体检：续期（需要时）+ 查额度，写回元数据。agy /quota 失败时保留上一次真实额度。返回更新后的号。"""
         at = self.ensure_token(aid)
+        prev = (self.pool.get(aid) or {}).get('quota')
+        prev_real = isinstance(prev, dict) and prev.get('source') == 'agy_cli' and prev.get('remaining') is not None
+        use_agy = self.active_id() == aid
+        agy_err = ''
+        if use_agy:
+            try:
+                q = self.agy_quota()
+                return self.pool.update(aid, quota=q, last_check=time.time(), error='')
+            except AccountError as exc:
+                agy_err = str(exc)
+                if prev_real:
+                    return self.pool.update(aid, last_check=time.time(), error=f'{agy_err}（保留上次额度）')
         try:
-            q = self.quota(at)
+            q = self.quota(at, use_agy=False)
         except AccountError as exc:
-            return self.pool.update(aid, last_check=time.time(), error=str(exc))
-        return self.pool.update(aid, quota=q, last_check=time.time(), error='')
+            return self.pool.update(aid, last_check=time.time(), error=agy_err or str(exc))
+        if prev_real and q.get('source') == 'api_placeholder':
+            return self.pool.update(aid, last_check=time.time(), error=f'{agy_err or "未能从 agy 获取真实额度"}（保留上次额度）')
+        return self.pool.update(aid, quota=q, last_check=time.time(), error=agy_err)
 
     def import_rt(self, rt, source='rt', extra=None):
         """导入一个 RT：先换一次 access_token 校验，再取邮箱、查额度。同一个邮箱已经在池里就更新它的 RT。返回号。"""
@@ -605,8 +656,16 @@ class Gemini:
         upd = dict(status='ok', error='', email=email, label=email or a.get('label'), last_refresh=time.time(), last_check=time.time())
         if same and source == 'local':
             upd['source'] = 'local'
+        prev_q = (same or {}).get('quota') if isinstance((same or {}).get('quota'), dict) else None
+        prev_real = bool(prev_q and prev_q.get('source') == 'agy_cli' and prev_q.get('remaining') is not None)
+        cur_rt = ((self.kc.read() or {}).get('token') or {}).get('refresh_token')
+        use_agy = bool(cur_rt and rt_hash(cur_rt) == rt_hash(t['refresh_token']))
         try:
-            upd['quota'] = self.quota(t['access_token'])
+            q = self.quota(t['access_token'], use_agy=use_agy)
+            if prev_real and q.get('source') == 'api_placeholder':
+                upd['error'] = 'agy /quota 查询失败（保留上次额度）'
+            else:
+                upd['quota'] = q
         except AccountError as exc:
             upd['error'] = str(exc)
         return self.pool.update(a['id'], **upd)
@@ -709,6 +768,73 @@ class Gemini:
         return self.import_rt(self.exchange_code(got['code'], port, verifier), source='login')
 
 
+def _agy_group_label(name):
+    s = str(name or '').strip()
+    low = s.lower()
+    if 'gemini' in low and 'claude' not in low and 'gpt' not in low:
+        return 'Gemini'
+    if 'claude' in low and 'gpt' in low:
+        return 'Claude/GPT'
+    return re.sub(r'\s+models$', '', s, flags=re.I) or s
+
+
+def _agy_window_label(window, bucket_name=''):
+    w = str(window or '').strip().lower()
+    n = str(bucket_name or '').strip().lower()
+    if w == '5h' or 'five hour' in n:
+        return '5 小时'
+    if w == 'weekly' or 'weekly' in n:
+        return '每周'
+    return str(window or bucket_name or '').strip()
+
+
+def parse_agy_quota(body):
+    """解析 `agy -p /quota --output-format json` 输出：
+    从 command.data.groups[].buckets[] 提取各模型组的 5 小时 / 每周窗口，1970 重置时间记为 None，
+    models 按「组 · 窗口」列出，remaining 取所有窗口最低值，附 source='agy_cli' 和 groups 原始分组。"""
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            body = {}
+    if not isinstance(body, dict):
+        body = {}
+    if body.get('status') and str(body.get('status')).upper() != 'SUCCESS':
+        return dict(remaining=None, reset=None, low_model='', models=[], groups=[], source='agy_cli', at=time.time())
+    data = ((body.get('command') or {}).get('data') if 'command' in body else body) or {}
+    if not isinstance(data, dict):
+        data = {}
+    win_order = {'5h': 0, 'weekly': 1}
+    models, groups = [], []
+    for g in data.get('groups') or []:
+        if not isinstance(g, dict):
+            continue
+        gname = str(g.get('name') or '').strip()
+        glabel = _agy_group_label(gname)
+        raw_buckets = [b for b in (g.get('buckets') or []) if isinstance(b, dict) and b.get('remaining_fraction') is not None]
+        raw_buckets.sort(key=lambda b: win_order.get(str(b.get('window') or '').strip().lower(), 99))
+        buckets = []
+        for b in raw_buckets:
+            try:
+                rem = max(0.0, min(1.0, float(b['remaining_fraction'])))
+            except (TypeError, ValueError):
+                continue
+            rst = _iso_ts(b.get('reset_time'))
+            if rst is not None and rst <= 86400:
+                rst = None
+            win = str(b.get('window') or '').strip()
+            wlabel = _agy_window_label(win, b.get('name') or '')
+            label = f'{glabel} · {wlabel}' if glabel and wlabel else (glabel or wlabel or str(b.get('id') or ''))
+            buckets.append(dict(id=str(b.get('id') or ''), name=str(b.get('name') or ''), window=win,
+                                window_label=wlabel, remaining=rem, reset=rst))
+            models.append(dict(id=str(b.get('id') or ''), name=label, group=glabel, window=win, remaining=rem, reset=rst))
+        if buckets:
+            groups.append(dict(name=gname, label=glabel, description=str(g.get('description') or ''), buckets=buckets))
+    low = min(models, key=lambda x: (x['remaining'], x['reset'] or 0)) if models else None
+    return dict(remaining=low['remaining'] if low else None, reset=low['reset'] if low else None,
+                low_model=low['name'] if low else '', models=models, groups=groups, source='agy_cli', at=time.time())
+
+
 def parse_quota(body):
     models = []
     for mid, m in ((body or {}).get('models') or {}).items():
@@ -721,7 +847,7 @@ def parse_quota(body):
     models.sort(key=lambda x: (x['remaining'], x['reset'] or 0))
     low = models[0] if models else None
     return dict(remaining=low['remaining'] if low else None, reset=low['reset'] if low else None, low_model=low['name'] if low else '',
-                models=models, at=time.time())
+                models=models, source='api_placeholder', at=time.time())
 
 
 class Keychain:
