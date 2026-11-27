@@ -3021,11 +3021,37 @@ function markDoneSeen() {
   s.seen = true;
   api('/api/camera', { action: 'seen', ref: ch }).catch(() => { s.seen = false; fail[ch] = Date.now(); }).finally(() => { markDoneSeen.busy = null; });
 }
+// 有要用户审批 / 处理 / 回复的事时，浏览器标签页图标右上角加红点
+function setFaviconDot(on) {
+  const st = setFaviconDot;
+  if (st.on === on) return;
+  st.on = on;
+  const link = document.querySelector('link[rel="icon"]');
+  if (!link) return;
+  if (!on) { link.href = AVATAR; return; }
+  const draw = () => {
+    if (!st.on) return;
+    try {
+      const c = document.createElement('canvas');
+      c.width = c.height = 64;
+      const g = c.getContext('2d');
+      g.drawImage(st.img, 0, 0, 64, 64);
+      g.beginPath(); g.arc(46, 18, 16, 0, Math.PI * 2);
+      g.fillStyle = '#ff3b30'; g.fill();
+      g.lineWidth = 4; g.strokeStyle = '#fff'; g.stroke();
+      link.href = c.toDataURL('image/png');
+    } catch { /* 画不了就只靠标题里的数字 */ }
+  };
+  if (st.img && st.img.complete) return draw();
+  if (!st.img) { st.img = new Image(); st.img.src = AVATAR; }
+  st.img.addEventListener('load', draw, { once: true });
+}
 function renderAll(stick) {
   markDoneSeen(); markSeen();   // 先记已读再画侧栏，红点立刻消失
   renderSide(); renderHead(); applyProjMode(); renderPendingBar(); renderMessages(stick); renderPanel(); renderTabs(); loadMail();
   const n = state.inbox.length;
   document.title = n ? `(${n}) 麻薯电脑秘书` : '麻薯电脑秘书';
+  setFaviconDot(n > 0);
   const ids = new Set(state.inbox.map((r) => r.id));
   if (renderAll.ids) {
     const fresh = state.inbox.filter((r) => !renderAll.ids.has(r.id));
