@@ -471,9 +471,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/greenlight':
             f, created = studio.greenlight(conn, data.get('path', ''), data.get('id') or None, data.get('title') or None)
             return {'film': f['id'], 'created': created, 'producer': f['producer_name']}
+        if path == '/api/presets':
+            return studio.preset_action(conn, data.get('action') or 'list', data)
         if path == '/api/pitch':
-            aid = (data.get('cli_account') or '').strip()
-            ex = studio.check_exec({'cli': 'codex', 'account': aid}) if aid else None
+            ex_raw = data.get('exec')
+            if isinstance(ex_raw, dict) and ex_raw:
+                ex = studio.check_exec(ex_raw)
+            else:
+                aid = (data.get('cli_account') or '').strip()
+                ex = studio.check_exec({'cli': 'codex', 'account': aid}) if aid else None
             f, key, cam = studio.pitch(conn, data['film'], data['slug'], data['brief'], data.get('title') or None,
                                           workflow=bool(data.get('workflow')), exec_cfg=ex)
             return {'key': key, 'crew': cam['name']}
@@ -506,20 +512,49 @@ class Handler(BaseHTTPRequestHandler):
         if action == 'handoff':
             return studio.request_handoff(conn, studio.camera_of_channel(conn, data.get('channel') or 'assistant'))
         if action == 'new-session':
-            if 'xacct' in data or 'xmodel' in data:
-                studio.set_pref(conn, data.get('channel') or 'assistant', defer=True,
-                                xacct=data.get('xacct'), xmodel=data.get('xmodel'))
-            return studio.fresh_session(conn, data.get('channel') or 'assistant')
+            ch = data.get('channel') or 'assistant'
+            ex = data.get('exec')
+            if isinstance(ex, dict) and ex:
+                pid = (ex.get('preset') or '').strip()
+                cli = (ex.get('cli') or '').strip()
+                if pid:
+                    studio.set_pref(conn, ch, defer=True, preset=pid)
+                else:
+                    # 显式指定了自定义字段（或清除 preset 回到默认）
+                    if ex.get('use_default'):
+                        studio.set_pref(conn, ch, defer=True, preset='')
+                    else:
+                        kw = {}
+                        if cli:
+                            kw['provider'] = cli
+                            mk = studio.MODEL_KEY.get(cli)
+                            if mk and 'model' in ex:
+                                kw[mk] = ex.get('model') or ''
+                        if 'effort' in ex:
+                            kw['effort'] = ex.get('effort') or ''
+                        if cli in studio.ACCT_KEY and 'account' in ex:
+                            kw[studio.ACCT_KEY[cli]] = ex.get('account') or ''
+                        if cli == 'claude' and 'code_mode' in ex:
+                            kw['code'] = 'on' if ex.get('code_mode') else 'off'
+                        if kw:
+                            studio.set_pref(conn, ch, defer=True, **kw)
+            elif any(k in data for k in ('preset', 'xacct', 'xmodel', 'provider', 'model', 'gmodel', 'omodel', 'effort', 'code')):
+                studio.set_pref(conn, ch, defer=True, preset=data.get('preset'), provider=data.get('provider'),
+                                model=data.get('model'), gmodel=data.get('gmodel'), xmodel=data.get('xmodel'),
+                                omodel=data.get('omodel'), effort=data.get('effort'), xacct=data.get('xacct'),
+                                code=data.get('code'))
+            return studio.fresh_session(conn, ch)
         if action == 'defaults':
             return studio.set_defaults(conn, models=data.get('models'), efforts=data.get('efforts'), codes=data.get('codes'),
                                        clear=bool(data.get('clear')), providers=data.get('providers'), gmodels=data.get('gmodels'),
-                                       xmodels=data.get('xmodels'), omodels=data.get('omodels'))
+                                       xmodels=data.get('xmodels'), omodels=data.get('omodels'), role_presets=data.get('role_presets'))
         if action == 'gemini-models':
             return studio.refresh_gemini_models()
         if action == 'opencode-models':
             return studio.refresh_opencode_models()
         if action == 'pref':
-            return studio.set_pref(conn, data.get('channel') or 'assistant', model=data.get('model'), effort=data.get('effort'),
+            return studio.set_pref(conn, data.get('channel') or 'assistant', preset=data.get('preset'),
+                                   model=data.get('model'), effort=data.get('effort'),
                                    code=data.get('code'), provider=data.get('provider'), gmodel=data.get('gmodel'),
                                    xmodel=data.get('xmodel'), omodel=data.get('omodel'), xacct=data.get('xacct'), gacct=data.get('gacct'))
         if action == 'interrupt-all':

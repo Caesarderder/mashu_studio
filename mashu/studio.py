@@ -100,6 +100,7 @@ DEFAULTS = dict(
     opencode_models={},           # 各角色 OpenCode 会话的默认模型（provider/model）；空 = OpenCode 配置里的默认
     stuck_minutes=15,             # 忙碌中的会话这么久屏幕和记录都没变化：标「可能卡住」并提醒用户
     api_retry_max=3,              # 屏幕出现 API 报错时自动发“继续”的最多次数
+    preset_fallback_pct=95,       # 备选预设自动切换阈值：已知额度任一窗口已用 ≥ 该百分比时切到备选预设
     trust_streak=20,              # 某类审批连续原样批准多少次后，提议交给麻薯                    # {"claude-opus-5-5": {"input": 每百万 token 单价, "output":…, "cache_read":…, "cache_write":…}}
 )
 CONFIG_OVERRIDES = {}             # 测试用
@@ -177,13 +178,8 @@ CREATE TABLE IF NOT EXISTS stage_watch(film_id TEXT, seq_key TEXT, statuses TEXT
 
 # ---------- 配置与数据库 ----------
 
-def cfg(key):
-    if key in CONFIG_OVERRIDES:
-        return CONFIG_OVERRIDES[key]
-    env = {'claude': 'MASHU_CLAUDE', 'agy': 'MASHU_AGY', 'codex': 'MASHU_CODEX', 'opencode': 'MASHU_OPENCODE',
-           'tmux_session': 'MASHU_TMUX', 'tmux_socket': 'MASHU_TMUX_SOCKET'}.get(key)
-    if env and os.environ.get(env):
-        return os.environ[env]
+def _studio_cfg():
+    """读主配置 studio.json（带缓存，文件变了自动重读）。"""
     path = HOME / 'studio.json'
     try:
         st = path.stat()
@@ -196,7 +192,17 @@ def cfg(key):
         except ValueError:
             _cfg_cache['data'] = {}
         _cfg_cache['mtime'] = sig
-    return cfgfile.get_setting(_cfg_cache['data'], key, DEFAULTS)
+    return _cfg_cache['data']
+
+
+def cfg(key):
+    if key in CONFIG_OVERRIDES:
+        return CONFIG_OVERRIDES[key]
+    env = {'claude': 'MASHU_CLAUDE', 'agy': 'MASHU_AGY', 'codex': 'MASHU_CODEX', 'opencode': 'MASHU_OPENCODE',
+           'tmux_session': 'MASHU_TMUX', 'tmux_socket': 'MASHU_TMUX_SOCKET'}.get(key)
+    if env and os.environ.get(env):
+        return os.environ[env]
+    return cfgfile.get_setting(_studio_cfg(), key, DEFAULTS)
 
 
 def ensure_migrated():
@@ -1391,7 +1397,10 @@ def pitch(conn, film_id, slug, brief, title=None, by=None, playbook=None, workfl
     elif by:
         notice(conn, f['id'], f'{LEVEL_LABEL.get(by["role"], by["role"])}「{by["name"]}」开了#{num}：{title or slug}，等用户批准开工')
         ex = kickoff_exec(conn, f, key)
-        text = (f'申请开工 {seq_label(f, key)}：{title or slug}\n\n执行者：{exec_label(ex["cli"], ex["model"], ex["effort"])}\n\n需求：{brief}'
+        pr_obj = preset_by_id(ex.get('preset')) if ex.get('preset') else None
+        exec_txt = (f'预设「{pr_obj["name"]}」（{exec_label(ex["cli"], ex["model"], ex["effort"])}）' if pr_obj
+                    else exec_label(ex['cli'], ex['model'], ex['effort']))
+        text = (f'申请开工 {seq_label(f, key)}：{title or slug}\n\n执行者：{exec_txt}\n\n需求：{brief}'
                 + (f'\n\n方案（docs/plan.md）：\n{plan}' if plan else ''))
         create_report(conn, 'gate', by, f['id'], key, text, summary=f'批准开工 #{num}：{title or slug}',
                       options=['批准开工', '先别'], gate='kickoff', meta=dict(exec=ex))
@@ -1570,40 +1579,65 @@ def kickoff_pending(f, key):
 
 
 def check_exec(v):
-    """执行配置 dict(cli, model, effort) 校验：平台要能用，模型 / 思考程度要认得；空字符串 = 用默认。返回整理后的 dict。"""
+    """执行配置 dict(cli, model, effort[, account, preset, code_mode]) 校验：支持 preset 自动展开；
+    平台要能用，模型 / 思考程度要认得；空字符串 = 用默认。返回整理后的 dict。"""
     if not isinstance(v, dict):
         raise ValueError('执行配置格式不对')
-    cli = (v.get('cli') or 'claude').strip()
+    pid = (v.get('preset') or '').strip()
+    pr = None
+    if pid:
+        pr = find_preset(pid)
+        if not pr:
+            raise ValueError(f'找不到预设：{pid}')
+    cli = (v.get('cli') or (pr['cli'] if pr else 'claude')).strip()
     if cli not in PROVIDERS:
         raise ValueError(f'不认识的 CLI：{cli}（可选 {" / ".join(PROVIDERS)}）')
     st = platform_status(cli)
-    if not st['ok']:
+    if not st['ok'] and not (pr and pr.get('fallback')):
         raise ValueError(f'{PROV_LABEL[cli]} 现在不能用：{st["reason"]}')
-    model, effort = (v.get('model') or '').strip(), (v.get('effort') or '').strip()
-    api_models = _API_MODELS.get((v.get('account') or '').strip(), []) if cli == 'codex' else []
+    model = (v.get('model') if 'model' in v and v.get('model') is not None else (pr['model'] if pr else '')).strip()
+    effort = (v.get('effort') if 'effort' in v and v.get('effort') is not None else (pr['effort'] if pr else '')).strip()
+    aid = (v.get('account') if 'account' in v and v.get('account') is not None else (pr['account'] if pr else '')).strip()
+    code_mode = bool(v.get('code_mode')) if 'code_mode' in v else (bool(pr['code_mode']) if pr else False)
+    if cli != 'claude':
+        code_mode = False
+    api_models = _API_MODELS.get(aid, []) if cli == 'codex' else []
     if model and not valid_model(cli, model) and model not in api_models:
         raise ValueError(f'{PROV_LABEL[cli]} 不认识模型 {model}')
     if effort and effort not in EFFORTS:
         raise ValueError(f'思考程度只能是 {" / ".join(EFFORTS)}：{effort}')
     out = dict(cli=cli, model=model, effort=effort)
-    aid = (v.get('account') or '').strip()
-    if aid and cli in ACCT_KEY:          # 账号池里指定的号（空 = 自动）；换了平台就作废
+    if aid and cli in ACCT_KEY:          # 模型池里指定的号（空 = 自动）；换了平台就作废
         a = pool().get(aid)
         if not a or a.get('platform') != cli:
-            raise ValueError(f'{PROV_LABEL[cli]} 账号池里没有 {aid}')
+            raise ValueError(f'{PROV_LABEL[cli]} 模型池里没有 {aid}')
         out['account'] = aid
+    if cli == 'claude' and code_mode:
+        out['code_mode'] = True
+    if pr:
+        same_as_preset = (
+            cli == pr['cli']
+            and model == pr['model']
+            and effort == pr['effort']
+            and (aid if cli in ACCT_KEY else '') == pr['account']
+            and code_mode == bool(pr['code_mode'])
+        )
+        if same_as_preset:
+            out['preset'] = pr['id']
     return out
 
 
 def kickoff_exec(conn, f, key):
-    """这个功能的执行者会用什么启动：dict(cli, model, effort)，按 对话单独设 > 功能定的（state.exec）> 执行者默认 解析。"""
+    """这个功能的执行者会用什么启动：按 对话单独设 > 对话预设 > 功能定的（state.exec）> 执行者默认预设 解析。"""
     c = dict(id=0, role='crew', film_id=f['id'], seq_key=key, resume_sid=None, claude_sid=None)
-    prov = provider_pref(conn, c)
-    p = session_pref(conn, c, prov)
-    out = dict(cli=prov, model=p['model'], effort=p['effort'])
-    ex = feature_exec(conn, c)
-    if prov in ACCT_KEY and (ex.get('cli') or 'claude') == prov and ex.get('account'):
-        out['account'] = ex['account']
+    res = resolve_exec(conn, c)
+    out = dict(cli=res['cli'], model=res['model'], effort=res['effort'])
+    if res['cli'] in ACCT_KEY and res['account']:
+        out['account'] = res['account']
+    if res['cli'] == 'claude' and res['code']:
+        out['code_mode'] = True
+    if res['preset'] and not res['customized']:
+        out['preset'] = res['preset']
     return out
 
 
@@ -2033,8 +2067,8 @@ def vendor_info():
     return out
 
 
-def choose_account(conn, c, prov, exclude=()):
-    """新会话用池里哪个号：对话里指定的 > 功能开工时定的（exec.account）> 自动（额度剩得最多）。
+def choose_account(conn, c, prov, exclude=(), want_override=None):
+    """新会话用池里哪个号：对话里指定的 > 对话预设 > 功能开工时定的（exec）> 角色默认预设 > 自动（额度剩得最多）。
     exclude：自动选时先避开的号（执行者已满并发槽的号）；都满了就照常选，由 launch_queue 排队等。指定的号不避开（满了就等它）。
     返回 (号 或 None, 原因)；池里这个平台没有号就是 (None, '')，按以前的单号行为开会话。"""
     if prov not in ACCT_KEY:
@@ -2042,8 +2076,11 @@ def choose_account(conn, c, prov, exclude=()):
     accs = cli_accounts(prov)
     if not accs:
         return None, ''
-    ex = feature_exec(conn, c)
-    want = get_pref(conn, channel_of(c)).get(ACCT_KEY[prov]) or (ex.get('account') if (ex.get('cli') or 'claude') == prov else '')
+    if want_override is not None:
+        want = want_override
+    else:
+        res = resolve_exec(conn, c, provider=prov)
+        want = res['account'] if res['cli'] == prov else ''
     d = pool().default(prov)
     if exclude and not want:
         rest = [a for a in accs if a['id'] not in exclude]
@@ -2187,7 +2224,7 @@ def gemini_switch_for(conn, c, a):
     if acct.agy_running():
         cur_a = pool().get(cur) if cur else None
         notice(conn, channel_of(c), f'Gemini 想用 {account_label(a)}，但有 agy 会话在跑（agy 全机共用一个登录），'
-                                    f'这次沿用当前号{account_label(cur_a) or "（不在账号池里）"}')
+                                    f'这次沿用当前号{account_label(cur_a) or "（不在模型池里）"}')
         log_event(conn, 'account-switch-skip', c, level='warn', account=a['id'], current=cur or '')
         return cur
     try:
@@ -2383,7 +2420,7 @@ def account_action(action, data=None):
         return dict(accounts=cli_accounts())
     if action == 'check-all':
         res = accounts_check(force=True)
-        return dict(result='；'.join(f'{x}：{r}' for x, r in res) or '账号池是空的')
+        return dict(result='；'.join(f'{x}：{r}' for x, r in res) or '模型池里还没有账号')
     if action == 'add-codex-api':
         name = str(data.get('name') or '').strip()
         base_url = str(data.get('base_url') or '').strip().rstrip('/')
@@ -2709,7 +2746,7 @@ def adapter_prompt(conn, f, key):
     return v if isinstance(v, dict) and (v.get('text') or v.get('first')) else {}
 
 
-def agy_cmd(conn, c, cwd, sid, as_file, no_prompt):
+def agy_cmd(conn, c, cwd, sid, as_file, no_prompt, exec_override=None):
     """Gemini 会话的命令行（Antigravity CLI agy），对应 Claude 的那套：
     - 系统提示：agy 没有 --append-system-prompt，写进 launch/<id>-system.txt，由 SessionStart hook 用 injectSteps 注入；
     - hooks：全局 ~/.gemini/config/hooks.json 里的 mashu 项（agy_hooks）；状态栏：--settings 每会话传；
@@ -2725,7 +2762,8 @@ def agy_cmd(conn, c, cwd, sid, as_file, no_prompt):
     cmd = [cfg('agy'), '--dangerously-skip-permissions', '--settings', str(agy_settings(c['id'], [cwd, *dirs]))]
     for d in dirs:
         cmd += ['--add-dir', str(d)]
-    pref = session_pref(conn, c, 'gemini')
+    pref = (dict(provider='gemini', model=exec_override.get('model') or '', effort=exec_override.get('effort') or '')
+            if exec_override else session_pref(conn, c, 'gemini'))
     if pref['model']:
         cmd += ['--model', pref['model']]
     if pref['effort']:
@@ -2733,7 +2771,7 @@ def agy_cmd(conn, c, cwd, sid, as_file, no_prompt):
     if sid:
         cmd += ['--conversation', sid]
         meta_set(conn, f'provider:{sid}', 'gemini')
-    else:               # 账号池：Gemini 只留单号（#157），不挑号、不切号；只记下这个会话用的是钥匙串里的哪个号
+    else:               # 模型池：Gemini 只留单号（#157），不挑号、不切号；只记下这个会话用的是钥匙串里的哪个号
         cur = next((a['id'] for a in cli_accounts('gemini') if a.get('active')), '')
         meta_set(conn, f'camacct:{c["id"]}', cur)
     if not no_prompt:
@@ -2747,7 +2785,7 @@ def extra_dirs(conn, c):
     return dirs + [KMAP]
 
 
-def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
+def codex_cmd(conn, c, cwd, sid, as_file, no_prompt, exec_override=None):
     """Codex 会话的命令行，对应 Claude 的那套（详见 docs/references/platforms.md）：
     - CODEX_HOME=state/codex-home：用户 config.toml 的副本 + 麻薯 hooks，登录文件软链接共用。不改 ~/.codex（Codex 会往
       CODEX_HOME 的 config.toml 写目录信任，用独立 home 就只写到副本里）；
@@ -2756,14 +2794,16 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
     - 会话 ID 不能预先指定：SessionStart / UserPromptSubmit hook 回写；恢复用 codex resume <ID>。
     返回 (命令, sid, 额外环境变量, 启动前的 shell 行)。"""
     skills = {skills_dist.NAME: src} if (src := docs_skill_source()) else {}
-    # 账号池：新会话按规则挑号（每个号一个 CODEX_HOME，会话之间互不影响）；恢复会话回到 rollout 所在的那个号目录，中途不换号
+    # 模型池：新会话按规则挑号（每个号一个 CODEX_HOME，会话之间互不影响）；恢复会话回到 rollout 所在的那个号目录，中途不换号
     a, why = (None, '')
     if sid:
         _, h = plat.find_codex_session(codex_homes(), sid)
         a = next((x for x in pool().list('codex') if h and codex_acct_home(x) == h), None)
         home_dir = h or codex_home()
     else:
-        a, why = choose_account(conn, c, 'codex', full_accounts(conn, 'codex') if c['role'] == 'crew' else ())
+        want_acct = exec_override.get('account') if exec_override is not None else None
+        a, why = choose_account(conn, c, 'codex', full_accounts(conn, 'codex') if c['role'] == 'crew' else (),
+                                want_override=want_acct)
         home_dir = codex_acct_home(a) if a else codex_home()
     meta_set(conn, f'camacct:{c["id"]}', a['id'] if a else '')
     if a and not sid:
@@ -2776,7 +2816,8 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
     if home_dir == codex_home() and auth.exists() and not auth.is_symlink():
         notice(conn, channel_of(c), f'{auth} 变成了普通文件（Codex 刷新登录时换掉了软链接）：麻薯的 Codex 会话和你自己的登录可能不同步，'
                                     f'确认能用后可以删掉它，麻薯下次启动会重新链接到 {CODEX_USER_HOME / "auth.json"}')
-    pref = session_pref(conn, c, 'codex')
+    pref = (dict(provider='codex', model=exec_override.get('model') or '', effort=exec_override.get('effort') or '')
+            if exec_override else session_pref(conn, c, 'codex'))
     cmd = [cfg('codex')] + (['resume', sid] if sid else [])
     cmd += ['--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust', '-C', str(cwd)]
     for d in extra_dirs(conn, c):
@@ -2797,7 +2838,7 @@ def codex_cmd(conn, c, cwd, sid, as_file, no_prompt):
     return cmd, sid, {'CODEX_HOME': str(home)}, pre
 
 
-def opencode_cmd(conn, c, cwd, sid, as_file, no_prompt):
+def opencode_cmd(conn, c, cwd, sid, as_file, no_prompt, exec_override=None):
     """OpenCode 会话的命令行（TUI）：
     - OPENCODE_CONFIG_DIR=state/opencode-config：只多加载麻薯插件（integrations/opencode/mashu.js），用户的 ~/.config/opencode 照常读、不改；
     - 模型、思考档位：OPENCODE_CONFIG_CONTENT 里的 agent.build.model / variant（TUI 没有 --variant）；
@@ -2805,7 +2846,8 @@ def opencode_cmd(conn, c, cwd, sid, as_file, no_prompt):
     - 去掉 TMUX 环境变量：用户装的 opentmux 插件在 tmux 里会自己开窗格，会打乱麻薯的窗口布局；
     - 会话 ID：插件在第一轮回写；恢复用 -s <ID>。"""
     as_file('system', system_prompt(conn, c))
-    pref = session_pref(conn, c, 'opencode')
+    pref = (dict(provider='opencode', model=exec_override.get('model') or '', effort=exec_override.get('effort') or '')
+            if exec_override else session_pref(conn, c, 'opencode'))
     conf = {}
     if pref['model']:
         agent = dict(model=pref['model'])
@@ -2887,7 +2929,25 @@ def launch(conn, cid, pane=None, no_prompt=False):
         first = adapter_prompt(conn, fa, c['seq_key']).get('first')
         if first:           # 适配器的开场话接在「继续 …」后面（hook 认「继续」开头注入状态摘要）
             c = dict(c, prompt=f'{c["prompt"] or "开工"}\n\n{first}')
-    prov = provider_of_sid(conn, sid) if sid else provider_pref(conn, c)    # 恢复会话必须沿用开会话时的那家
+    launch_ex = None
+    fb_info = None
+    if sid:
+        prov = provider_of_sid(conn, sid)                                   # 恢复会话必须沿用开会话时的那家，不走备选切换
+    else:
+        launch_ex, fb_info = resolve_launch_exec(conn, c)
+        prov = launch_ex['cli']
+        if fb_info and fb_info.get('switched'):
+            notice(conn, channel_of(c),
+                   f'主预设「{fb_info["from_name"]}」不能用（{fb_info["reason"]}），已改用「{fb_info["to_name"]}」')
+            audit(conn, 'system', 'preset-fallback', c['film_id'], c['seq_key'],
+                  f'{fb_info["from_name"]} -> {fb_info["to_name"]}：{fb_info["reason"]}')
+            log_event(conn, 'preset-fallback', c, level='warn', from_preset=fb_info['from_id'],
+                      to_preset=fb_info['to_id'], reason=fb_info['reason'])
+        elif fb_info and fb_info.get('exhausted'):
+            notice(conn, channel_of(c),
+                   f'主预设「{fb_info["from_name"]}」不能用（{fb_info["reason"]}），备选预设也都不可用，仍按原预设尝试启动')
+            log_event(conn, 'preset-fallback-exhausted', c, level='warn', from_preset=fb_info['from_id'],
+                      reason=fb_info['reason'])
     st = platform_status(prov)
     if not st['ok']:
         if sid:      # 恢复会话没法换平台：不启动，说明原因
@@ -2899,16 +2959,17 @@ def launch(conn, cid, pane=None, no_prompt=False):
         notice(conn, channel_of(c), f'{PROV_LABEL.get(prov, prov)} 现在不能用（{st["reason"]}），这次改用 Claude 启动「{c["name"]}」')
         log_event(conn, 'platform-fallback', c, level='warn', provider=prov, err=st['reason'])
         prov = 'claude'
+        launch_ex = None
     meta_set(conn, f'camprov:{cid}', prov)
     extra_env, pre = {}, []
     if prov == 'gemini':
-        cmd, sid = agy_cmd(conn, c, cwd, sid, as_file, no_prompt)
+        cmd, sid = agy_cmd(conn, c, cwd, sid, as_file, no_prompt, exec_override=launch_ex)
         code = False
     elif prov == 'codex':
-        cmd, sid, extra_env, pre = codex_cmd(conn, c, cwd, sid, as_file, no_prompt)
+        cmd, sid, extra_env, pre = codex_cmd(conn, c, cwd, sid, as_file, no_prompt, exec_override=launch_ex)
         code = False
     elif prov == 'opencode':
-        cmd, sid, extra_env, pre = opencode_cmd(conn, c, cwd, sid, as_file, no_prompt)
+        cmd, sid, extra_env, pre = opencode_cmd(conn, c, cwd, sid, as_file, no_prompt, exec_override=launch_ex)
         code = False
     else:
         cmd = [cfg('claude'), '--permission-mode', cfg('permission_mode'), '-n', title,
@@ -2919,22 +2980,25 @@ def launch(conn, cid, pane=None, no_prompt=False):
         host = skill_host()
         if host:
             cmd += ['--plugin-dir', str(host)]
-        pref = session_pref(conn, c, 'claude')
-        if pref['model']:
-            cmd += ['--model', pref['model']]
-        if pref['effort']:
-            cmd += ['--effort', pref['effort']]
+        pref_cl = (dict(model=launch_ex.get('model') or '', effort=launch_ex.get('effort') or '')
+                   if launch_ex else session_pref(conn, c, 'claude'))
+        if pref_cl['model']:
+            cmd += ['--model', pref_cl['model']]
+        if pref_cl['effort']:
+            cmd += ['--effort', pref_cl['effort']]
         if sid:
             cmd += ['--resume', sid]
             code = code_mode_of(conn, sid)       # 恢复会话必须沿用开会话时的模式
         else:
             sid = str(uuid.uuid4())
             cmd += ['--session-id', sid]
-            code = code_pref(conn, c)
+            code = bool(launch_ex['code']) if launch_ex is not None else code_pref(conn, c)
             meta_set(conn, f'codemode:{sid}', '1' if code else '0')
         if not no_prompt:
             cmd.append(as_file('prompt', c['prompt'] or '开工'))
     pref = session_pref(conn, c, prov)
+    eff_for_record = (launch_ex.get('effort') or '') if launch_ex else (pref.get('effort') or '')
+    model_for_record = (launch_ex.get('model') or '') if launch_ex else (pref.get('model') or '')
     script = HOME / 'launch' / f'{cid}.sh'
     exit_fp = shlex.quote(str(HOME / 'launch' / f'{cid}.exit'))
     script.write_text(f'#!/bin/sh\nrm -f {exit_fp}\n' + ''.join(x + '\n' for x in pre) + ' '.join(f'"$(cat {shlex.quote(str(big[a]))})"' if a in big else shlex.quote(str(a))
@@ -2977,8 +3041,8 @@ def launch(conn, cid, pane=None, no_prompt=False):
     conn.execute('UPDATE cameras SET state=?, pane=?, claude_sid=?, started_at=?, last_active=?, last_stop=?, updated=?, '
                  'pref_applied=? WHERE id=?', ('idle' if no_prompt else 'running', pane, sid, t, t, t + 0.001 if no_prompt else 0, t,
                                                json.dumps(pref, sort_keys=True), cid))
-    if prov in ('codex', 'opencode') and pref.get('effort'):     # 这两家不回报思考档位：记下实际传的那档，网页显示「现在：…」
-        conn.execute('UPDATE cameras SET effort=? WHERE id=?', (platform_effort(prov, pref['model'], pref['effort']) or None, cid))
+    if prov in ('codex', 'opencode') and eff_for_record:     # 这两家不回报思考档位：记下实际传的那档，网页显示「现在：…」
+        conn.execute('UPDATE cameras SET effort=? WHERE id=?', (platform_effort(prov, model_for_record, eff_for_record) or None, cid))
     conn.commit()
     c = camera(conn, cid)
     if c['role'] == 'crew' and not respawn:
@@ -4470,16 +4534,23 @@ def full_accounts(conn, prov):
 def queued_account_key(conn, c):
     """排队的执行者启动后会占哪个账号：和 launch 的选法一致（恢复会话沿用原来的那家、那个号）。"""
     sid = c['resume_sid']
-    prov = provider_of_sid(conn, sid) if sid else provider_pref(conn, c)
+    want_acct = None
+    if sid:
+        prov = provider_of_sid(conn, sid)
+    else:
+        launch_ex, _ = resolve_launch_exec(conn, c)
+        prov = launch_ex['cli']
+        want_acct = launch_ex.get('account')
     if not sid and not platform_status(prov)['ok']:
         prov = 'claude'                 # launch 会退回 Claude
+        want_acct = None
     aid = ''
     if prov == 'codex':
         if sid:
             _, h = plat.find_codex_session(codex_homes(), sid)
             a = next((x for x in pool().list('codex') if h and codex_acct_home(x) == h), None)
         else:
-            a, _ = choose_account(conn, c, 'codex', full_accounts(conn, 'codex'))
+            a, _ = choose_account(conn, c, 'codex', full_accounts(conn, 'codex'), want_override=want_acct)
         aid = a['id'] if a else ''
     elif prov == 'gemini':
         aid = next((a['id'] for a in cli_accounts('gemini') if a.get('active')), '')
@@ -5340,7 +5411,7 @@ def valid_model(provider, v):
 
 
 def feature_exec(conn, c):
-    """执行者所属功能批准开工时定下的执行配置（state.json 的 exec：cli / model / effort）；不是执行者或没定就是空 dict。"""
+    """执行者所属功能批准开工时定下的执行配置（state.json 的 exec：preset / cli / model / effort / account / code_mode）；不是执行者或没定就是空 dict。"""
     if not c or c['role'] != 'crew' or not c['film_id'] or not c['seq_key']:
         return {}
     f = film(conn, c['film_id'])
@@ -5348,11 +5419,298 @@ def feature_exec(conn, c):
     return v if isinstance(v, dict) else {}
 
 
+def presets_state():
+    """读取主配置中的 presets 和 role_presets（若尚未迁移但有旧 defaults 且无 overrides，则在内存中按需兼容派生，不写盘）。"""
+    raw = _studio_cfg()
+    norm = cfgfile.normalize_config(raw)
+    presets = norm.get('presets') or []
+    role_presets = norm.get('role_presets') or {}
+    return presets, role_presets
+
+
+def presets_list():
+    return presets_state()[0]
+
+
+def role_presets_map():
+    return presets_state()[1]
+
+
+def preset_by_id(pid):
+    pid = (pid or '').strip()
+    if not pid:
+        return None
+    return next((p for p in presets_list() if p['id'] == pid), None)
+
+
+def find_preset(ref):
+    """按 id（优先）或名字精确查找预设。"""
+    ref = (ref or '').strip()
+    if not ref:
+        return None
+    ps = presets_list()
+    return next((p for p in ps if p['id'] == ref), None) or next((p for p in ps if p['name'] == ref), None)
+
+
+def role_default_exec(role):
+    """某个角色的默认执行配置：优先走 role_presets 指向的预设；若无则兼容旧 defaults / CONFIG_OVERRIDES。"""
+    presets, rp = presets_state()
+    pid = rp.get(role) or ''
+    pr = next((p for p in presets if p['id'] == pid), None) if pid else None
+    if pr:
+        return dict(cli=pr['cli'], model=pr['model'], effort=pr['effort'],
+                    account=pr['account'] if pr['cli'] in ACCT_KEY else '',
+                    code=bool(pr['code_mode']) if pr['cli'] == 'claude' else False,
+                    preset=pr['id'], preset_name=pr['name'])
+    # 兼容尚未迁移的旧配置或单测里的 CONFIG_OVERRIDES
+    cli = (cfg('providers') or {}).get(role) or 'claude'
+    if cli not in PROVIDERS:
+        cli = 'claude'
+    model = (cfg(DEFAULT_MODELS[cli]) or {}).get(role) or ''
+    effort = (cfg('efforts') or {}).get(role) or ''
+    code = (cli == 'claude' and (cfg('code_modes') or {}).get(role) == 'on')
+    return dict(cli=cli, model=model, effort=effort, account='', code=code, preset='', preset_name='')
+
+
+def _base_exec_without_chat_fields(conn, c):
+    """不含对话单改字段的基准执行配置：对话选的预设 > 功能开工 exec（预设或字段）> 角色默认预设 > CLI 默认。"""
+    role = c['role']
+    cur = role_default_exec(role)
+    ex = feature_exec(conn, c)
+    if ex:
+        ex_pr = preset_by_id(ex.get('preset')) if ex.get('preset') else None
+        if ex_pr:
+            cur = dict(cli=ex_pr['cli'], model=ex_pr['model'], effort=ex_pr['effort'],
+                       account=ex_pr['account'] if ex_pr['cli'] in ACCT_KEY else '',
+                       code=bool(ex_pr['code_mode']) if ex_pr['cli'] == 'claude' else False,
+                       preset=ex_pr['id'], preset_name=ex_pr['name'])
+        ex_cli = (ex.get('cli') or '').strip()
+        if ex_cli in PROVIDERS and ex_cli != cur['cli']:
+            cur = dict(cli=ex_cli, model='', effort=cur['effort'], account='', code=False, preset='', preset_name='')
+        if 'model' in ex and (ex.get('model') or ''):
+            cur['model'] = ex['model']
+            if not ex_pr or cur['model'] != ex_pr['model']:
+                cur['preset'] = cur['preset_name'] = ''
+        if 'effort' in ex and (ex.get('effort') or ''):
+            cur['effort'] = ex['effort']
+            if not ex_pr or cur['effort'] != ex_pr['effort']:
+                cur['preset'] = cur['preset_name'] = ''
+        if cur['cli'] in ACCT_KEY and (ex.get('account') or ''):
+            cur['account'] = ex['account']
+            if not ex_pr or cur['account'] != ex_pr['account']:
+                cur['preset'] = cur['preset_name'] = ''
+        if cur['cli'] == 'claude' and 'code_mode' in ex:
+            cur['code'] = bool(ex['code_mode'])
+            if not ex_pr or cur['code'] != bool(ex_pr['code_mode']):
+                cur['preset'] = cur['preset_name'] = ''
+    p = get_pref(conn, channel_of(c))
+    chat_pr = preset_by_id(p.get('preset')) if p.get('preset') else None
+    if chat_pr:
+        cur = dict(cli=chat_pr['cli'], model=chat_pr['model'], effort=chat_pr['effort'],
+                   account=chat_pr['account'] if chat_pr['cli'] in ACCT_KEY else '',
+                   code=bool(chat_pr['code_mode']) if chat_pr['cli'] == 'claude' else False,
+                   preset=chat_pr['id'], preset_name=chat_pr['name'])
+    return cur
+
+
+def resolve_exec(conn, c, provider=None):
+    """统一执行配置解析：对话里单独改过的字段 > 对话选的预设 > 功能开工时定的（预设或字段）> 角色默认预设 > CLI 默认。
+    若传入 provider（如恢复会话锁定原 CLI），则锁定在该 CLI 下解析模型 / 思考 / 账号 / Code Mode。"""
+    base = _base_exec_without_chat_fields(conn, c)
+    p = get_pref(conn, channel_of(c))
+    cli = base['cli']
+    model = base['model']
+    effort = base['effort']
+    account = base['account']
+    code = base['code']
+    preset_id = base['preset']
+    preset_name = base['preset_name']
+
+    # 对话单独改过的字段覆盖基准
+    if 'provider' in p and p['provider']:
+        pv = p['provider']
+        if pv in PROVIDERS and pv != cli:
+            cli = pv
+            model = ''
+            account = ''
+            code = False
+            preset_id = ''
+            preset_name = ''
+    mk = MODEL_KEY[cli]
+    if mk in p:
+        model = p[mk] or ''
+    if 'effort' in p:
+        effort = p['effort'] or ''
+    if cli in ACCT_KEY and ACCT_KEY[cli] in p:
+        account = p[ACCT_KEY[cli]] or ''
+    if cli == 'claude' and 'code' in p and p['code'] in ('on', 'off'):
+        code = (p['code'] == 'on')
+
+    if provider and provider in PROVIDERS and provider != cli:
+        # 锁定原 CLI（例如恢复会话）：取该 CLI 对应的模型 / 账号 / Code Mode
+        cli = provider
+        ex = feature_exec(conn, c)
+        ex_same = ex if (ex.get('cli') or 'claude') == cli else {}
+        mk2 = MODEL_KEY[cli]
+        if mk2 in p:
+            model = p[mk2] or ''
+        elif ex_same.get('model'):
+            model = ex_same['model']
+        elif base['cli'] == cli:
+            model = base['model']
+        else:
+            model = (cfg(DEFAULT_MODELS[cli]) or {}).get(c['role']) or ''
+        if cli in ACCT_KEY:
+            ak = ACCT_KEY[cli]
+            account = p[ak] if ak in p else (ex_same.get('account') or (base['account'] if base['cli'] == cli else ''))
+        else:
+            account = ''
+        if cli == 'claude':
+            if 'code' in p and p['code'] in ('on', 'off'):
+                code = (p['code'] == 'on')
+            elif base['cli'] == 'claude':
+                code = base['code']
+            else:
+                code = (cfg('code_modes') or {}).get(c['role']) == 'on'
+        else:
+            code = False
+        if preset_id:
+            pr = preset_by_id(preset_id)
+            if not pr or pr['cli'] != cli:
+                preset_id = ''
+                preset_name = ''
+
+    customized = (cli, model, effort, account if cli in ACCT_KEY else '', code if cli == 'claude' else False) != (
+        base['cli'], base['model'], base['effort'], base['account'] if base['cli'] in ACCT_KEY else '',
+        base['code'] if base['cli'] == 'claude' else False
+    )
+    return dict(cli=cli, model=model, effort=effort, account=account if cli in ACCT_KEY else '',
+                code=bool(code) if cli == 'claude' else False,
+                preset=preset_id, preset_name=preset_name, customized=customized)
+
+
+def claude_used_pct():
+    """本机 Claude 登录的已知额度最大已用百分比；未知返回 None。"""
+    try:
+        rf = HOME / 'ratelimits.json'
+        if rf.is_file():
+            return acct.window_used_pct(json.loads(rf.read_text()))
+    except Exception:
+        pass
+    return None
+
+
+def codex_local_used_pct():
+    """单号模式下（池里无 Codex 号）本机 Codex 已知额度最大已用百分比；未知返回 None。"""
+    try:
+        q = plat.find_codex_rate_limits([HOME / 'codex-home' / 'sessions', CODEX_USER_HOME / 'sessions'])
+        return acct.window_used_pct(q)
+    except Exception:
+        return None
+
+
+def exec_usable(ex, limit_pct=None):
+    """检查一组执行配置（CLI / 账号 / 额度）现在能不能用来开新会话：返回 (ok: bool, reason: str)。"""
+    cli = (ex.get('cli') or 'claude').strip()
+    if limit_pct is None:
+        try:
+            limit_pct = float(cfg('preset_fallback_pct') or 95)
+        except (TypeError, ValueError):
+            limit_pct = 95.0
+    st = platform_status(cli)
+    if not st['ok']:
+        return False, f'{PROV_LABEL.get(cli, cli)} CLI 不可用（{st["reason"]}）'
+    if cli == 'codex':
+        accs = cli_accounts('codex')
+        aid = (ex.get('account') or '').strip()
+        if aid:
+            a = next((x for x in accs if x['id'] == aid), None)
+            if not a:
+                return False, f'账号 {aid} 不存在'
+            if not acct.usable(a):
+                why = '已禁用' if a.get('disabled') else (a.get('status_cn') or acct.STATUS_CN.get(a.get('status'), a.get('status') or '异常'))
+                return False, f'账号 {account_label(a)} {why}'
+            if a.get('kind') != 'api':
+                u = acct.used_pct(a)
+                if u is not None and u >= limit_pct:
+                    return False, f'账号 {account_label(a)} 额度已用 {u:.0f}%（≥{limit_pct:.0f}%）'
+            return True, ''
+        if accs:
+            d = pool().default('codex')
+            def _acct_ok(a):
+                if not acct.usable(a):
+                    return False
+                if a.get('kind') == 'api':
+                    return bool(d and a['id'] == d['id'])
+                u = acct.used_pct(a)
+                return u is None or u < limit_pct
+            if any(_acct_ok(a) for a in accs):
+                return True, ''
+            return False, f'Codex 模型池里没有可用账号（均异常或额度 ≥{limit_pct:.0f}%）'
+        u = codex_local_used_pct()
+        if u is not None and u >= limit_pct:
+            return False, f'Codex 额度已用 {u:.0f}%（≥{limit_pct:.0f}%）'
+        return True, ''
+    if cli == 'gemini':
+        accs = cli_accounts('gemini')
+        if accs:
+            a = next((x for x in accs if x.get('active')), None) or next((x for x in accs if x.get('default')), accs[0])
+            if not acct.usable(a):
+                why = '已禁用' if a.get('disabled') else (a.get('status_cn') or acct.STATUS_CN.get(a.get('status'), a.get('status') or '异常'))
+                return False, f'Gemini 账号 {account_label(a)} {why}'
+            u = acct.used_pct(a)
+            if u is not None and u >= limit_pct:
+                return False, f'Gemini 额度已用 {u:.0f}%（≥{limit_pct:.0f}%）'
+        return True, ''
+    if cli == 'claude':
+        u = claude_used_pct()
+        if u is not None and u >= limit_pct:
+            return False, f'Claude 额度已用 {u:.0f}%（≥{limit_pct:.0f}%）'
+        return True, ''
+    return True, ''
+
+
+def resolve_launch_exec(conn, c):
+    """开新会话时决定实际启动配置：若绑定了预设且当前不可用，按备选链找第一个可用的（最多 3 跳，防环）。
+    只作用于本次启动，不改对话偏好。返回 (exec_dict, fallback_info 或 None)。"""
+    base = resolve_exec(conn, c)
+    pid = base.get('preset') or ''
+    if not pid:
+        return base, None
+    pr0 = preset_by_id(pid)
+    if not pr0:
+        return base, None
+    ok, reason = exec_usable(base)
+    if ok:
+        return base, None
+    nxt_id = (pr0.get('fallback') or '').strip()
+    if not nxt_id:
+        return base, None
+    visited = {pid}
+    hops = 0
+    while nxt_id and hops < 3:
+        if nxt_id in visited:
+            break
+        visited.add(nxt_id)
+        nxt = preset_by_id(nxt_id)
+        if not nxt:
+            break
+        hops += 1
+        cand = dict(cli=nxt['cli'], model=nxt['model'], effort=nxt['effort'],
+                    account=nxt['account'] if nxt['cli'] in ACCT_KEY else '',
+                    code=bool(nxt['code_mode']) if nxt['cli'] == 'claude' else False,
+                    preset=nxt['id'], preset_name=nxt['name'], customized=False)
+        ok2, _ = exec_usable(cand)
+        if ok2:
+            return cand, dict(switched=True, from_id=pid, from_name=pr0['name'],
+                              to_id=nxt['id'], to_name=nxt['name'], reason=reason, hops=hops)
+        nxt_id = (nxt.get('fallback') or '').strip()
+    return base, dict(switched=False, exhausted=True, from_id=pid, from_name=pr0['name'], reason=reason)
+
+
 def provider_pref(conn, c):
-    """新会话用哪家：对话单独设的优先，其次功能批准开工时定的（执行者），再次角色默认，默认 Claude。"""
-    v = (get_pref(conn, channel_of(c)).get('provider') or feature_exec(conn, c).get('cli')
-         or (cfg('providers') or {}).get(c['role']) or 'claude')
-    return v if v in PROVIDERS else 'claude'
+    """新会话用哪家：统一走 resolve_exec。"""
+    return resolve_exec(conn, c)['cli']
 
 
 def provider_of_sid(conn, sid):
@@ -5367,26 +5725,20 @@ def cam_provider(conn, c):
 
 
 def session_pref(conn, c, provider=None):
-    """这个对话用的模型 / 思考程度：网页上单独设的优先，其次功能批准开工时定的（执行者、同一平台时），再次角色默认，都没有就用 CLI 默认（空）。
-    各家的模型分开记（model / gmodel / xmodel / omodel），切换平台不会改到另一家的设置；Claude 会话的结果和以前完全一样。"""
+    """这个对话用的模型 / 思考程度：统一走 resolve_exec。"""
     prov = provider or cam_provider(conn, c)
-    p = get_pref(conn, channel_of(c))
-    ex = feature_exec(conn, c)
-    ex = ex if (ex.get('cli') or 'claude') == prov else {}
-    effort = p.get('effort') or ex.get('effort') or (cfg('efforts') or {}).get(c['role']) or ''
-    model = p.get(MODEL_KEY[prov]) or ex.get('model') or (cfg(DEFAULT_MODELS[prov]) or {}).get(c['role']) or ''
+    res = resolve_exec(conn, c, provider=prov)
     if prov == 'claude':
-        return dict(model=model, effort=effort)
-    return dict(provider=prov, model=model, effort=effort)
+        return dict(model=res['model'], effort=res['effort'])
+    return dict(provider=prov, model=res['model'], effort=res['effort'])
 
 
 CODE_ENV = 'CLAUDE_CODE_EXPERIMENTAL_CODE_MODE'
 
 
 def code_pref(conn, c):
-    """新会话要不要开 Code Mode：对话单独设的优先，其次角色默认，默认关。"""
-    v = get_pref(conn, channel_of(c)).get('code') or (cfg('code_modes') or {}).get(c['role']) or 'off'
-    return v == 'on'
+    """新会话要不要开 Code Mode：统一走 resolve_exec。"""
+    return resolve_exec(conn, c, provider='claude')['code']
 
 
 def code_mode_of(conn, sid):
@@ -5394,17 +5746,60 @@ def code_mode_of(conn, sid):
     return bool(sid) and meta_get(conn, f'codemode:{sid}') == '1'
 
 
+def _channel_dummy_cam(channel):
+    if channel == 'assistant':
+        return dict(id=0, role='assistant', film_id=None, seq_key=None, resume_sid=None, claude_sid=None)
+    fid, key = split_channel(channel)
+    return dict(id=0, role='crew' if key else 'producer', film_id=fid, seq_key=key, resume_sid=None, claude_sid=None)
+
+
 def set_pref(conn, channel, defer=False, **kw):
     p = get_pref(conn, channel)
-    for prov, k in ACCT_KEY.items():     # 账号池：指定这个对话用哪个号（空 = 自动），只对新会话生效，不触发重开
+    base_before = _base_exec_without_chat_fields(conn, _channel_dummy_cam(channel))
+    if 'preset' in kw and kw['preset'] is not None:
+        v = (kw.pop('preset') or '').strip()
+        for k in ('provider', 'effort', 'code') + tuple(MODEL_KEY.values()) + tuple(ACCT_KEY.values()):
+            p.pop(k, None)
+        if v:
+            pr = find_preset(v)
+            if not pr:
+                raise ValueError(f'找不到预设：{v}')
+            p['preset'] = pr['id']
+        else:
+            p.pop('preset', None)
+        meta_set(conn, f'pref:{channel}', json.dumps(p, ensure_ascii=False))
+        only_preset = all(kw.get(x) is None for x in ('model', 'effort', 'provider', 'code') + tuple(MODEL_KEY.values()) + tuple(ACCT_KEY.values()))
+        if only_preset:
+            if defer:
+                return '已记下，下次启动生效'
+            c = camera_of_channel(conn, channel)
+            res = resolve_exec(conn, _channel_dummy_cam(channel))
+            label = res['preset_name'] or exec_label(res['cli'], res['model'], res['effort'])
+            if not c or c['state'] not in LIVE or c['pane'] not in alive_panes():
+                return f'已选预设「{label}」，下次启动生效'
+            if cam_provider(conn, c) != res['cli']:
+                return f'已选预设「{label}」，平台变更将在下次新会话（新会话 / 交接）生效'
+            if c['pref_applied'] is None:
+                conn.execute('UPDATE cameras SET pref_applied="{}" WHERE id=?', (c['id'],))
+                conn.commit()
+                c = camera(conn, c['id'])
+            if c['last_active'] > c['last_stop']:
+                return f'已选预设「{label}」，「{c["name"]}」这一轮做完就切换（对话不丢）'
+            switched = apply_pref(conn, c)
+            return switched or f'已选预设「{label}」（账号 / Code Mode 等将在下次新会话生效）'
+        base_before = _base_exec_without_chat_fields(conn, _channel_dummy_cam(channel))
+
+    for prov, k in ACCT_KEY.items():     # 模型池：指定这个对话用哪个号（空 = 自动），只对新会话生效，不触发重开
         if kw.get(k) is None:
             continue
         v = (kw.pop(k) or '').strip()
         a = pool().get(v) if v else None
         if v and (not a or a.get('platform') != prov):
-            raise ValueError(f'{PROV_LABEL[prov]} 账号池里没有 {v}')
+            raise ValueError(f'{PROV_LABEL[prov]} 模型池里没有 {v}')
         if v:
             p[k] = v
+        elif base_before['cli'] == prov and base_before['account']:
+            p[k] = ''
         else:
             p.pop(k, None)
         meta_set(conn, f'pref:{channel}', json.dumps(p, ensure_ascii=False))
@@ -5433,8 +5828,8 @@ def set_pref(conn, channel, defer=False, **kw):
             p.pop('provider', None)
         meta_set(conn, f'pref:{channel}', json.dumps(p, ensure_ascii=False))
         if all(kw.get(k) is None for k in ('model', 'effort') + tuple(MODEL_KEY.values())):
-            name = PROV_LABEL.get(v) or ('默认（' + PROV_LABEL.get((cfg('providers') or {}).get(
-                'assistant' if channel == 'assistant' else 'crew' if '/' in channel else 'producer'), 'Claude') + '）')
+            role = 'assistant' if channel == 'assistant' else 'crew' if '/' in channel else 'producer'
+            name = PROV_LABEL.get(v) or ('默认（' + PROV_LABEL.get(role_default_exec(role)['cli'], 'Claude') + '）')
             return f'已记下：改用 {name}，下次新会话（新会话 / 交接）生效；要马上换就点「新会话」'
 
     key_prov = {v: k for k, v in MODEL_KEY.items()}
@@ -5442,11 +5837,13 @@ def set_pref(conn, channel, defer=False, **kw):
         if k not in kw or kw[k] is None:
             continue
         v = (kw[k] or '').strip()
-        api_models = _API_MODELS.get(p.get('xacct'), []) if k == 'xmodel' else []
+        api_models = _API_MODELS.get(p.get('xacct') or base_before.get('account'), []) if k == 'xmodel' else []
         if v and (not valid_model(key_prov[k], v) and v not in api_models if k != 'effort' else v not in EFFORTS):
             raise ValueError(f'不支持的{"思考程度" if k == "effort" else "模型"}：{v}')
         if v:
             p[k] = v
+        elif (k == 'effort' and base_before['effort']) or (k != 'effort' and base_before['cli'] == key_prov[k] and base_before['model']):
+            p[k] = ''
         else:
             p.pop(k, None)
     meta_set(conn, f'pref:{channel}', json.dumps(p, ensure_ascii=False))
@@ -5467,20 +5864,218 @@ def set_pref(conn, channel, defer=False, **kw):
 ROLES = ('assistant', 'producer', 'crew')
 
 
-def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, providers=None, gmodels=None, xmodels=None, omodels=None):
-    """网页「默认设置」：统一改各角色默认模型 / 思考程度（写 studio.json 的 defaults 节），clear=True 同时清掉各对话单独设的。
-    空闲的会话马上在原窗格 --resume 重开生效，忙的这一轮做完由调度器切。"""
+def _check_fallback_cycle(presets, start_id, fb_id):
+    """检测设置 start_id.fallback = fb_id 是否会形成环。"""
+    if not fb_id:
+        return False
+    if fb_id == start_id:
+        return True
+    by_id = {p['id']: p for p in presets}
+    seen = {start_id}
+    cur = fb_id
+    while cur:
+        if cur in seen:
+            return True
+        seen.add(cur)
+        nxt = by_id.get(cur)
+        cur = (nxt.get('fallback') or '').strip() if nxt else ''
+    return False
+
+
+def preset_action(conn, action, data=None):
+    """模型池预设管理：list / save / delete / move / set-roles。"""
+    data = data or {}
+    ensure_migrated()
+    path = HOME / 'studio.json'
+
+    if action == 'list':
+        ps, rp = presets_state()
+        return dict(presets=ps, role_presets=rp, fallback_pct=cfg('preset_fallback_pct'))
+
+    if action == 'save':
+        raw_id = (data.get('id') or '').strip()
+        name = (data.get('name') or '').strip()
+        if not name:
+            raise ValueError('预设名称不能为空')
+        cli = (data.get('cli') or 'claude').strip().lower()
+        if cli not in PROVIDERS:
+            raise ValueError(f'不认识的 CLI：{cli}')
+        model = (data.get('model') or '').strip()
+        effort = (data.get('effort') or '').strip()
+        account = (data.get('account') or '').strip() if cli in ACCT_KEY else ''
+        code_mode = bool(data.get('code_mode')) if cli == 'claude' else False
+        fallback = (data.get('fallback') or '').strip()
+        if effort and effort not in EFFORTS:
+            raise ValueError(f'思考程度只能是 {" / ".join(EFFORTS)}：{effort}')
+        if account:
+            a = pool().get(account)
+            if not a or a.get('platform') != cli:
+                raise ValueError(f'{PROV_LABEL[cli]} 模型池里没有 {account}')
+        api_models = _API_MODELS.get(account, []) if cli == 'codex' else []
+        if model and not valid_model(cli, model) and model not in api_models:
+            raise ValueError(f'{PROV_LABEL[cli]} 不认识模型 {model}')
+
+        saved_item = {}
+
+        def _apply(cfg_data):
+            ps = list(cfg_data.get('presets') or [])
+            cur_idx = next((i for i, x in enumerate(ps) if x['id'] == raw_id), None) if raw_id else None
+            if raw_id and cur_idx is None:
+                raise ValueError(f'找不到预设：{raw_id}')
+            # 新建或更改 CLI 时检查 CLI 是否可用（保留原不可用 CLI 编辑其它字段时允许）
+            if cur_idx is None or ps[cur_idx]['cli'] != cli:
+                st = platform_status(cli)
+                if not st['ok'] and not fallback:
+                    raise ValueError(f'{PROV_LABEL[cli]} 现在不能用：{st["reason"]}')
+            pid = raw_id
+            if not pid:
+                nums = [int(m.group(1)) for x in ps for m in [re.fullmatch(r'p-(\d+)', x.get('id', ''))] if m]
+                pid = f'p-{max(nums + [0]) + 1}'
+            if any(x['name'] == name and x['id'] != pid for x in ps):
+                raise ValueError(f'已有同名预设「{name}」')
+            if fallback:
+                if fallback == pid:
+                    raise ValueError('备选预设不能指向自己')
+                if not any(x['id'] == fallback for x in ps):
+                    raise ValueError(f'找不到备选预设：{fallback}')
+                if _check_fallback_cycle(ps, pid, fallback):
+                    raise ValueError('备选预设不能形成循环引用')
+            item = dict(id=pid, name=name, cli=cli, model=model, effort=effort,
+                        account=account, code_mode=code_mode, fallback=fallback)
+            if cur_idx is None:
+                ps.append(item)
+            else:
+                ps[cur_idx] = item
+            cfg_data['presets'] = ps
+            saved_item.update(item)
+
+        cfgfile.update_config(path, _apply)
+        _cfg_cache['mtime'] = None
+        audit(conn, 'executive', 'preset-save', None, None, f'{saved_item["id"]} {saved_item["name"]} ({cli} {model or "默认"} {effort or "默认"})')
+        apply_prefs(conn)
+        return dict(preset=saved_item, result=f'已保存预设「{saved_item["name"]}」')
+
+    if action == 'delete':
+        pid = (data.get('id') or '').strip()
+        if not pid:
+            raise ValueError('缺少预设 id')
+        removed = {}
+        cleared_refs = []
+
+        def _apply(cfg_data):
+            ps = list(cfg_data.get('presets') or [])
+            target = next((x for x in ps if x['id'] == pid), None)
+            if not target:
+                raise ValueError(f'找不到预设：{pid}')
+            removed.update(target)
+            ps = [x for x in ps if x['id'] != pid]
+            for x in ps:
+                if x.get('fallback') == pid:
+                    x['fallback'] = ''
+                    cleared_refs.append(f'预设「{x["name"]}」的备选')
+            rp = dict(cfg_data.get('role_presets') or {})
+            for role in ROLES:
+                if rp.get(role) == pid:
+                    rp.pop(role, None)
+                    cleared_refs.append(f'{LEVEL_LABEL[role]}默认')
+            cfg_data['presets'] = ps
+            cfg_data['role_presets'] = rp
+
+        cfgfile.update_config(path, _apply)
+        _cfg_cache['mtime'] = None
+        audit(conn, 'executive', 'preset-delete', None, None, f'{removed["id"]} {removed["name"]}')
+        apply_prefs(conn)
+        tail = f'，并已解除引用（{"、".join(cleared_refs)}）' if cleared_refs else ''
+        return dict(result=f'已删除预设「{removed["name"]}」{tail}', cleared_refs=cleared_refs)
+
+    if action == 'move':
+        pid = (data.get('id') or '').strip()
+        direction = (data.get('direction') or '').strip()
+        if direction not in ('up', 'down'):
+            raise ValueError('direction 只能是 up / down')
+
+        def _apply(cfg_data):
+            ps = list(cfg_data.get('presets') or [])
+            idx = next((i for i, x in enumerate(ps) if x['id'] == pid), None)
+            if idx is None:
+                raise ValueError(f'找不到预设：{pid}')
+            nxt = idx - 1 if direction == 'up' else idx + 1
+            if 0 <= nxt < len(ps):
+                ps[idx], ps[nxt] = ps[nxt], ps[idx]
+            cfg_data['presets'] = ps
+
+        cfgfile.update_config(path, _apply)
+        _cfg_cache['mtime'] = None
+        return dict(result='已调整预设顺序')
+
+    if action == 'set-roles':
+        given = data.get('role_presets')
+        if not isinstance(given, dict):
+            raise ValueError('缺少 role_presets')
+        clear = bool(data.get('clear'))
+        fb_pct = data.get('fallback_pct')
+
+        def _apply(cfg_data):
+            ps = cfg_data.get('presets') or []
+            by_id = {x['id']: x for x in ps}
+            rp = dict(cfg_data.get('role_presets') or {})
+            for role, pid in given.items():
+                if role not in ROLES:
+                    raise ValueError(f'未知角色：{role}')
+                pid = (pid or '').strip()
+                if pid:
+                    if pid not in by_id:
+                        raise ValueError(f'找不到预设：{pid}')
+                    rp[role] = pid
+                else:
+                    rp.pop(role, None)
+            cfg_data['role_presets'] = rp
+            if fb_pct is not None:
+                try:
+                    pct_v = int(fb_pct)
+                except (TypeError, ValueError):
+                    raise ValueError('额度阈值必须是 1 到 100 的整数')
+                if not 1 <= pct_v <= 100:
+                    raise ValueError('额度阈值必须在 1 到 100 之间')
+                cfg_data.setdefault('settings', {})['preset_fallback_pct'] = pct_v
+
+        saved = cfgfile.update_config(path, _apply)
+        _cfg_cache['mtime'] = None
+        cleared = 0
+        if clear:
+            cleared = conn.execute('DELETE FROM meta WHERE k LIKE "pref:%"').rowcount
+            conn.commit()
+        audit(conn, 'executive', 'role-presets', None, None,
+              json.dumps(dict(role_presets=saved.get('role_presets'), cleared=cleared), ensure_ascii=False))
+        apply_prefs(conn)
+        busy = len(rows(conn, f'SELECT id FROM cameras WHERE state IN {LIVE} AND last_active>last_stop'))
+        msg = '已保存角色默认预设' + (f'，清掉了 {cleared} 个对话的单独设置' if cleared else '')
+        msg += '；空闲会话已在原窗格重开' + (f'，{busy} 个正在忙的这一轮做完再切' if busy else '')
+        msg += '；平台 / 账号 / Code Mode 变更对新会话生效'
+        return dict(result=msg, role_presets=saved.get('role_presets'))
+
+    raise ValueError(f'未知预设动作：{action}')
+
+
+def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, providers=None, gmodels=None, xmodels=None, omodels=None, role_presets=None):
+    """兼容入口：支持传 role_presets 直接设角色默认预设；若传旧参数（models / providers / efforts / codes 等），
+    则按角色转为对应预设并更新 role_presets（不再写入旧 defaults 键）。"""
+    if role_presets is not None:
+        return preset_action(conn, 'set-roles', dict(role_presets=role_presets, clear=clear))['result']
     ensure_migrated()
     path = HOME / 'studio.json'
 
     def _apply(cfg_data):
-        defs = cfg_data.setdefault('defaults', {})
+        ps = list(cfg_data.get('presets') or [])
+        rp = dict(cfg_data.get('role_presets') or {})
+        by_id = {x['id']: x for x in ps}
+        # 先做参数校验
+        touched_roles = set()
         for key, given, allowed in (('models', models, MODELS), ('efforts', efforts, EFFORTS), ('code_modes', codes, ('on', 'off')),
                                     ('providers', providers, PROVIDERS), ('gemini_models', gmodels, None),
                                     ('codex_models', xmodels, None), ('opencode_models', omodels, None)):
             if given is None:
                 continue
-            cur = dict(defs.get(key) or {})
             for role, v in given.items():
                 if role not in ROLES:
                     raise ValueError(f'未知角色：{role}')
@@ -5491,23 +6086,41 @@ def set_defaults(conn, models=None, efforts=None, clear=False, codes=None, provi
                     raise ValueError(f'不支持的{ {"models": "模型", "gemini_models": "Gemini 模型", "codex_models": "Codex 模型", "opencode_models": "OpenCode 模型", "efforts": "思考程度", "providers": "平台"}.get(key, "Code Mode 设置") }：{v}')
                 if key == 'providers' and v and not platform_status(v)['ok']:
                     raise ValueError(f'{PROV_LABEL[v]} 现在不能用：{platform_status(v)["reason"]}')
-                if v and not (key == 'code_modes' and v == 'off') and not (key == 'providers' and v == 'claude'):
-                    cur[role] = v
-                else:
-                    cur.pop(role, None)
-            defs[key] = cur
+                touched_roles.add(role)
+        for role in touched_roles:
+            cur_pr = by_id.get(rp.get(role) or '')
+            cli = (providers or {}).get(role) if providers and role in providers else (cur_pr['cli'] if cur_pr else 'claude')
+            cli = (cli or 'claude').strip()
+            mk_map = {'claude': models, 'gemini': gmodels, 'codex': xmodels, 'opencode': omodels}
+            mg = mk_map.get(cli)
+            model = (mg[role].strip() if mg and role in mg else (cur_pr['model'] if cur_pr and cur_pr['cli'] == cli else ''))
+            effort = (efforts[role].strip() if efforts and role in efforts else (cur_pr['effort'] if cur_pr else ''))
+            code_mode = (codes[role].strip() == 'on' if codes and role in codes else (bool(cur_pr['code_mode']) if cur_pr and cur_pr['cli'] == 'claude' else False))
+            if cli != 'claude':
+                code_mode = False
+            account = cur_pr['account'] if cur_pr and cur_pr['cli'] == cli and cli in ACCT_KEY else ''
+            match = next((x for x in ps if x['cli'] == cli and x['model'] == model and x['effort'] == effort
+                          and x['account'] == account and bool(x['code_mode']) == code_mode), None)
+            if match:
+                rp[role] = match['id']
+            else:
+                nums = [int(m.group(1)) for x in ps for m in [re.fullmatch(r'p-(\d+)', x.get('id', ''))] if m]
+                pid = f'p-{max(nums + [0]) + 1}'
+                item = dict(id=pid, name=cfgfile._preset_auto_name(cli, model, effort, code_mode),
+                            cli=cli, model=model, effort=effort, account=account, code_mode=code_mode, fallback='')
+                ps.append(item)
+                by_id[pid] = item
+                rp[role] = pid
+        cfg_data['presets'] = ps
+        cfg_data['role_presets'] = rp
 
     saved = cfgfile.update_config(path, _apply)
     _cfg_cache['mtime'] = None
-    defs = saved['defaults']
     cleared = 0
     if clear:
         cleared = conn.execute('DELETE FROM meta WHERE k LIKE "pref:%"').rowcount
         conn.commit()
-    audit(conn, 'executive', 'defaults', None, None, json.dumps(dict(models=defs.get('models'), efforts=defs.get('efforts'), codes=defs.get('code_modes'),
-                                                                     providers=defs.get('providers'), gemini_models=defs.get('gemini_models'),
-                                                                     codex_models=defs.get('codex_models'), opencode_models=defs.get('opencode_models'),
-                                                                     cleared=cleared), ensure_ascii=False))
+    audit(conn, 'executive', 'defaults', None, None, json.dumps(dict(role_presets=saved.get('role_presets'), cleared=cleared), ensure_ascii=False))
     apply_prefs(conn)
     busy = len(rows(conn, f'SELECT id FROM cameras WHERE state IN {LIVE} AND last_active>last_stop'))
     msg = '已保存' + (f'，清掉了 {cleared} 个对话的单独设置' if cleared else '')
@@ -5621,7 +6234,7 @@ def collect_limits(home=None):
     gemini_data = {
         'installed': gemini_installed,
         'available': False,
-        'reason': 'agy CLI 不报额度：到「会话监控 → 账号」导入 Gemini 号（RT），麻薯用它查各模型剩余额度',
+        'reason': 'agy CLI 不报额度：到「模型池」登记本机 agy 登录，麻薯用它查各模型剩余额度',
     }
 
     # 5. 账号池（#4）：Codex、Gemini 显示默认号的数字，accounts 里是所有号（悬停显示）
@@ -7244,6 +7857,17 @@ def status_data(conn):
     cams = [cam_view(c, alive) | dict(title=camera_title(conn, c), film_id=c['film_id'], seq_key=c['seq_key'], provider=cam_provider(conn, c),
                                      account=meta_get(conn, f'camacct:{c["id"]}') or '')
             for c in rows(conn, 'SELECT * FROM cameras WHERE state IN ("queued","running","idle") ORDER BY role="crew", role="producer", id')]
+    ps, rp = presets_state()
+    role_defs = {r: role_default_exec(r) for r in ROLES}
+    pref_defaults = dict(
+        providers={r: role_defs[r]['cli'] for r in ROLES if role_defs[r]['cli'] != 'claude'},
+        models={r: role_defs[r]['model'] for r in ROLES if role_defs[r]['cli'] == 'claude' and role_defs[r]['model']},
+        gmodels={r: role_defs[r]['model'] for r in ROLES if role_defs[r]['cli'] == 'gemini' and role_defs[r]['model']},
+        xmodels={r: role_defs[r]['model'] for r in ROLES if role_defs[r]['cli'] == 'codex' and role_defs[r]['model']},
+        omodels={r: role_defs[r]['model'] for r in ROLES if role_defs[r]['cli'] == 'opencode' and role_defs[r]['model']},
+        efforts={r: role_defs[r]['effort'] for r in ROLES if role_defs[r]['effort']},
+        codes={r: 'on' for r in ROLES if role_defs[r]['cli'] == 'claude' and role_defs[r]['code']},
+    )
     return dict(
         assistant=cam_view_bg(conn, active_assistant(conn), alive), films=out_films, cameras=cams,
         stages=dict(used=crew_slots(conn)[0], max=cfg('stages'),
@@ -7256,9 +7880,8 @@ def status_data(conn):
         tmux=session_name(), stage_names=STAGES, approval_ttl_hours=cfg('approval_ttl_hours'),
         live=live_replies(conn), limits=read_limits(), cli_accounts=cli_accounts(), vendors=vendor_info(),
         prefs={r['k'][5:]: json.loads(r['v'] or '{}') for r in rows(conn, 'SELECT k, v FROM meta WHERE k LIKE "pref:%"')},
-        pref_defaults=dict(models=cfg('models') or {}, efforts=cfg('efforts') or {}, codes=cfg('code_modes') or {},
-                           providers=cfg('providers') or {}, gmodels=cfg('gemini_models') or {},
-                           xmodels=cfg('codex_models') or {}, omodels=cfg('opencode_models') or {}),
+        pref_defaults=pref_defaults,
+        presets=ps, role_presets=rp, preset_fallback_pct=cfg('preset_fallback_pct'),
         model_choices=MODELS, effort_choices=EFFORTS, gemini_model_choices=gemini_models(), provider_choices=PROVIDERS,
         gemini_models_cached=(HOME / 'gemini-models.json').exists(), platforms=platforms_view())
 
@@ -7496,7 +8119,21 @@ def cmd_pitch(args):
         if not args.plan:
             raise SystemExit('麻薯开功能要带方案：先和用户把需求、技术方案谈清楚，写成文件后 `--plan <文件>`；开好后等用户批准开工')
         plan = Path(args.plan).expanduser().read_text()
-    ex = {k: v for k, v in dict(cli=args.cli, model=args.model, effort=args.effort, account=getattr(args, 'cli_account', None)).items() if v}
+    preset_arg = getattr(args, 'preset', None)
+    if preset_arg and (args.cli or getattr(args, 'cli_account', None)):
+        raise SystemExit('--preset 不能和 --cli / --cli-account 同时使用')
+    if preset_arg:
+        ensure_migrated()
+        pr = find_preset(preset_arg)
+        if not pr:
+            raise SystemExit(f'找不到预设：{preset_arg}（用 mashu preset list 查看可用预设）')
+        ex = dict(preset=pr['id'], cli=pr['cli'], model=args.model or pr['model'], effort=args.effort or pr['effort'])
+        if pr['account']:
+            ex['account'] = pr['account']
+        if pr['cli'] == 'claude' and pr['code_mode']:
+            ex['code_mode'] = True
+    else:
+        ex = {k: v for k, v in dict(cli=args.cli, model=args.model, effort=args.effort, account=getattr(args, 'cli_account', None)).items() if v}
     try:
         f, key, cam = pitch(conn, args.film, args.slug, args.brief, args.title, by=c, playbook=args.playbook, workflow=args.workflow,
                             touches=args.touches, plan=plan, account=args.account, workdir=args.workdir, exec_cfg=ex or None)
@@ -7508,6 +8145,44 @@ def cmd_pitch(args):
         print(f'已开 {seq_label(f, key)}（{key}），已向用户申请批准开工；批准后执行者自动启动，在此之前不要 start / note')
         return
     print(f'已开 {seq_label(f, key)}（{key}），执行者「{cam["name"]}」{"排队中" if cam["state"] == "queued" else cam["state"]}')
+
+
+def cmd_preset(args):
+    """mashu preset list [--json]：列出模型池预设（只读；增删改在网页模型池页做）。"""
+    ensure_migrated()
+    ps, rp = presets_state()
+    by_id = {p['id']: p for p in ps}
+    role_of = {}
+    for role in ROLES:
+        pid = rp.get(role)
+        if pid:
+            role_of.setdefault(pid, []).append(role)
+    items = []
+    for p in ps:
+        fb = by_id.get(p.get('fallback') or '')
+        items.append(dict(
+            id=p['id'], name=p['name'], cli=p['cli'], model=p['model'], effort=p['effort'],
+            account=p['account'], code_mode=bool(p['code_mode']),
+            fallback=p.get('fallback') or '', fallback_name=fb['name'] if fb else '',
+            roles=role_of.get(p['id'], []),
+        ))
+    if getattr(args, 'json', False):
+        print(json.dumps(dict(presets=items, role_presets=rp, fallback_pct=cfg('preset_fallback_pct')), ensure_ascii=False, indent=2))
+        return
+    if not items:
+        print('还没有预设：在网页「模型池」页新增预设。')
+        return
+    print(f'模型池预设（共 {len(items)} 个；额度 ≥{cfg("preset_fallback_pct")}% / 不可用时自动换备选）：')
+    for it in items:
+        roles_cn = ' / '.join(LEVEL_LABEL[r] for r in it['roles'])
+        parts = [PROV_LABEL.get(it['cli'], it['cli']), it['model'] or 'CLI默认', f'思考 {it["effort"] or "默认"}']
+        if it['cli'] in ACCT_KEY:
+            parts.append(f'账号 {it["account"] or "自动"}')
+        if it['cli'] == 'claude' and it['code_mode']:
+            parts.append('Code开')
+        fb_txt = f'  备选→{it["fallback_name"]}({it["fallback"]})' if it['fallback'] else ''
+        role_txt = f'  [默认：{roles_cn}]' if roles_cn else ''
+        print(f'  {it["id"]}  {it["name"]}  （{" · ".join(parts)}）{fb_txt}{role_txt}')
 
 
 def cmd_action(args):
@@ -8001,7 +8676,7 @@ def cmd_account(args):
     if act == 'list':
         accs = cli_accounts(args.target if args.target in acct.PLATFORMS else None)
         if not accs:
-            print('账号池是空的：mashu account import-local codex|gemini 登记本机登录，mashu account add codex 加 Codex 号')
+            print('模型池里还没有账号：mashu account import-local codex|gemini 登记本机登录，mashu account add codex 加 Codex 号')
             return
         for pl in acct.PLATFORMS:
             sub_ = [a for a in accs if a['platform'] == pl]
@@ -8045,7 +8720,7 @@ def cmd_account(args):
         return
     if act == 'check' and not args.target:
         res = accounts_check(force=True)
-        print('\n'.join(f'{x}：{r}' for x, r in res) or '账号池是空的')
+        print('\n'.join(f'{x}：{r}' for x, r in res) or '模型池里还没有账号')
         return
     print(account_action(act, dict(id=args.target or ''))['result'])
 
@@ -8227,8 +8902,9 @@ def main(argv=None):
     s.add_argument('--plan', help='方案文件（需求 + 技术方案 + 验收标准，已和用户谈清楚）；麻薯开功能必填，开好后等用户批准开工')
     s.add_argument('--account', help='归哪个账号（项目有 .mashu/accounts.json 时；不写按 accounts.json 的 features / 改动范围推）')
     s.add_argument('--workdir', help='执行者的工作目录：工程文件夹里已存在的子目录（相对路径）；不写就是工程根目录。项目适配器开功能时也可能自己设')
+    s.add_argument('--preset', help='执行者用哪个模型池预设（名或 id，mashu preset list 可查；不能与 --cli / --cli-account 同时用）')
     s.add_argument('--cli', choices=PROVIDERS, help='执行者用哪家 CLI（不写 = 执行者默认）；开工审批卡上用户可以再改')
-    s.add_argument('--cli-account', help='执行者用账号池里哪个 Codex 号（cx-2…；要配 --cli codex，不写 = 自动选号）')
+    s.add_argument('--cli-account', help='执行者用模型池里哪个 Codex 号（cx-2…；要配 --cli codex，不写 = 自动选号）')
     s.add_argument('--model', help='执行者的模型（该 CLI 的模型名，mashu platforms 可查；不写 = 默认）')
     s.add_argument('--effort', choices=EFFORTS, help='执行者的思考程度（不写 = 默认）')
     s = sub.add_parser('playbook', aliases=['workflow'], help='工作流（可复用流程）')
@@ -8302,7 +8978,10 @@ def main(argv=None):
         s.add_argument('--agy', action='store_true', help='Gemini（agy）调用：输入输出用 agy 的格式')
         s.add_argument('--codex', action='store_true', help='Codex 调用（格式同 Claude，工具名不同）')
         s.add_argument('--opencode', action='store_true', help='麻薯的 OpenCode 插件调用')
-    s = sub.add_parser('account', help='账号池：Codex 多账号；Gemini 只管本机当前登录的一个号（list / add / import-local / check / refresh / default / disable / enable / remove）')
+    s = sub.add_parser('preset', help='模型池预设（只读列出；增删改在网页模型池页做）')
+    s.add_argument('action', choices=['list'])
+    s.add_argument('--json', action='store_true', help='以 JSON 格式输出')
+    s = sub.add_parser('account', help='模型池账号：Codex 多账号；Gemini 只管本机当前登录的一个号（list / add / import-local / check / refresh / default / disable / enable / remove）')
     s.add_argument('action', choices=['list', 'add', 'import-local', 'check', 'refresh', 'default', 'disable', 'enable', 'remove'])
     s.add_argument('target', nargs='?', help='add / import-local：codex 或 gemini；其余：号 ID（cx-1、gm-2…）')
     s.add_argument('--device', action='store_true', help='Codex：用设备码登录（不在本机浏览器里登录时用）')
@@ -8337,7 +9016,7 @@ def main(argv=None):
         'statusline': cmd_statusline, 'hook-prompt': cmd_hook_prompt, 'hook-stop': cmd_hook_stop, 'hook-notify': cmd_hook_notify,
         'hook-pretool': cmd_hook_pretool, 'hook-session': cmd_hook_session,
         'restart-server': cmd_restart_server, 'gemini-models': cmd_gemini_models, 'platforms': cmd_platforms,
-        'opencode-models': cmd_opencode_models, 'init': cmd_init, 'account': cmd_account, 'config': cmd_config,
+        'opencode-models': cmd_opencode_models, 'init': cmd_init, 'account': cmd_account, 'preset': cmd_preset, 'config': cmd_config,
         'self-iterate': lambda a: __import__('selfiter').cmd(a)}[cmd]
     try:
         handler(args)

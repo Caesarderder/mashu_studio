@@ -342,7 +342,7 @@ function renderTabs() {
   tab('mail', 'mail', '邮箱', badge(mailPending(), 'gold'));
   tab('board', 'board', '看板');
   tab('wall', 'monitor', '会话监控');
-  tab('accounts', 'wallet', '账号池');
+  tab('accounts', 'wallet', '模型池');
   tab('decisions', 'notebook', '决策记录', badge(d, 'dim'));
   tab('library', 'library', '资料库');
   tab('budget', 'wallet', '用量');
@@ -711,25 +711,97 @@ async function loadCandidates() {
 }
 
 // ---------- 频道头 ----------
-// 会话控制：模型 / 思考程度（按对话记住，空闲时在原窗格 --resume 重开生效）+ 交接 / 新会话
-// 功能批准开工时定的执行配置（state.json 的 exec）：执行者对话的「默认」先看它，再看角色默认
+// 会话控制：预设 / CLI / 模型 / 思考 / 账号 / Code Mode（按对话记住，空闲时在原窗格 --resume 重开生效）+ 交接 / 新会话
+// 功能批准开工时定的执行配置（state.json 的 exec）：执行者对话的「默认」先看它，再看角色默认预设
 function featExec(ch) {
   if (!ch || ch === MAIN || !ch.includes('/')) return null;
   const s = seqOf(ch)[1];
   return (s && s.exec) || null;
 }
-function prefOf(ch, role) {
-  const p = (state.prefs || {})[ch] || {};
+function presetsList() { return state.presets || []; }
+function presetById(id) { return id ? presetsList().find((x) => x.id === id) || null : null; }
+function rolePresetId(role) { return (state.role_presets || {})[role] || ''; }
+function rolePreset(role) { return presetById(rolePresetId(role)); }
+function roleDefaultExec(role) {
+  const pr = rolePreset(role);
+  if (pr) {
+    return { cli: pr.cli || 'claude', model: pr.model || '', effort: pr.effort || '',
+      account: pr.cli === 'codex' ? (pr.account || '') : '', code: pr.cli === 'claude' ? !!pr.code_mode : false,
+      preset: pr.id, preset_name: pr.name };
+  }
   const d = state.pref_defaults || {};
+  const cli = (d.providers || {})[role] || 'claude';
+  const pl = platOf(cli);
+  return { cli, model: (d[pl.default_key] || {})[role] || '', effort: (d.efforts || {})[role] || '',
+    account: '', code: cli === 'claude' && (d.codes || {})[role] === 'on', preset: '', preset_name: '' };
+}
+function execSame(a, b) {
+  const ac = a.cli || 'claude', bc = b.cli || 'claude';
+  return ac === bc && (a.model || '') === (b.model || '') && (a.effort || '') === (b.effort || '')
+    && (ac === 'codex' ? (a.account || '') : '') === (bc === 'codex' ? (b.account || '') : '')
+    && (ac === 'claude' ? !!a.code : false) === (bc === 'claude' ? !!b.code : false);
+}
+function baseExecOf(ch, role) {
+  let cur = roleDefaultExec(role);
   const ex = featExec(ch);
-  const dp = (ex && ex.cli) || (d.providers || {})[role] || 'claude';
-  return { model: p.model || '', effort: p.effort || '', code: p.code || '', dm: (d.models || {})[role] || '', de: (ex && ex.effort) || (d.efforts || {})[role] || '', dc: (d.codes || {})[role] || 'off',
-    provider: p.provider || '', dp, gmodel: p.gmodel || '', dgm: (d.gmodels || {})[role] || '',
-    mk: (prov) => p[platOf(prov).model_key] || '',
-    dmk: (prov) => (ex && (ex.cli || 'claude') === prov && ex.model) || (d[platOf(prov).default_key] || {})[role] || '' };
+  if (ex) {
+    const epr = presetById(ex.preset);
+    if (epr) {
+      cur = { cli: epr.cli || 'claude', model: epr.model || '', effort: epr.effort || '',
+        account: epr.cli === 'codex' ? (epr.account || '') : '', code: epr.cli === 'claude' ? !!epr.code_mode : false,
+        preset: epr.id, preset_name: epr.name };
+    }
+    if (ex.cli && ex.cli !== cur.cli) {
+      cur = { cli: ex.cli, model: '', effort: cur.effort, account: '', code: false, preset: '', preset_name: '' };
+    }
+    if (ex.model) { cur.model = ex.model; if (!epr || cur.model !== (epr.model || '')) { cur.preset = ''; cur.preset_name = ''; } }
+    if (ex.effort) { cur.effort = ex.effort; if (!epr || cur.effort !== (epr.effort || '')) { cur.preset = ''; cur.preset_name = ''; } }
+    if (cur.cli === 'codex' && ex.account) { cur.account = ex.account; if (!epr || cur.account !== (epr.account || '')) { cur.preset = ''; cur.preset_name = ''; } }
+    if (cur.cli === 'claude' && 'code_mode' in ex) { cur.code = !!ex.code_mode; if (!epr || cur.code !== !!epr.code_mode) { cur.preset = ''; cur.preset_name = ''; } }
+  }
+  const p = (state.prefs || {})[ch] || {};
+  const cpr = presetById(p.preset);
+  if (cpr) {
+    cur = { cli: cpr.cli || 'claude', model: cpr.model || '', effort: cpr.effort || '',
+      account: cpr.cli === 'codex' ? (cpr.account || '') : '', code: cpr.cli === 'claude' ? !!cpr.code_mode : false,
+      preset: cpr.id, preset_name: cpr.name };
+  }
+  return cur;
+}
+function effectiveExec(ch, role) {
+  const base = baseExecOf(ch, role);
+  const p = (state.prefs || {})[ch] || {};
+  let cli = base.cli, model = base.model, effort = base.effort, account = base.account, code = base.code;
+  let preset = base.preset, preset_name = base.preset_name;
+  if (p.provider && p.provider !== cli) {
+    cli = p.provider; model = ''; account = ''; code = false; preset = ''; preset_name = '';
+  }
+  const mk = platOf(cli).model_key;
+  if (mk in p) model = p[mk] || '';
+  if ('effort' in p) effort = p.effort || '';
+  if (cli === 'codex' && 'xacct' in p) account = p.xacct || '';
+  if (cli === 'claude' && (p.code === 'on' || p.code === 'off')) code = p.code === 'on';
+  const cur = { cli, model, effort, account: cli === 'codex' ? account : '', code: cli === 'claude' ? code : false };
+  const customized = !execSame(cur, base);
+  return { ...cur, preset, preset_name, base, customized };
+}
+function presetSelectOpts(selectedId, defaultPreset, isCustom) {
+  const defLabel = defaultPreset ? `默认：${defaultPreset.name}` : '默认：Claude 默认';
+  return `<option value="" ${!isCustom && !selectedId ? 'selected' : ''}>${esc(defLabel)}</option>`
+    + (isCustom ? '<option value="__custom__" selected disabled>自定义</option>' : '')
+    + presetsList().map((x) => `<option value="${esc(x.id)}" ${!isCustom && selectedId === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('');
+}
+function presetSummary(pr) {
+  const parts = [PROV_CN[pr.cli] || pr.cli, pr.model || 'CLI 默认', `思考 ${pr.effort || '默认'}`];
+  if (pr.cli === 'codex') {
+    const a = pr.account ? cliAccts('codex').find((x) => x.id === pr.account) : null;
+    parts.push(`账号 ${pr.account ? (acctName(a) || pr.account) : '自动'}`);
+  }
+  if (pr.cli === 'claude' && pr.code_mode) parts.push('Code 开');
+  return parts.join(' · ');
 }
 const PROV_CN = { claude: 'Claude', gemini: 'Gemini', codex: 'Codex', opencode: 'OpenCode' };
-const ACCT_PREF = { codex: 'xacct' };      // 对话偏好里指定账号池号的键（Gemini 只留单号，不能指定：#157）
+const ACCT_PREF = { codex: 'xacct' };      // 对话偏好里指定模型池号的键（Gemini 只留单号，不能指定：#157）
 // 平台表（后端 platforms_view）：能不能选、不能选的原因、模型列表、对话偏好里的模型键
 function plats() {
   return state.platforms || [
@@ -745,43 +817,49 @@ function provOpts(cur, withDefault) {
   return plats().map((x) => `<option value="${x.id}" ${x.id === cur ? 'selected' : ''} ${x.ok || x.id === cur ? '' : 'disabled'} title="${esc(x.ok ? (x.version ? `${x.label} ${x.version}` : x.label) : x.reason)}">${esc(x.label)}${x.ok ? '' : '（不可用）'}</option>`).join('');
 }
 function chRole(ch) { return ch === MAIN ? 'assistant' : (seqOf(ch)[1] ? 'crew' : 'producer'); }
-// 这个对话下次新会话用哪家（对话单独设 > 角色默认 > Claude）
-function chProvider(ch) { const p = prefOf(ch, chRole(ch)); return p.provider || p.dp; }
+// 这个对话下次新会话用哪家
+function chProvider(ch) { return effectiveExec(ch, chRole(ch)).cli; }
 function shortModel(x) { return String(x || '').replace(/^claude-/, '').replace(/-(\d+)-(\d+)(?:-\d{8})?$/, ' $1.$2').replace(/^\w/, (c) => c.toUpperCase()); }
 function sessCtl(ch, role, cam, buttons) {
-  const p = prefOf(ch, role);
-  const opts = (list, cur, def, now, none) => `<option value="">${def ? esc(def) : (now ? esc(now) : none)}</option>`
+  const p = (state.prefs || {})[ch] || {};
+  const eff = effectiveExec(ch, role);
+  const opts = (list, cur, now, none) => `<option value="">${now ? esc(now) : none}</option>`
     + (cur && !list.includes(cur) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : '')
     + list.map((x) => `<option value="${esc(x)}" ${x === cur ? 'selected' : ''}>${esc(x)}</option>`).join('');
   const ctx = cam && cam.alive && cam.context_pct != null ? cam.context_pct : null;
-  const prov = p.provider || p.dp, pl = platOf(prov), camProv = cam && cam.alive ? cam.provider || 'claude' : '';
+  const prov = eff.cli, pl = platOf(prov), camProv = cam && cam.alive ? cam.provider || 'claude' : '';
   const nowModel = cam && (cam.provider || 'claude') === prov ? cam.model : '';
-  const full = `${PROV_CN[prov] || prov} · ${p.mk(prov) || p.dmk(prov) || nowModel || '默认模型'} · 思考 ${p.effort || p.de || (cam && cam.effort) || '默认'}`;
+  const ex = featExec(ch);
+  const defPr = (ex && presetById(ex.preset)) || rolePreset(role);
+  const showCustom = eff.customized || (!p.preset && ex && !ex.preset && !execSame(eff, roleDefaultExec(role)));
+  const full = `${eff.preset_name && !showCustom ? `预设：${eff.preset_name} · ` : ''}${PROV_CN[prov] || prov} · ${eff.model || nowModel || '默认模型'} · 思考 ${eff.effort || (cam && cam.effort) || '默认'}`;
   return `<div class="sess-ctl">
     <div class="sess-pill" title="${esc(full)}">
+      <label class="sel preset" title="模型池预设：选了自动填好其余几格；单独改任意一格后显示「自定义」">
+        <select data-pref="preset" data-ch="${esc(ch)}">${presetSelectOpts(p.preset || '', defPr, showCustom)}</select></label>
+      <span class="sp-sep">·</span>
       <label class="sel prov" title="用哪家 CLI（Claude / Gemini / Codex / OpenCode）。只对新会话（点「新会话」或交接后）生效，恢复会话沿用原来那家；灰掉的是现在不能用的（悬停看原因）${camProv ? `；现在的会话：${PROV_CN[camProv] || camProv}` : ''}">
-        <select data-pref="provider" data-ch="${esc(ch)}"><option value="">${PROV_CN[p.dp] || 'Claude'}（默认）</option>
-          ${provOpts(p.provider)}</select></label>
+        <select data-pref="provider" data-ch="${esc(ch)}">${provOpts(prov)}</select></label>
       ${camProv && camProv !== prov ? `<span class="sp-pend" title="现在的会话还是 ${PROV_CN[camProv]}，点「新会话」或交接后换成 ${PROV_CN[prov]}">待新会话</span>` : ''}
       <span class="sp-sep">·</span>
       <label class="sel" title="${esc(full)}
-${esc(pl.label)} 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。第一项 = 用默认。切换时会话在原窗格重开，对话不丢${prov === 'opencode' && !(pl.models || []).length ? '。还没有 OpenCode 模型列表：到「会话监控」的默认设置里点刷新' : ''}">
-        <select data-pref="${esc(pl.model_key)}" data-ch="${esc(ch)}">${opts(modelsFor(prov, ((state.prefs || {})[ch] || {})[ACCT_PREF[prov]] || (featExec(ch) || {}).account), p.mk(prov), p.dmk(prov), prov === 'claude' ? shortModel(nowModel) : nowModel, '默认模型')}</select></label>
+${esc(pl.label)} 模型${nowModel ? `（现在：${esc(nowModel)}）` : ''}。第一项 = CLI 默认。切换时会话在原窗格重开，对话不丢${prov === 'opencode' && !(pl.models || []).length ? '。还没有 OpenCode 模型列表：到「模型池」点刷新' : ''}">
+        <select data-pref="${esc(pl.model_key)}" data-ch="${esc(ch)}">${opts(modelsFor(prov, eff.account), eff.model, prov === 'claude' ? shortModel(nowModel) : nowModel, '默认模型')}</select></label>
       <span class="sp-sep">·</span>
       <label class="sel eff" title="思考程度${cam && cam.effort ? `（现在：${esc(cam.effort)}）` : ''}。Codex / OpenCode 会换成这个模型支持的最接近一档。切换时会话在原窗格重开，对话不丢">
-        <select data-pref="effort" data-ch="${esc(ch)}">${opts(state.effort_choices || [], p.effort, p.de, cam && cam.effort, '默认思考')}</select></label>
+        <select data-pref="effort" data-ch="${esc(ch)}">${opts(state.effort_choices || [], eff.effort, cam && cam.effort, '默认思考')}</select></label>
       ${ACCT_PREF[prov] && cliAccts(prov).length ? `<span class="sp-sep">·</span>
-      <label class="sel acct" title="用账号池里哪个号：第一项 = 自动（状态正常、额度剩得最多的）。只对新会话（新会话 / 交接）生效，会话中途不换号${cam && cam.alive && cam.account ? `；现在的会话用的是 ${esc(acctName(cliAccts().find((a) => a.id === cam.account)) || cam.account)}` : ''}${prov === 'gemini' ? '。Gemini 全机共用一个登录：有 agy 在跑时不切号' : ''}">
-        <select data-pref="${ACCT_PREF[prov]}" data-ch="${esc(ch)}">${acctOpts(prov, ((state.prefs || {})[ch] || {})[ACCT_PREF[prov]] || '')}</select></label>` : ''}
+      <label class="sel acct" title="用模型池里哪个号：第一项 = 自动（状态正常、额度剩得最多的）。只对新会话（新会话 / 交接）生效，会话中途不换号${cam && cam.alive && cam.account ? `；现在的会话用的是 ${esc(acctName(cliAccts().find((a) => a.id === cam.account)) || cam.account)}` : ''}">
+        <select data-pref="${ACCT_PREF[prov]}" data-ch="${esc(ch)}">${acctOpts(prov, eff.account || '')}</select></label>` : ''}
       ${prov !== 'claude' ? '' : `<span class="sp-sep">·</span>
       <label class="sel" title="Claude Code 实验性 Code Mode（用 JavaScript 一次跑多个工具）。开了以后 Chrome 浏览器、computer use 用不了；只对新会话（新会话 / 交接）生效，恢复会话沿用原模式">
-        <select data-pref="code" data-ch="${esc(ch)}"><option value="">Code ${p.dc === 'on' ? '开' : '关'}（默认）</option>
-          <option value="on" ${p.code === 'on' ? 'selected' : ''}>Code 开</option><option value="off" ${p.code === 'off' ? 'selected' : ''}>Code 关</option></select></label>`}
+        <select data-pref="code" data-ch="${esc(ch)}">
+          <option value="off" ${!eff.code ? 'selected' : ''}>Code 关</option><option value="on" ${eff.code ? 'selected' : ''}>Code 开</option></select></label>`}
       ${ctx != null ? `<span class="sp-ctx ${ctxLvl(ctx)}" title="上下文 ${pct(ctx)}（75% 会被要求交接）"><i style="--p:${Math.round(ctx * 100)}"></i>上下文 ${Math.round(ctx * 100)}%</span>` : ''}
     </div>
     <button class="btn ${detailOn ? 'on' : ''}" data-detail title="详细：像 Claude Code 终端一样显示工具参数、子代理、后台任务、待办、思考和状态栏">${icon('terminal', 15)}<span class="bt">${detailOn ? '详细' : '简洁'}</span></button>
     ${buttons ? `<button class="btn" data-sess="handoff" title="交接：让它整理交接文档（handoff.md），然后在原窗格换新会话接着做" ${cam && cam.alive ? '' : 'disabled'}>${icon('swap', 15)}<span class="bt">交接</span></button>
-      <button class="btn" data-sess="new-session" title="新会话：直接新开一个会话，不带上一段对话、不读交接">${icon('sparkle', 15)}<span class="bt">新会话</span></button>` : ''}</div>`;
+      <button class="btn" data-sess="new-session" title="新会话：选择预设并新开一个会话，不带上一段对话、不读交接">${icon('sparkle', 15)}<span class="bt">新会话</span></button>` : ''}</div>`;
 }
 function headStatus(ch, k, extra = '') {
   const lt = liveBusy(ch) ? liveText(ch) : '';
@@ -897,39 +975,96 @@ function closedLine(r) {
   }
   return `<div class="done-line ok">${icon('check', 13)}${esc(by)}批复 · ${clock(r.closed_at)}：${esc(r.answer)}</div>`;
 }
-// 开工审批卡：执行者用哪个 CLI / 模型 / 思考程度，默认填好（开功能时指定的，或执行者默认），可以改了再批准
+// 开工审批卡：第一格选预设，后面是 CLI / 模型 / 思考 / 账号 / Code Mode；选预设自动填好，改一格变「自定义」
 function kickModelOpts(prov, cur, aid) {
   const list = modelsFor(prov, aid);
   return '<option value="">默认模型</option>' + (cur && !list.includes(cur) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : '')
     + list.map((x) => `<option value="${esc(x)}" ${x === cur ? 'selected' : ''}>${esc(x)}</option>`).join('');
 }
 const kickSel = {};       // 卡片上改过但还没批的执行配置：重画消息时保留
+function execMatchesPreset(ex, pr) {
+  if (!pr) return false;
+  return execSame({ cli: ex.cli || 'claude', model: ex.model || '', effort: ex.effort || '',
+    account: ex.account || '', code: !!ex.code_mode }, { cli: pr.cli || 'claude', model: pr.model || '',
+    effort: pr.effort || '', account: pr.account || '', code: !!pr.code_mode });
+}
 function kickExecHtml(r) {
-  const ex = kickSel[r.id] || (r.meta || {}).exec || { cli: 'claude', model: '', effort: '' };
-  return `<div class="kick-exec" data-kick="${r.id}" title="批准后执行者按这里的配置启动；之后在对话的 ⚙ 里改，只影响新会话">
+  const defPr = rolePreset('crew');
+  const defEx = roleDefaultExec('crew');
+  const raw = kickSel[r.id] || (r.meta || {}).exec || { preset: defPr ? defPr.id : '', cli: defEx.cli, model: defEx.model, effort: defEx.effort, account: defEx.account, code_mode: defEx.code };
+  const ex = { preset: raw.preset || '', cli: raw.cli || 'claude', model: raw.model || '', effort: raw.effort || '',
+    account: raw.account || '', code_mode: !!raw.code_mode };
+  const matchedPr = ex.preset ? presetById(ex.preset) : null;
+  const isDefault = !ex.preset && execSame({ ...ex, code: ex.code_mode }, defEx);
+  const isCustom = !isDefault && !(matchedPr && execMatchesPreset(ex, matchedPr));
+  const selPresetId = isDefault ? '' : (matchedPr && !isCustom ? matchedPr.id : '');
+  return `<div class="kick-exec" data-kick="${r.id}" title="批准后执行者按这里的配置启动；第一格选预设，改任意一格后显示自定义">
     <span class="ke-l">${icon('terminal', 13)}执行者</span>
-    <select data-kick-cli="${r.id}">${provOpts(ex.cli || 'claude')}</select>
-    <select data-kick-model="${r.id}">${kickModelOpts(ex.cli || 'claude', ex.model || '', ex.account)}</select>
+    <select data-kick-preset="${r.id}" title="模型池预设">${presetSelectOpts(selPresetId, defPr, isCustom)}</select>
+    <select data-kick-cli="${r.id}">${provOpts(ex.cli)}</select>
+    <select data-kick-model="${r.id}">${kickModelOpts(ex.cli, ex.model, ex.account)}</select>
     <select data-kick-effort="${r.id}"><option value="">默认思考</option>${(state.effort_choices || []).map((x) => `<option value="${esc(x)}" ${x === ex.effort ? 'selected' : ''}>思考 ${esc(x)}</option>`).join('')}</select>
-    <select data-kick-acct="${r.id}" title="账号池里的号（自动 = 开工时挑额度剩得最多的）" ${ACCT_PREF[ex.cli] && cliAccts(ex.cli).length ? '' : 'hidden'}>${acctOpts(ex.cli, ex.account || '')}</select>
+    <select data-kick-acct="${r.id}" title="模型池里的号（自动 = 开工时挑额度剩得最多的）" ${ACCT_PREF[ex.cli] && cliAccts(ex.cli).length ? '' : 'hidden'}>${acctOpts(ex.cli, ex.account)}</select>
+    <select data-kick-code="${r.id}" title="Claude Code 实验性 Code Mode" ${ex.cli === 'claude' ? '' : 'hidden'}><option value="off" ${!ex.code_mode ? 'selected' : ''}>Code 关</option><option value="on" ${ex.code_mode ? 'selected' : ''}>Code 开</option></select>
   </div>`;
 }
 function kickExecOf(rid, el) {
   const box = (el && el.querySelector(`[data-kick="${rid}"]`)) || document.querySelector(`[data-kick="${rid}"]`);
   if (!box) return null;
+  const prEl = box.querySelector('[data-kick-preset]');
+  const cli = box.querySelector('[data-kick-cli]').value;
   const ac = box.querySelector('[data-kick-acct]');
-  return { cli: box.querySelector('[data-kick-cli]').value, model: box.querySelector('[data-kick-model]').value, effort: box.querySelector('[data-kick-effort]').value,
+  const cd = box.querySelector('[data-kick-code]');
+  const pval = prEl ? prEl.value : '';
+  const defPr = rolePreset('crew');
+  const out = { cli, model: box.querySelector('[data-kick-model]').value, effort: box.querySelector('[data-kick-effort]').value,
     account: ac && !ac.hidden ? ac.value : '' };
+  if (cli === 'claude' && cd && !cd.hidden && cd.value === 'on') out.code_mode = true;
+  if (pval && pval !== '__custom__') out.preset = pval;
+  else if (pval === '' && defPr && execMatchesPreset(out, defPr)) out.preset = defPr.id;
+  return out;
 }
 document.addEventListener('change', (ev) => {
-  const s = ev.target.closest('select[data-kick-cli],select[data-kick-model],select[data-kick-effort],select[data-kick-acct]');
+  const s = ev.target.closest('select[data-kick-preset],select[data-kick-cli],select[data-kick-model],select[data-kick-effort],select[data-kick-acct],select[data-kick-code]');
   if (!s) return;
   const box = s.closest('[data-kick]');
-  if (s.dataset.kickCli) {
-    const m = box.querySelector('[data-kick-model]'); if (m) m.innerHTML = kickModelOpts(s.value, '');
-    const a = box.querySelector('[data-kick-acct]'); if (a) { a.innerHTML = acctOpts(s.value, ''); a.hidden = !(ACCT_PREF[s.value] && cliAccts(s.value).length); }
+  const prEl = box.querySelector('[data-kick-preset]');
+  const cliEl = box.querySelector('[data-kick-cli]');
+  const mEl = box.querySelector('[data-kick-model]');
+  const eEl = box.querySelector('[data-kick-effort]');
+  const aEl = box.querySelector('[data-kick-acct]');
+  const cEl = box.querySelector('[data-kick-code]');
+  if (s.dataset.kickPreset !== undefined) {
+    const pr = s.value ? presetById(s.value) : null;
+    const target = pr ? { cli: pr.cli || 'claude', model: pr.model || '', effort: pr.effort || '', account: pr.account || '', code: !!pr.code_mode } : roleDefaultExec('crew');
+    if (cliEl) cliEl.value = target.cli;
+    if (aEl) { aEl.innerHTML = acctOpts(target.cli, target.account); aEl.hidden = !(ACCT_PREF[target.cli] && cliAccts(target.cli).length); }
+    if (mEl) mEl.innerHTML = kickModelOpts(target.cli, target.model, target.account);
+    if (eEl) eEl.value = target.effort;
+    if (cEl) { cEl.value = target.code ? 'on' : 'off'; cEl.hidden = target.cli !== 'claude'; }
+    // 移除临时「自定义」项
+    prEl?.querySelector('option[value="__custom__"]')?.remove();
+  } else {
+    if (s.dataset.kickCli) {
+      if (mEl) mEl.innerHTML = kickModelOpts(s.value, '');
+      if (aEl) { aEl.innerHTML = acctOpts(s.value, ''); aEl.hidden = !(ACCT_PREF[s.value] && cliAccts(s.value).length); }
+      if (cEl) { cEl.value = 'off'; cEl.hidden = s.value !== 'claude'; }
+    }
+    if (s.dataset.kickAcct) {
+      const prov = cliEl.value;
+      if (mEl) mEl.innerHTML = kickModelOpts(prov, modelsFor(prov, s.value).includes(mEl.value) ? mEl.value : '', s.value);
+    }
+    // 任意一格改了，预设格切到「自定义」
+    if (prEl) {
+      let opt = prEl.querySelector('option[value="__custom__"]');
+      if (!opt) {
+        opt = document.createElement('option');
+        opt.value = '__custom__'; opt.textContent = '自定义'; opt.disabled = true;
+        prEl.insertBefore(opt, prEl.children[1] || null);
+      }
+      prEl.value = '__custom__';
+    }
   }
-  if (s.dataset.kickAcct) { const m = box.querySelector('[data-kick-model]'), prov = box.querySelector('[data-kick-cli]').value; if (m) m.innerHTML = kickModelOpts(prov, modelsFor(prov, s.value).includes(m.value) ? m.value : '', s.value); }
   kickSel[box.dataset.kick] = kickExecOf(box.dataset.kick, box.parentElement);
 });
 function muteBtn(r) { return `<button class="btn ghost mute" data-mute="${r.id}" title="静默：不处理这件事、不叫醒任何人，维持现状">${icon('moon', 13)}静默</button>`; }
@@ -1761,56 +1896,25 @@ function drawMail() {
 // ---------- 会话监控 ----------
 let wallTimer = null;
 let zoomCam = null;
-// 默认设置：统一切换各角色默认模型 / 思考程度（studio.json），可同时清掉各对话单独设的
+// 默认设置已移到模型池页；会话监控页只留一行跳转
 const ROLE_CN = { assistant: '主脑', producer: '子脑', crew: '执行者' };
 function defaultsHtml() {
-  const d = state.pref_defaults || {}, E = d.efforts || {}, C = d.codes || {}, P = d.providers || {};
-  const MK = plats().map((x) => x.default_key);       // models / gmodels / xmodels / omodels
-  const LIST = { efforts: state.effort_choices };
-  plats().forEach((x) => { LIST[x.default_key] = x.models || []; });
-  const psel = (role, cur) => `<select data-def="providers" data-role="${role}">${role === '*' ? '<option value="">（不改）</option>' : ''}${provOpts(role === '*' ? '' : (cur || 'claude'))}</select>`;
-  const csel = (role, cur) => `<select data-def="codes" data-role="${role}">${role === '*' ? '<option value="">（不改）</option>' : ''}<option value="off" ${role !== '*' && cur !== 'on' ? 'selected' : ''}>关闭</option><option value="on" ${cur === 'on' ? 'selected' : ''}>开启</option></select>`;
-  const sel = (kind, role, cur) => `<select data-def="${kind}" data-role="${role}"><option value="">${role === '*' ? '（不改）' : kind === 'gmodels' ? 'agy 默认' : 'CLI 默认'}</option>`
-    + (cur && !(LIST[kind] || []).includes(cur) ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : '')
-    + (LIST[kind] || []).map((x) => `<option value="${esc(x)}" ${x === cur ? 'selected' : ''}>${esc(x)}</option>`).join('') + '</select>';
-  const oc = platOf('opencode'), cx = platOf('codex');
-  const nOver = Object.keys(state.prefs || {}).filter((k) => Object.keys(state.prefs[k] || {}).length).length;
-  return `<div class="defaults card-lite"><div class="df-h">${icon('gear', 15)}<b>默认平台、模型与思考程度</b><span class="hint-inline">各角色新开或重开的会话用这里的设置；对话里单独选过的优先</span></div>
-    <div class="df-scroll"><div class="df-grid" style="grid-template-columns: auto repeat(${MK.length + 3}, minmax(76px, 1fr))"><span></span><span class="df-th">平台</span>${plats().map((x) => `<span class="df-th" title="${esc(x.ok ? '' : x.reason)}">${esc(x.label)} 模型${x.ok ? '' : '（不可用）'}</span>`).join('')}<span class="df-th">思考程度</span><span class="df-th" title="只对 Claude 会话有效">Code Mode</span>
-      <span class="df-r all">全部统一</span>${psel('*', '')}${MK.map((k) => sel(k, '*', '')).join('')}${sel('efforts', '*', '')}${csel('*', '')}
-      ${Object.keys(ROLE_CN).map((r) => `<span class="df-r">${ROLE_CN[r]}</span>${psel(r, P[r])}${MK.map((k) => sel(k, r, (d[k] || {})[r])).join('')}${sel('efforts', r, E[r])}${csel(r, C[r])}`).join('')}</div></div>
-    <div class="hint">平台只对新开的会话生效，恢复会话沿用原来那家；灰掉的平台现在不能用（悬停看原因：没装，或版本没做过安全拦截实测）。Gemini 用本机的 Antigravity CLI（agy），要先在终端运行一次 <code>agy</code> 用谷歌账号登录；登录后点
-      <button class="btn small" data-gmrefresh>${icon('swap', 13)}刷新 Gemini 模型列表</button>（现在是${state.gemini_models_cached ? ' agy models 的列表' : '内置兜底列表'}）。</div>
-    <div class="hint">Codex${cx.version ? ` ${esc(cx.version)}` : ''} 用你本机 Codex 的登录和配置（麻薯会话用独立的 CODEX_HOME，不改 <code>~/.codex</code>），模型列表来自 Codex 自己的缓存。
-      OpenCode${oc.version ? ` ${esc(oc.version)}` : ''} 用你本机 OpenCode 配好的提供方（按量计费的模型会花钱），麻薯插件只在麻薯开的会话里加载；模型列表（${(oc.models || []).length} 个）
-      <button class="btn small" data-ocrefresh>${icon('swap', 13)}刷新 OpenCode 模型列表</button>。OpenCode 的思考程度要选了模型才生效。</div>
-    <div class="hint">Code Mode 是 Claude Code 的实验功能：只对新开的会话生效（恢复会话沿用原模式）；开了以后 Chrome 浏览器、computer use 用不了，要用浏览器的活别开。</div>
-    <div class="df-acts"><label><input type="checkbox" id="dfClear"> 同时清除各对话单独设置${nOver ? `（现有 ${nOver} 个）` : ''}</label>
-      <button class="btn primary" data-defsave>${icon('check', 14)}保存并切换</button><span class="hint-inline">空闲会话会在原窗格重开（对话不丢），忙的这一轮做完再切</span></div></div>`;
+  return `<div class="defaults-move card-lite"><span>${icon('gear', 15)}默认平台、模型、预设与模型列表刷新已移到 <b>模型池</b></span>
+    <button class="btn small primary" data-view-go="accounts">前往模型池 →</button></div>`;
 }
-document.addEventListener('change', (ev) => {
-  const s = ev.target.closest('select[data-def][data-role="*"]');
-  if (!s || !s.value) return;
-  document.querySelectorAll(`select[data-def="${s.dataset.def}"]`).forEach((x) => { if (x.dataset.role !== '*') x.value = s.value; });
-});
-document.addEventListener('click', async (ev) => {
-  const b = ev.target.closest('[data-defsave]');
-  if (!b) return;
-  const out = { efforts: {}, codes: {}, providers: {} };
-  plats().forEach((x) => { out[x.default_key] = {}; });
-  document.querySelectorAll('select[data-def]').forEach((x) => { if (x.dataset.role !== '*') out[x.dataset.def][x.dataset.role] = x.value; });
-  b.disabled = true;
-  try { const d = await api('/api/camera', { action: 'defaults', ...out, clear: $('#dfClear')?.checked }); toast(d.result); await refresh(); renderWall(); }
-  catch (e) { toast(e.message); } finally { b.disabled = false; }
-});
 document.addEventListener('click', async (ev) => {
   const b = ev.target.closest('[data-gmrefresh],[data-ocrefresh]');
   if (!b) return;
   b.disabled = true;
-  try { const d = await api('/api/camera', { action: b.dataset.ocrefresh !== undefined ? 'opencode-models' : 'gemini-models' }); toast(d.result); await refresh(); renderWall(); }
-  catch (e) { toast(e.message); } finally { b.disabled = false; }
+  try {
+    const d = await api('/api/camera', { action: b.dataset.ocrefresh !== undefined ? 'opencode-models' : 'gemini-models' });
+    toast(d.result);
+    await refresh();
+    if (view === 'accounts') renderAccounts();
+    if (view === 'wall') renderWall();
+  } catch (e) { toast(e.message); } finally { b.disabled = false; }
 });
-// ---------- 账号池（#4）：Codex / Gemini 多账号。令牌只在「粘贴 RT」时发给本机服务，页面上不显示 ----------
+// ---------- 模型池（#4 + #14）：预设管理、角色默认 + 各家账号与额度 ----------
 let acctJob = loadJSON('mashu.acctjob', null);
        // 正在进行的网页登录：{ id, platform }
 function cliAccts(prov) { return (state.cli_accounts || []).filter((a) => !prov || a.platform === prov); }
@@ -1874,6 +1978,116 @@ function quotaBars(rows) {
     return `<div class="vd-qr" title="${esc(tip || '')}"><span>${esc(label)}</span><i class="vd-bar ${cls}"><i style="width:${p}%"></i></i><b class="${cls}">已用 ${p}%</b><span class="q-dim">${esc(tip || '')}</span></div>`;
   }).join('')}</div>`;
 }
+function presetsSectionHtml() {
+  const ps = presetsList();
+  const rp = state.role_presets || {};
+  const byId = Object.fromEntries(ps.map((p) => [p.id, p]));
+  const rolesOf = (pid) => Object.keys(ROLE_CN).filter((r) => rp[r] === pid).map((r) => ROLE_CN[r]);
+  const rows = ps.map((pr, idx) => {
+    const rs = rolesOf(pr.id);
+    const fb = pr.fallback ? byId[pr.fallback] : null;
+    const pl = platOf(pr.cli);
+    return `<div class="pr-row">
+      <div class="pr-ord">
+        <button class="btn small ghost" data-preset-move="up" data-preset-id="${esc(pr.id)}" ${idx === 0 ? 'disabled' : ''} title="上移">↑</button>
+        <button class="btn small ghost" data-preset-move="down" data-preset-id="${esc(pr.id)}" ${idx === ps.length - 1 ? 'disabled' : ''} title="下移">↓</button>
+      </div>
+      <div class="pr-main">
+        <div class="pr-name"><b>${esc(pr.name)}</b><span class="ac-id">${esc(pr.id)}</span>${!pl.ok ? `<span class="ac-tag bad" title="${esc(pl.reason || '')}">CLI 不可用</span>` : ''}${rs.map((r) => `<span class="ac-tag def">${esc(r)}默认</span>`).join('')}</div>
+        <div class="pr-meta"><span>${esc(presetSummary(pr))}</span>${fb ? `<span class="pr-fb">备选 → <b>${esc(fb.name)}</b></span>` : ''}</div>
+      </div>
+      <div class="pr-acts">
+        <button class="btn small" data-preset-edit="${esc(pr.id)}">编辑</button>
+        <button class="btn small danger" data-preset-del="${esc(pr.id)}">删除</button>
+      </div>
+    </div>`;
+  }).join('');
+  return `<section class="vd-card pr-card" id="vd-presets">
+    <div class="vd-h pr-head">
+      <div><b>预设</b><span class="hint-inline">把 CLI + 模型 + 思考 + 账号 + Code Mode 打包成一个预设，在 ⚙ / 新会话 / 新功能 / 开工卡里一键选用；可指定备选预设在异常或额度不足时自动切换</span></div>
+      <button class="btn small primary" data-preset-new>${icon('plus', 13)}新建预设</button>
+    </div>
+    <div class="pr-list">${rows || '<div class="hint">还没有预设：点右上角「新建预设」创建一个</div>'}</div>
+  </section>`;
+}
+function roleDefaultsSectionHtml() {
+  const ps = presetsList();
+  const rp = state.role_presets || {};
+  const oc = platOf('opencode');
+  const nOver = Object.keys(state.prefs || {}).filter((k) => Object.keys(state.prefs[k] || {}).length).length;
+  const pctLim = state.preset_fallback_pct ?? 95;
+  const roleSel = (role) => `<label class="rp-item"><span>${ROLE_CN[role]}</span><select data-role-preset="${role}">
+    <option value="">（CLI 默认）</option>
+    ${ps.map((p) => `<option value="${esc(p.id)}" ${rp[role] === p.id ? 'selected' : ''}>${esc(p.name)}（${esc(PROV_CN[p.cli] || p.cli)}${p.model ? ` · ${esc(p.model)}` : ''}）</option>`).join('')}
+  </select></label>`;
+  return `<section class="vd-card rp-card" id="vd-roles">
+    <div class="vd-h"><b>角色默认</b><span class="hint-inline">各角色默认使用的预设；对话里单独改过的优先。开新会话时 CLI 不可用、号异常或额度 ≥ ${esc(String(pctLim))}% 自动切换备选预设</span></div>
+    <div class="rp-grid">${Object.keys(ROLE_CN).map(roleSel).join('')}</div>
+    <div class="df-acts">
+      <label><input type="checkbox" id="dfClear"> 同时清除各对话单独设置${nOver ? `（现有 ${nOver} 个）` : ''}</label>
+      <button class="btn primary" data-rolesave>${icon('check', 14)}保存并切换</button>
+      <span class="hint-inline">空闲会话会在原窗格重开（对话不丢），忙的这一轮做完再切</span>
+    </div>
+    <div class="rp-refresh hint">
+      模型列表：
+      <button class="btn small" data-gmrefresh>${icon('swap', 13)}刷新 Gemini 模型列表</button>（${state.gemini_models_cached ? '已缓存 agy models' : '内置兜底列表'}）
+      <button class="btn small" data-ocrefresh>${icon('swap', 13)}刷新 OpenCode 模型列表</button>（${(oc.models || []).length} 个）
+    </div>
+  </section>`;
+}
+function openPresetModal(editId = null) {
+  const ps = presetsList();
+  const cur = editId ? presetById(editId) : null;
+  const pr = cur || { id: '', name: '', cli: 'claude', model: '', effort: '', account: '', code_mode: false, fallback: '' };
+  const fbOpts = `<option value="">无备选</option>` + ps.filter((x) => x.id !== pr.id).map((x) => `<option value="${esc(x.id)}" ${x.id === pr.fallback ? 'selected' : ''}>${esc(x.name)}（${esc(PROV_CN[x.cli] || x.cli)}${x.model ? ` · ${esc(x.model)}` : ''}）</option>`).join('');
+  openModal(`<h2>${cur ? '编辑预设' : '新建预设'}</h2><div class="form api-form">
+    <label>预设名称<input id="prName" value="${esc(pr.name)}" placeholder="例如 Claude Opus · high 或 Codex 主力" autocomplete="off"></label>
+    <label>CLI<select id="prCli">${provOpts(pr.cli)}</select></label>
+    <label>模型<select id="prModel">${kickModelOpts(pr.cli, pr.model, pr.account)}</select></label>
+    <label>思考程度<select id="prEffort"><option value="">默认</option>${(state.effort_choices || []).map((x) => `<option value="${esc(x)}" ${x === pr.effort ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></label>
+    <label id="prAcctWrap" ${ACCT_PREF[pr.cli] && cliAccts(pr.cli).length ? '' : 'hidden'}>账号<select id="prAcct">${acctOpts(pr.cli, pr.account)}</select></label>
+    <label id="prCodeWrap" ${pr.cli === 'claude' ? '' : 'hidden'}>Code Mode<select id="prCode"><option value="off" ${!pr.code_mode ? 'selected' : ''}>关闭</option><option value="on" ${pr.code_mode ? 'selected' : ''}>开启（开了用不了 Chrome 浏览器）</option></select></label>
+    <label>备选预设<select id="prFallback">${fbOpts}</select></label>
+    <p class="hint">CLI 不可用、指定号异常、或已知额度已用 ≥ ${esc(String(state.preset_fallback_pct ?? 95))}% 时，开新会话自动换备选（最多 3 跳，不改对话偏好）。</p>
+    <div class="api-actions"><button class="btn" data-close>取消</button><button class="btn primary" id="prSave">保存</button></div>
+  </div>`);
+  $('#modalBox').classList.add('api-dialog');
+  const syncCli = () => {
+    const cli = $('#prCli').value;
+    const hasAcct = !!(ACCT_PREF[cli] && cliAccts(cli).length);
+    $('#prAcctWrap').hidden = !hasAcct;
+    if (hasAcct) $('#prAcct').innerHTML = acctOpts(cli, '');
+    $('#prModel').innerHTML = kickModelOpts(cli, '', hasAcct ? $('#prAcct').value : '');
+    $('#prCodeWrap').hidden = cli !== 'claude';
+    if (cli !== 'claude') $('#prCode').value = 'off';
+  };
+  $('#prCli').onchange = syncCli;
+  $('#prAcct').onchange = () => {
+    const cli = $('#prCli').value, aid = $('#prAcct').value, m = $('#prModel');
+    m.innerHTML = kickModelOpts(cli, modelsFor(cli, aid).includes(m.value) ? m.value : '', aid);
+  };
+  $('#prSave').onclick = async () => {
+    const btn = $('#prSave'); btn.disabled = true;
+    const cli = $('#prCli').value;
+    try {
+      const d = await api('/api/presets', {
+        action: 'save',
+        id: pr.id || '',
+        name: $('#prName').value.trim(),
+        cli,
+        model: $('#prModel').value,
+        effort: $('#prEffort').value,
+        account: !$('#prAcctWrap').hidden ? $('#prAcct').value : '',
+        code_mode: cli === 'claude' && $('#prCode').value === 'on',
+        fallback: $('#prFallback').value,
+      });
+      closeModal();
+      if (d.result) toast(d.result);
+      await acctRefresh();
+    } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+  };
+  $('#prName').focus();
+}
 function acctPageHtml() {
   const L = state.limits || {}, V = state.vendors || {}, cl = L.claude || {}, oc = L.opencode || {};
   const ce = V.claude || {};
@@ -1901,13 +2115,15 @@ function acctPageHtml() {
   const opencode = vendCard('opencode', 'OpenCode', '按量付费，没有账号额度；提供方和密钥在 OpenCode 自己的配置里',
     oc.today != null || oc.week != null ? `<div class="vd-q"><div class="vd-qr"><span>今日花费</span><b class="vd-unk">$${Number(oc.today || 0).toFixed(2)}</b></div><div class="vd-qr"><span>本周花费</span><b class="vd-unk">$${Number(oc.week || 0).toFixed(2)}</b></div></div>`
       : `<div class="hint">${V.opencode && V.opencode.installed === false ? '没装 OpenCode' : '还没有花费数据'}</div>`);
-  const rules = vendCard('rules', '选号与体检', '',
-    `<ul class="vd-rules"><li><b>Codex 选号</b>：对话 ⚙ 里指定的号 &gt; 开工卡上定的号 &gt; 自动（状态正常、没禁用、额度剩得最多；一样多时默认号优先）。API 号仅手动选择或设为默认时使用。只在新会话开工时选，会话中途不换号。</li>
+  const rules = vendCard('rules', '预设、选号与体检', '',
+    `<ul class="vd-rules"><li><b>预设与备选</b>：优先级为「对话单改字段 &gt; 对话选的预设 &gt; 功能开工配置 &gt; 角色默认预设 &gt; CLI 默认」。开新会话时若 CLI 不可用、指定号异常或已知额度 ≥ ${esc(String(state.preset_fallback_pct ?? 95))}%，自动按备选链切换（最多 3 跳，不改对话偏好，恢复会话不换）。</li>
+      <li><b>Codex 选号</b>：预设/对话指定的号 &gt; 自动（状态正常、没禁用、额度剩得最多；一样多时默认号优先）。API 号仅手动选择或设为默认时使用。只在新会话开工时选，会话中途不换号。</li>
       <li><b>体检</b>：后台每 10 分钟（Gemini）/ 30 分钟（Codex）一次：Gemini 快过期前用 RT 续期并查额度；Codex 读登录状态，麻薯自己持有的号超过 7 天没续期就续一次（本机号让 Codex 自己续）。</li>
-      <li><b>令牌</b>：只存在 <code>state/accounts/</code>（0600）和各自的登录文件里，页面和日志里不显示。删掉 <code>state/accounts/</code> 就回到单号。</li>
-      <li><b>风险</b>：号由你自己提供；多号轮换可能违反服务条款、有封号风险（Gemini 因此只留单号）。</li></ul>`,
+      <li><b>凭据</b>：统一存在 <code>state/studio.json</code>（0600）与各号运行时目录里，页面和日志里不显示。</li></ul>`,
     `<button class="btn small" data-acct-checkall title="马上给所有号体检一次（续期 + 查额度）">${icon('refresh', 13)}全部体检</button>`);
-  return `<div id="acctPage"><h2>账号池</h2><p class="hint">各家 CLI 用的账号和额度。Codex 可以放多个号轮着用；Gemini、Claude 用本机当前的登录；OpenCode 按量付费。</p>
+  return `<div id="acctPage"><h2>模型池</h2><p class="hint">管理模型预设、各角色默认预设，以及各家 CLI 的账号与额度。</p>
+    ${presetsSectionHtml()}
+    ${roleDefaultsSectionHtml()}
     <div id="acctJob">${acctJobHtml()}</div>
     <div class="vd-grid">${claude}${codex}${gemini}${opencode}</div>${rules}</div>`;
 }
@@ -1947,6 +2163,45 @@ async function acctStartJob(body, platform) {
   if (box) box.innerHTML = acctJobHtml();
   setTimeout(acctPoll, 800);
 }
+document.addEventListener('click', async (ev) => {
+  const pn = ev.target.closest('[data-preset-new]');
+  if (pn) return openPresetModal(null);
+  const pe = ev.target.closest('[data-preset-edit]');
+  if (pe) return openPresetModal(pe.dataset.presetEdit);
+  const pm = ev.target.closest('[data-preset-move]');
+  if (pm) {
+    pm.disabled = true;
+    try { const d = await api('/api/presets', { action: 'move', id: pm.dataset.presetId, direction: pm.dataset.presetMove }); if (d.result) toast(d.result); await acctRefresh(); }
+    catch (e) { toast(e.message); } finally { pm.disabled = false; }
+    return;
+  }
+  const pd = ev.target.closest('[data-preset-del]');
+  if (pd) {
+    const pid = pd.dataset.presetDel, pr = presetById(pid);
+    if (!pr) return;
+    const refs = [];
+    for (const r of Object.keys(ROLE_CN)) if ((state.role_presets || {})[r] === pid) refs.push(`${ROLE_CN[r]}默认`);
+    for (const x of presetsList()) if (x.fallback === pid) refs.push(`预设「${x.name}」的备选`);
+    const msg = refs.length ? `确定删除预设「${pr.name}」？\n\n以下引用会一并解除：${refs.join('、')}` : `确定删除预设「${pr.name}」？`;
+    if (!window.confirm(msg)) return;
+    pd.disabled = true;
+    try { const d = await api('/api/presets', { action: 'delete', id: pid }); if (d.result) toast(d.result); await acctRefresh(); }
+    catch (e) { toast(e.message); } finally { pd.disabled = false; }
+    return;
+  }
+  const rs = ev.target.closest('[data-rolesave]');
+  if (rs) {
+    const role_presets = {};
+    document.querySelectorAll('select[data-role-preset]').forEach((x) => { role_presets[x.dataset.rolePreset] = x.value; });
+    rs.disabled = true;
+    try {
+      const d = await api('/api/presets', { action: 'set-roles', role_presets, clear: !!$('#dfClear')?.checked });
+      if (d.result) toast(d.result);
+      await acctRefresh();
+    } catch (e) { toast(e.message); } finally { rs.disabled = false; }
+    return;
+  }
+});
 document.addEventListener('click', async (ev) => {
   const add = ev.target.closest('[data-acct-add]'), act = ev.target.closest('[data-acct-act]');
   const jc = ev.target.closest('[data-acct-jobcancel]'), jx = ev.target.closest('[data-acct-jobclose]'), ca = ev.target.closest('[data-acct-checkall]');
@@ -2310,15 +2565,105 @@ function greenlightModal() {
     <p class="hint" style="margin-top:14px">登记后麻薯会为它开一个子脑和对应的对话；执行者直接在这个文件夹里开发，不建分支。</p>`);
   $('#glPath').focus();
 }
+// 通用预设+执行配置选择器（用于新功能弹窗、新会话弹框）：第一格选预设，选了自动填好其余几格，改一格变「自定义」
+function execPickerHtml(prefix, initEx, defPr) {
+  const ex = { preset: initEx.preset || '', cli: initEx.cli || 'claude', model: initEx.model || '',
+    effort: initEx.effort || '', account: initEx.account || '', code_mode: !!initEx.code_mode };
+  const defEx = defPr ? { cli: defPr.cli || 'claude', model: defPr.model || '', effort: defPr.effort || '',
+    account: defPr.account || '', code: !!defPr.code_mode } : { cli: 'claude', model: '', effort: '', account: '', code: false };
+  const matchedPr = ex.preset ? presetById(ex.preset) : null;
+  const isDefault = !ex.preset && execSame({ ...ex, code: ex.code_mode }, defEx);
+  const isCustom = !isDefault && !(matchedPr && execMatchesPreset(ex, matchedPr));
+  const selPid = isDefault ? '' : (matchedPr && !isCustom ? matchedPr.id : '');
+  const hasAcct = !!(ACCT_PREF[ex.cli] && cliAccts(ex.cli).length);
+  return `<div class="exec-picker" id="${prefix}Picker">
+    <label>预设<select id="${prefix}Preset">${presetSelectOpts(selPid, defPr, isCustom)}</select></label>
+    <div class="ep-grid">
+      <label>CLI<select id="${prefix}Cli">${provOpts(ex.cli)}</select></label>
+      <label>模型<select id="${prefix}Model">${kickModelOpts(ex.cli, ex.model, ex.account)}</select></label>
+      <label>思考<select id="${prefix}Effort"><option value="">默认思考</option>${(state.effort_choices || []).map((x) => `<option value="${esc(x)}" ${x === ex.effort ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></label>
+      <label id="${prefix}AcctWrap" ${hasAcct ? '' : 'hidden'}>账号<select id="${prefix}Acct">${acctOpts(ex.cli, ex.account)}</select></label>
+      <label id="${prefix}CodeWrap" ${ex.cli === 'claude' ? '' : 'hidden'}>Code Mode<select id="${prefix}Code"><option value="off" ${!ex.code_mode ? 'selected' : ''}>关</option><option value="on" ${ex.code_mode ? 'selected' : ''}>开</option></select></label>
+    </div>
+  </div>`;
+}
+function wireExecPicker(prefix, defPr) {
+  const prEl = $(`#${prefix}Preset`), cliEl = $(`#${prefix}Cli`), mEl = $(`#${prefix}Model`);
+  const eEl = $(`#${prefix}Effort`), aEl = $(`#${prefix}Acct`), aWrap = $(`#${prefix}AcctWrap`);
+  const cEl = $(`#${prefix}Code`), cWrap = $(`#${prefix}CodeWrap`);
+  const markCustom = () => {
+    let opt = prEl.querySelector('option[value="__custom__"]');
+    if (!opt) {
+      opt = document.createElement('option');
+      opt.value = '__custom__'; opt.textContent = '自定义'; opt.disabled = true;
+      prEl.insertBefore(opt, prEl.children[1] || null);
+    }
+    prEl.value = '__custom__';
+  };
+  prEl.onchange = () => {
+    const pr = prEl.value ? presetById(prEl.value) : defPr;
+    const t = pr ? { cli: pr.cli || 'claude', model: pr.model || '', effort: pr.effort || '', account: pr.account || '', code: !!pr.code_mode }
+      : { cli: 'claude', model: '', effort: '', account: '', code: false };
+    cliEl.value = t.cli;
+    const hasAcct = !!(ACCT_PREF[t.cli] && cliAccts(t.cli).length);
+    aWrap.hidden = !hasAcct;
+    if (hasAcct) aEl.innerHTML = acctOpts(t.cli, t.account);
+    else { aEl.innerHTML = '<option value="">自动选号</option>'; aEl.value = ''; }
+    mEl.innerHTML = kickModelOpts(t.cli, t.model, hasAcct ? t.account : '');
+    eEl.value = t.effort;
+    cWrap.hidden = t.cli !== 'claude';
+    cEl.value = t.code ? 'on' : 'off';
+    prEl.querySelector('option[value="__custom__"]')?.remove();
+  };
+  cliEl.onchange = () => {
+    const cli = cliEl.value;
+    const hasAcct = !!(ACCT_PREF[cli] && cliAccts(cli).length);
+    aWrap.hidden = !hasAcct;
+    if (hasAcct) aEl.innerHTML = acctOpts(cli, '');
+    else { aEl.innerHTML = '<option value="">自动选号</option>'; aEl.value = ''; }
+    mEl.innerHTML = kickModelOpts(cli, '', '');
+    cWrap.hidden = cli !== 'claude';
+    cEl.value = 'off';
+    markCustom();
+  };
+  aEl.onchange = () => {
+    const cli = cliEl.value;
+    mEl.innerHTML = kickModelOpts(cli, modelsFor(cli, aEl.value).includes(mEl.value) ? mEl.value : '', aEl.value);
+    markCustom();
+  };
+  mEl.onchange = markCustom;
+  eEl.onchange = markCustom;
+  cEl.onchange = markCustom;
+}
+function readExecPicker(prefix, defPr) {
+  const prEl = $(`#${prefix}Preset`), cli = $(`#${prefix}Cli`).value;
+  const aWrap = $(`#${prefix}AcctWrap`), cWrap = $(`#${prefix}CodeWrap`);
+  const pval = prEl.value;
+  const out = {
+    cli,
+    model: $(`#${prefix}Model`).value,
+    effort: $(`#${prefix}Effort`).value,
+    account: !aWrap.hidden ? $(`#${prefix}Acct`).value : '',
+  };
+  if (cli === 'claude' && !cWrap.hidden && $(`#${prefix}Code`).value === 'on') out.code_mode = true;
+  if (pval && pval !== '__custom__') out.preset = pval;
+  else if (pval === '') {
+    out.use_default = true;
+    if (defPr && execMatchesPreset(out, defPr)) out.preset = defPr.id;
+  }
+  return out;
+}
 function pitchModal(fid) {
   const f = filmOf(fid);
+  const defPr = rolePreset('crew'), defEx = roleDefaultExec('crew');
   openModal(`<h2>${esc(f.title)} · 新功能</h2><div class="form">
     <input id="ptSlug" placeholder="英文短名，例如 export-csv"><input id="ptTitle" placeholder="中文标题（可选）">
     <textarea id="ptBrief" placeholder="需求：要做什么、为什么、已知信息"></textarea>
-    ${cliAccts('codex').length ? `<label class="api-field">执行者使用的 Codex 账号（可选）<select id="ptCodexAccount">${acctOpts('codex', '')}</select></label>` : ''}
+    ${execPickerHtml('pt', { ...defEx, preset: '', code_mode: defEx.code }, defPr)}
     ${(f.playbook.stages || []).length > 1 ? `<label class="hint" style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="ptFlow" style="width:auto">按项目工作流「${esc(f.playbook.name)}」分阶段：${esc(f.playbook.stages.join(' → '))}</label>` : ''}
     <div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn" data-close>取消</button><button class="btn primary" id="ptGo" data-film="${esc(fid)}">创建</button></div></div>
     <p class="hint" style="margin-top:14px">默认直接做：一个执行者从头做到尾，不分阶段。一般更推荐直接跟麻薯说，她会交给这个项目的子脑安排。</p>`);
+  wireExecPicker('pt', defPr);
   $('#ptSlug').focus();
 }
 
@@ -2499,23 +2844,23 @@ async function setPref(kind, v) {
 }
 async function sessAction(btn) {
   const kind = btn.dataset.sess;
-  if (kind === 'new-session' && chProvider(current) === 'codex' && cliAccts('codex').length) {
-    const ch = current, selected = ((state.prefs || {})[ch] || {}).xacct || '';
-    const model = ((state.prefs || {})[ch] || {}).xmodel || '';
-    openModal(`<h2>新会话</h2><div class="form api-form"><p>新会话不会带上当前对话上下文。</p><label>Codex 账号<select id="newSessionAccount">${acctOpts('codex', selected)}</select></label><label>模型<select id="newSessionModel">${kickModelOpts('codex', model, selected)}</select></label><div class="api-actions"><button class="btn" data-close>取消</button><button class="btn primary" id="newSessionGo">开始新会话</button></div></div>`);
+  if (kind === 'new-session') {
+    const ch = current, role = chRole(ch);
+    const eff = effectiveExec(ch, role), defPr = rolePreset(role);
+    const p = (state.prefs || {})[ch] || {};
+    const initEx = { preset: eff.customized ? '' : (p.preset || ''), cli: eff.cli, model: eff.model, effort: eff.effort, account: eff.account, code_mode: eff.code };
+    openModal(`<h2>新会话</h2><div class="form api-form"><p>新会话不会带上当前对话上下文。</p>${execPickerHtml('ns', initEx, defPr)}<div class="api-actions"><button class="btn" data-close>取消</button><button class="btn primary" id="newSessionGo">开始新会话</button></div></div>`);
     $('#modalBox').classList.add('api-dialog');
-    $('#newSessionAccount').onchange = (ev) => { const m = $('#newSessionModel'); m.innerHTML = kickModelOpts('codex', modelsFor('codex', ev.target.value).includes(m.value) ? m.value : '', ev.target.value); };
+    wireExecPicker('ns', defPr);
     $('#newSessionGo').onclick = async () => {
       const button = $('#newSessionGo'); button.disabled = true;
-      try { await api('/api/camera', { action: 'new-session', channel: ch, xacct: $('#newSessionAccount').value, xmodel: $('#newSessionModel').value }); closeModal(); await refresh(); }
-      catch (e) { toast(e.message); button.disabled = false; }
+      try {
+        const d = await api('/api/camera', { action: 'new-session', channel: ch, exec: readExecPicker('ns', defPr) });
+        closeModal();
+        if (d.result) toast(d.result);
+        await refresh();
+      } catch (e) { toast(e.message); button.disabled = false; }
     };
-    return;
-  }
-  if (kind === 'new-session' && !btn.classList.contains('confirm')) {     // 新会话会丢掉当前对话上下文：点两下确认
-    const html = btn.innerHTML;
-    btn.classList.add('confirm'); btn.textContent = '再点一次确认';
-    clearTimeout(btn._t); btn._t = setTimeout(() => { btn.classList.remove('confirm'); btn.innerHTML = html; }, 3000);
     return;
   }
   btn.disabled = true;
@@ -2713,7 +3058,8 @@ document.addEventListener('click', async (ev) => {
   }
   if (t.id === 'ptGo') {
     try {
-      const d = await api('/api/pitch', { film: t.dataset.film, slug: $('#ptSlug').value.trim(), title: $('#ptTitle').value.trim(), brief: $('#ptBrief').value.trim(), workflow: !!$('#ptFlow')?.checked, cli_account: $('#ptCodexAccount')?.value || '' });
+      const ex = readExecPicker('pt', rolePreset('crew'));
+      const d = await api('/api/pitch', { film: t.dataset.film, slug: $('#ptSlug').value.trim(), title: $('#ptTitle').value.trim(), brief: $('#ptBrief').value.trim(), workflow: !!$('#ptFlow')?.checked, exec: ex });
       closeModal(); toast(`方案执行者「${d.crew}」排队中`); await refresh(); go(`${t.dataset.film}/${d.key}`);
     } catch (e) { toast(e.message); }
   }
@@ -2725,7 +3071,12 @@ document.addEventListener('keydown', (ev) => {
 });
 document.addEventListener('change', (ev) => {
   if (ev.target.dataset && 'mpend' in ev.target.dataset) { mailPendingOnly = ev.target.checked; drawMail(); }
-  if (ev.target.dataset?.pref) { const t = ev.target; t.blur(); camApi({ action: 'pref', channel: t.dataset.ch, [t.dataset.pref]: t.value }); }
+  if (ev.target.dataset?.pref) {
+    const t = ev.target;
+    if (t.dataset.pref === 'preset' && t.value === '__custom__') return;
+    t.blur();
+    camApi({ action: 'pref', channel: t.dataset.ch, [t.dataset.pref]: t.value });
+  }
 });
 $('#input').addEventListener('keydown', (ev) => {
   if (ev.isComposing) return;
@@ -2830,7 +3181,7 @@ document.documentElement.style.setProperty('--pw', `${panelW}px`);
 })();
 
 // 顶部只留用户常看的几页（用户 2026-11-26：看板、决策记录、资料库、用量不显示）；这几页的视图代码还在，聊天里的文件链接、右栏「去看看」照样能打开
-const VIEWS = [['chat', 'chat', '聊天'], ['mail', 'mail', '邮箱'], ['wall', 'monitor', '会话监控'], ['accounts', 'wallet', '账号池'], ['selfiter', 'refresh', '自迭代']];
+const VIEWS = [['chat', 'chat', '聊天'], ['mail', 'mail', '邮箱'], ['wall', 'monitor', '会话监控'], ['accounts', 'wallet', '模型池'], ['selfiter', 'refresh', '自迭代']];
 let pal = { items: [], sel: 0 };
 function paletteItems() {
   const out = [];

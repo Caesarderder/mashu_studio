@@ -19,12 +19,16 @@ import time
 import zlib
 import base64
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUNDLE_FORMAT = 'mashu-config-bundle'
 OMITTED = '已省略'
 KDF_ITERATIONS = 200_000
 DEFAULT_KEYS = ('providers', 'models', 'gemini_models', 'codex_models', 'opencode_models', 'efforts', 'code_modes')
-SECTION_KEYS = ('schema_version', 'settings', 'defaults', 'accounts', 'providers', 'web')
+SECTION_KEYS = ('schema_version', 'settings', 'defaults', 'presets', 'role_presets', 'accounts', 'providers', 'web')
+ROLES = ('assistant', 'producer', 'crew')
+PRESET_CLIS = ('claude', 'gemini', 'codex', 'opencode')
+_CLI_LABEL = {'claude': 'Claude', 'gemini': 'Gemini', 'codex': 'Codex', 'opencode': 'OpenCode'}
+_CLI_MODEL_KEY = {'claude': 'models', 'gemini': 'gemini_models', 'codex': 'codex_models', 'opencode': 'opencode_models'}
 SAFE_PROVIDER_META = {'source', 'note', 'base_url', 'url', 'model', 'models', 'name', 'type', 'enabled'}
 RT_ROTATION_WARNING = (
     'Codex / Gemini 的 refresh_token 会轮换，导入新电脑后旧电脑上这些号要停用，否则两边会互相顶掉登录；'
@@ -127,7 +131,82 @@ def config_lock(config_path):
 
 
 def is_sectioned(raw):
-    return isinstance(raw, dict) and any(k in raw for k in ('schema_version', 'settings', 'defaults', 'accounts', 'web'))
+    return isinstance(raw, dict) and any(k in raw for k in ('schema_version', 'settings', 'defaults', 'presets', 'role_presets', 'accounts', 'web'))
+
+
+def normalize_preset(raw):
+    if not isinstance(raw, dict):
+        return None
+    pid = str(raw.get('id') or '').strip()
+    if not pid:
+        return None
+    cli = str(raw.get('cli') or 'claude').strip().lower()
+    if cli not in PRESET_CLIS:
+        cli = 'claude'
+    name = str(raw.get('name') or '').strip() or pid
+    model = str(raw.get('model') or '').strip()
+    effort = str(raw.get('effort') or '').strip()
+    account = str(raw.get('account') or '').strip() if cli == 'codex' else ''
+    code_mode = bool(raw.get('code_mode')) if cli == 'claude' else False
+    fallback = str(raw.get('fallback') or '').strip()
+    if fallback == pid:
+        fallback = ''
+    return {
+        'id': pid,
+        'name': name,
+        'cli': cli,
+        'model': model,
+        'effort': effort,
+        'account': account,
+        'code_mode': code_mode,
+        'fallback': fallback,
+    }
+
+
+def _preset_auto_name(cli, model, effort, code_mode):
+    label = _CLI_LABEL.get(cli, cli)
+    if not model and not effort and not code_mode:
+        return f'{label} 默认'
+    head = f'{label} {model}'.strip()
+    parts = [head]
+    if effort:
+        parts.append(effort)
+    if code_mode and cli == 'claude':
+        parts.append('Code')
+    return ' · '.join(parts)
+
+
+def build_presets_from_defaults(defaults_dict):
+    """把旧版 defaults（按角色的 providers / models / efforts / code_modes）转成 presets 和 role_presets。"""
+    defs = defaults_dict if isinstance(defaults_dict, dict) else {}
+    presets = []
+    by_sig = {}
+    role_presets = {}
+    for role in ROLES:
+        cli = str((defs.get('providers') or {}).get(role) or 'claude').strip().lower()
+        if cli not in PRESET_CLIS:
+            cli = 'claude'
+        mk = _CLI_MODEL_KEY[cli]
+        model = str((defs.get(mk) or {}).get(role) or '').strip()
+        effort = str((defs.get('efforts') or {}).get(role) or '').strip()
+        code_mode = (cli == 'claude' and str((defs.get('code_modes') or {}).get(role) or '').strip() == 'on')
+        sig = (cli, model, effort, '', code_mode)
+        pid = by_sig.get(sig)
+        if not pid:
+            pid = f'p-{len(presets) + 1}'
+            by_sig[sig] = pid
+            presets.append({
+                'id': pid,
+                'name': _preset_auto_name(cli, model, effort, code_mode),
+                'cli': cli,
+                'model': model,
+                'effort': effort,
+                'account': '',
+                'code_mode': code_mode,
+                'fallback': '',
+            })
+        role_presets[role] = pid
+    return presets, role_presets
 
 
 def normalize_config(raw):
@@ -150,6 +229,22 @@ def normalize_config(raw):
             continue
         settings.setdefault(k, copy.deepcopy(v))
 
+    presets = []
+    seen_pids = set()
+    raw_presets = raw.get('presets') if isinstance(raw.get('presets'), list) else []
+    for item in raw_presets:
+        p = normalize_preset(item)
+        if p and p['id'] not in seen_pids:
+            seen_pids.add(p['id'])
+            presets.append(p)
+
+    rp_raw = raw.get('role_presets') if isinstance(raw.get('role_presets'), dict) else {}
+    role_presets = {}
+    for role in ROLES:
+        pid = str(rp_raw.get(role) or '').strip()
+        if pid:
+            role_presets[role] = pid
+
     acc_raw = raw.get('accounts') if isinstance(raw.get('accounts'), dict) else {}
     acc_defaults = copy.deepcopy(acc_raw.get('defaults')) if isinstance(acc_raw.get('defaults'), dict) else {}
     raw_items = acc_raw.get('items') if isinstance(acc_raw.get('items'), list) else acc_raw.get('accounts')
@@ -164,6 +259,8 @@ def normalize_config(raw):
         'schema_version': SCHEMA_VERSION,
         'settings': settings,
         'defaults': defaults,
+        'presets': presets,
+        'role_presets': role_presets,
         'accounts': {
             'defaults': acc_defaults,
             'items': items,
@@ -267,8 +364,18 @@ def migrate_if_needed(home):
         provider = providers.get('zhaolaoban') if isinstance(providers, dict) else None
         return isinstance(provider, dict) and bool(provider.get('api_key'))
 
+    def needs_v2(raw):
+        if not isinstance(raw, dict):
+            return False
+        ver = raw.get('schema_version')
+        try:
+            ver_i = int(ver) if ver is not None else 0
+        except (TypeError, ValueError):
+            ver_i = 0
+        return ver_i < SCHEMA_VERSION or 'presets' not in raw or 'role_presets' not in raw
+
     raw_fast = read_json(conf, None) if conf.exists() else None
-    needs = (
+    needs_v1 = (
         tok_file.exists()
         or idx_file.exists()
         or clients_file.exists()
@@ -276,6 +383,7 @@ def migrate_if_needed(home):
         or has_legacy_api(raw_fast)
         or (conf.exists() and not is_sectioned(raw_fast))
     )
+    needs = needs_v1 or (conf.exists() and needs_v2(raw_fast))
     if not needs:
         if conf.exists() and (conf.stat().st_mode & 0o777) != 0o600:
             try:
@@ -287,7 +395,7 @@ def migrate_if_needed(home):
     with config_lock(conf):
         raw = read_json(conf, {}) if conf.exists() else {}
         cred_files = sorted(gemini_dir.glob('*/cred.json')) if gemini_dir.is_dir() else []
-        needs_locked = (
+        needs_v1_locked = (
             tok_file.exists()
             or idx_file.exists()
             or clients_file.exists()
@@ -295,19 +403,25 @@ def migrate_if_needed(home):
             or has_legacy_api(raw)
             or (conf.exists() and not is_sectioned(raw))
         )
-        if not needs_locked:
+        needs_v2_locked = conf.exists() and needs_v2(raw)
+        if not (needs_v1_locked or needs_v2_locked):
             return {'migrated': False, 'files': []}
 
         stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + f'-{secrets.token_hex(2)}'
-        bdir = home / 'backup' / f'one-config-{stamp}'
+        bdir = home / 'backup' / (f'one-config-{stamp}' if needs_v1_locked else f'model-pool-{stamp}')
         migrated_files = []
 
-        if conf.exists() and not is_sectioned(raw):
+        if conf.exists() and (not is_sectioned(raw) or needs_v2_locked):
             _backup_file(conf, bdir / 'studio.json')
             migrated_files.append('studio.json')
 
         cfg = normalize_config(raw)
         _ensure_provider_refs(cfg)
+
+        if not cfg['presets'] and not any(cfg['role_presets'].values()):
+            presets, role_presets = build_presets_from_defaults(cfg['defaults'])
+            cfg['presets'] = presets
+            cfg['role_presets'] = role_presets
 
         provider = cfg['providers'].get('zhaolaoban')
         if isinstance(provider, dict) and provider.get('api_key'):
@@ -680,6 +794,8 @@ def _sanitize_config_for_export(cfg):
         'schema_version': SCHEMA_VERSION,
         'settings': _redact_dict_secrets(norm['settings']),
         'defaults': copy.deepcopy(norm['defaults']),
+        'presets': copy.deepcopy(norm['presets']),
+        'role_presets': copy.deepcopy(norm['role_presets']),
         'accounts': {
             'defaults': copy.deepcopy(norm['accounts']['defaults']),
             'items': safe_accounts,
@@ -805,6 +921,34 @@ def _plan_import(current, payload, encrypted=False):
                 merged['defaults'].setdefault(k, {})[role] = copy.deepcopy(v)
                 changes.append({'section': 'defaults', 'key': f'{k}.{role}', 'action': 'update',
                                 'summary': f'更新默认 {k}.{role}：{cur_d[role]} → {v}'})
+
+    # 2b. presets & role_presets
+    cur_p_idx = {p['id']: i for i, p in enumerate(merged['presets'])}
+    for p in inc['presets']:
+        pid = p['id']
+        idx = cur_p_idx.get(pid)
+        if idx is None:
+            merged['presets'].append(copy.deepcopy(p))
+            cur_p_idx[pid] = len(merged['presets']) - 1
+            changes.append({'section': 'presets', 'key': pid, 'action': 'add',
+                            'summary': f'新增预设 {p["name"]}（{pid}）'})
+        elif merged['presets'][idx] != p:
+            merged['presets'][idx] = copy.deepcopy(p)
+            changes.append({'section': 'presets', 'key': pid, 'action': 'update',
+                            'summary': f'更新预设 {p["name"]}（{pid}）'})
+
+    for role, pid in (inc.get('role_presets') or {}).items():
+        if role not in ROLES or not pid:
+            continue
+        old_pid = merged['role_presets'].get(role) or ''
+        if not old_pid:
+            merged['role_presets'][role] = pid
+            changes.append({'section': 'role_presets', 'key': role, 'action': 'add',
+                            'summary': f'新增角色默认预设 {role} = {pid}'})
+        elif old_pid != pid:
+            merged['role_presets'][role] = pid
+            changes.append({'section': 'role_presets', 'key': role, 'action': 'update',
+                            'summary': f'更新角色默认预设 {role}：{old_pid} → {pid}'})
 
     # 3. providers
     for pname, pval in inc['providers'].items():

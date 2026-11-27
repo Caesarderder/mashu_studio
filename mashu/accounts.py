@@ -331,7 +331,15 @@ def used_pct(a):
     if a.get('platform') == 'gemini':
         r = q.get('remaining')
         return None if r is None else round((1 - float(r)) * 100, 1)
-    vals = [w.get('used_percentage') for w in (q.get('five_hour'), q.get('seven_day')) if isinstance(w, dict) and w.get('used_percentage') is not None]
+    return window_used_pct(q)
+
+
+def window_used_pct(q):
+    """从包含 five_hour / seven_day 的额度字典里取最大已用百分比；未知返回 None。"""
+    if not isinstance(q, dict):
+        return None
+    vals = [w.get('used_percentage') for w in (q.get('five_hour'), q.get('seven_day'))
+            if isinstance(w, dict) and w.get('used_percentage') is not None]
     return max(float(v) for v in vals) if vals else None
 
 

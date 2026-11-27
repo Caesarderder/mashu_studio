@@ -50,9 +50,10 @@ related:
 | `mashu decide "…" [--why …] [--ratify]` | 记下你的决定：默认记为已执行（简报列出，用户可推翻）；拿不准、要用户点头的加 `--ratify` 挂“待追认” |
 | `mashu browser "任务" [--model …] [--cwd …] [--timeout 分钟]` | Code Mode 会话用不了浏览器：把浏览器的活交给不开 Code Mode 的独立 `claude -p --chrome` 会话，结果打印回来，记录在 `state/browser/`；长任务配 `run_in_background` |
 | `mashu say "…"` | 长任务中途在主对话说一句 |
-| `mashu gemini-models [--refresh]` | Gemini（agy）可选模型；`--refresh` 跑 `agy models` 更新缓存 `state/gemini-models.json`（要先登录 agy；没登录时用内置兜底列表）。网页「会话监控 → 默认设置」里也有刷新按钮 |
+| `mashu gemini-models [--refresh]` | Gemini（agy）可选模型；`--refresh` 跑 `agy models` 更新缓存 `state/gemini-models.json`（要先登录 agy；没登录时用内置兜底列表）。网页「模型池」里也有刷新按钮 |
 | `mashu platforms [--check]` | 各家 CLI（Claude / Gemini / Codex / OpenCode）能不能用、版本、模型数；`--check` 再跑一遍安全拦截自检（不调模型）。Codex / OpenCode 的接法见 [平台说明](platforms.md) |
-| `mashu opencode-models [--refresh]` | OpenCode 可选模型（`provider/model`、支持的思考档位、窗口、是否免费）；`--refresh` 跑 `opencode models --verbose` 更新缓存 `state/opencode-models.json`。网页默认设置里也有刷新按钮 |
+| `mashu opencode-models [--refresh]` | OpenCode 可选模型（`provider/model`、支持的思考档位、窗口、是否免费）；`--refresh` 跑 `opencode models --verbose` 更新缓存 `state/opencode-models.json`。网页「模型池」里也有刷新按钮 |
+| `mashu preset list [--json]` | 只读列出模型池预设（id、名字、CLI、模型、思考、账号、备选、哪些角色默认在用）；增删改在网页「模型池」页做 |
 | `mashu config export --out <文件> [--with-secrets]` / `import <文件> [--dry-run] [--yes]` / `migrate` | 主配置文件（`state/studio.json`）导出、差异预览导入与迁移；`--with-secrets` 交互输口令加密，默认省略密钥。详见 [平台说明](platforms.md) |
 | `mashu playbook list / show / check / commit / apply / restore` | 工作流管理；目标写 `film:<项目>`（项目默认工作流）、`template:<项目>/<id>`（项目专用模板，在 `<工程>/.mashu/playbooks/`）或 `template:<id>`（麻薯通用模板）。见 [项目资料制作规范](../workflows/project-assets.md) |
 | `mashu retro [项目]` / `mashu digest` / `mashu self-iterate …` | 复盘数据 / 简报数据 / 每日自迭代 |
@@ -61,7 +62,8 @@ related:
 
 | 命令 | 用途 |
 | --- | --- |
-| `mashu new-feature <项目> <英文slug> --brief "需求原文" --plan <方案文件> [--title "中文标题"] [--workflow] [--touches <glob…>] [--account <id>] [--workdir <子目录>] [--cli claude\|gemini\|codex\|opencode] [--model <模型>] [--effort low\|medium\|high\|xhigh\|max]` | 新建功能（默认直接做）；`--cli / --model / --effort` 指定执行者用哪家 CLI、模型、思考程度（不写 = 执行者默认），写进开工审批卡「执行者：CLI · 模型 · 思考」，用户可以在卡上改了再批准；批准时的配置存进 state.json 的 `exec`，执行者按它启动；`--workdir` 让执行者在工程里的某个已存在子目录里启动（项目适配器也可能在开功能时自己设，见 [项目资料制作规范](../workflows/project-assets.md)「项目适配器」）；麻薯开的功能必须带 `--plan`（需求 + 技术方案，已和用户谈清楚），开好后自动申请用户「批准开工」，批准后执行者才启动；`--touches` 预先声明改动范围，重叠时通知双方和子脑；`--account` 归哪个账号（项目有 `.mashu/accounts.json` 时，id 不存在会报错并列出可选；不写按 accounts.json 推，见 [项目资料制作规范](../workflows/project-assets.md)「accounts.json」）；有账号的项目 `mashu status` 的功能行带账号名 |
+| `mashu new-feature <项目> <英文slug> --brief "需求原文" --plan <方案文件> [--title "中文标题"] [--workflow] [--touches <glob…>] [--account <id>] [--workdir <子目录>] [--preset <名或id>] [--cli claude\|gemini\|codex\|opencode] [--cli-account <id>] [--model <模型>] [--effort low\|medium\|high\|xhigh\|max]` | 新建功能（默认直接做）；优先用 `--preset <名或id>` 指定模型池预设（`mashu preset list` 可查，不能和 `--cli / --cli-account` 同时给），也可用 `--cli / --model / --effort` 单独指定，写进开工审批卡，用户可以在卡上改了再批准；批准时的配置存进 state.json 的 `exec`，执行者按它启动；`--workdir` 让执行者在工程里的某个已存在子目录里启动（项目适配器也可能在开功能时自己设，见 [项目资料制作规范](../workflows/project-assets.md)「项目适配器」）；麻薯开的功能必须带 `--plan`（需求 + 技术方案，已和用户谈清楚），开好后自动申请用户「批准开工」，批准后执行者才启动；`--touches` 预先声明改动范围，重叠时通知双方和子脑；`--account` 归哪个账号（项目有 `.mashu/accounts.json` 时，id 不存在会报错并列出可选；不写按 accounts.json 推，见 [项目资料制作规范](../workflows/project-assets.md)「accounts.json」）；有账号的项目 `mashu status` 的功能行带账号名 |
+| `mashu preset list [--json]` | 只读列出模型池预设，供 `new-feature --preset` 选用 |
 | `mashu start / stop / restart <项目>/<编号>` | 启动 / 停止 / 换新执行者（restart 会换一个新名字） |
 | `mashu note <项目>/<编号> "…"` | 给执行者补充指令 |
 | `mashu feature status --ref <项目>/<编号>` | 看某个功能的状态 |

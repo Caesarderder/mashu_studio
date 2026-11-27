@@ -4,7 +4,7 @@ km_type: reference
 domain: mashu
 status: active
 owner: mashu
-last_verified: 2026-11-26
+last_verified: 2026-11-27
 source_of_truth:
   - mashu/studio.py
   - mashu/platforms.py
@@ -31,14 +31,16 @@ related:
 
 说明麻薯的会话能跑在哪几家 CLI 上、每家怎么启动和恢复、麻薯的 hooks（安全拦截、回复转发、状态）怎么注入、会话记录在哪、已知限制。命令用法见 [命令参考](commands.md)。
 
-## 选哪家
+## 选哪家（模型池预设与备选，#14）
 
-- 网页对话头的 ⚙（平台 · 模型 · 思考）按对话选；「会话监控 → 默认设置」按角色选；`studio.json` 的 `providers` / `models` / `gemini_models` / `codex_models` / `opencode_models` / `efforts`。
-- 执行者的优先级：对话单独设 > 功能批准开工时定的 `exec`（state.json）> 角色默认 > Claude。
-- 开工审批卡写明「执行者：CLI · 模型 · 思考」，卡上可以改了再批准；`mashu new-feature … --cli codex --model gpt-6-luna --effort high` 预先指定。用户在网页直接点「启动」也按卡上的配置。
+- 网页顶部「模型池」页维护**预设**（`CLI + 模型 + 思考 + 账号 + Code Mode + 备选预设`）与**角色默认**（主脑 / 子脑 / 执行者各选一个预设），存放在 `state/studio.json` 的 `presets` 和 `role_presets`（`schema_version: 2`，首次升级自动从旧 `defaults` 迁移并备份）。
+- 对话头部 ⚙、新会话弹框、新功能弹窗、开工审批卡第一格均为「预设」下拉，选了自动填好其余几格；单独改任意一格后预设格显示「自定义」。
+- 解析优先级（统一由 `resolve_exec` 计算）：对话里单独改过的字段 > 对话选的预设 > 功能开工时定的 `exec`（预设或字段）> 角色默认预设 > CLI 默认。
+- **备选预设自动换**：仅在开新会话时触发（恢复会话 `--resume` 不换）。当主预设 CLI 不可用、指定号状态异常，或已知额度任一窗口已用 ≥ `settings.preset_fallback_pct`（默认 95%，额度未知视为可用；预设账号为自动且同 CLI 池有可用号时不换）时，沿备选链找第一个可用的预设（最多 3 跳，防环）；切换只在对话内发一条系统消息并记审计，不改对话偏好。
+- 子脑开功能优先用 `mashu new-feature … --preset <名或id>`（可用 `mashu preset list [--json]` 查询，不能与 `--cli / --cli-account` 同时给）；开工审批卡默认选中该预设，用户可在卡上修改后再批准。
 - 平台只对新会话生效；恢复会话沿用开会话时那家（`meta` 的 `provider:<会话 ID>`、`camprov:<机位>`）。
 - 思考程度共用一组（low / medium / high / xhigh / max），Codex / OpenCode 按模型支持的档位取最接近的（`platforms.nearest_effort`）。
-- **能不能选**：Codex、OpenCode 要装了、版本在已验证范围内（`studio.VERIFIED_VERSIONS`：Codex 0.166.x、OpenCode 1.18.x；`studio.json` 的 `platform_versions` 可追加）。不满足的在网页上灰掉并写原因，`set_pref` / 默认设置 / 开工卡都拒绝；偏好里写着但现在不能用的，新会话退回 Claude 并提示。CLI 升级后先实测安全拦截，再把版本加进去。
+- **能不能选**：Codex、OpenCode 要装了、版本在已验证范围内（`studio.VERIFIED_VERSIONS`：Codex 0.166.x、OpenCode 1.18.x；`studio.json` 的 `platform_versions` 可追加）。不满足的在网页上灰掉并写原因，`set_pref` / 默认设置 / 开工卡都拒绝；偏好里写着但现在不能用且无可用备选的，新会话退回 Claude 并提示。CLI 升级后先实测安全拦截，再把版本加进去。
 - `mashu platforms --check` 看各家状态，并跑一遍安全拦截自检（只验证输入格式转换和判定，不调模型）。
 
 ## 对照表
@@ -95,15 +97,15 @@ related:
 - **Claude**：来自受管会话状态栏回报的 `rate_limits`，写入 `state/ratelimits.json`；包含 5 小时（`five_hour`）与本周（`seven_day`）的百分比及重置时间。
 - **Codex**：来自 rollout 会话记录（`state/codex-home/sessions` 与 `~/.codex/sessions`）中 `token_count` 事件携带的 `rate_limits` 字段（`primary` 为 5 小时 300 分钟窗口，`secondary` 为周 10080 分钟窗口）。只读扫描最新 rollout 文件。
 - **OpenCode**：按量付费，从本地 `~/.local/share/opencode/opencode.db` 只读汇总今日（0 点起）与本周（周一 0 点起）的会话花费（`cost`）。
-- **Gemini（agy）**：agy CLI 自己不报额度；账号池里有 Gemini 号时，麻薯用它的 RT 换 access_token 调 Code Assist 的 `fetchAvailableModels`，显示各模型里剩得最少的比例（见下节「账号池」）。没导入号时显示「无额度数据」。
-- **账号池**：Codex 显示默认号的数字，多号时名字后面标「N号」，悬停列出所有号；Gemini 只有本机当前登录这一个号。
+- **Gemini（agy）**：agy CLI 自己不报额度；模型池里有 Gemini 号时，麻薯用它的 RT 换 access_token 调 Code Assist 的 `fetchAvailableModels`，显示各模型里剩得最少的比例（见下节「模型池」）。没导入号时显示「无额度数据」。
+- **模型池**：Codex 显示默认号的数字，多号时名字后面标「N号」，悬停列出所有号；Gemini 只有本机当前登录这一个号。
 - **服务端节流与缓存**：`studio.read_limits()` 对各平台只读汇总，内存缓存 60 秒，避免前端轮询频繁扫盘或开库；Claude 收到新状态栏时立即失效缓存。
 
-## 账号池（#4 4-account-pool）
+## 模型池（#4 + #14）
 
-Codex 也支持兼容 OpenAI Responses 的 API 号：在账号池点「加 API 号」，输入名称、请求地址和 key，保存前会检查模型列表。命令行可用 `mashu account add codex --api --name 名称 --base-url 地址`，从标准输入读取 key，或用 `--key-file` 指定权限为 0600 的文件。API 号按量计费，不参与自动额度比较；手动指定或设为默认号才使用。密钥存于主配置和该号的运行时登录文件，不带密钥导出时会省略。旧的 `providers.zhaolaoban` 在服务启动时备份主配置后迁入账号池。
+Codex 也支持兼容 OpenAI Responses 的 API 号：在模型池点「加 API 号」，输入名称、请求地址和 key，保存前会检查模型列表。命令行可用 `mashu account add codex --api --name 名称 --base-url 地址`，从标准输入读取 key，或用 `--key-file` 指定权限为 0600 的文件。API 号按量计费，不参与自动额度比较；手动指定或设为默认号才使用。密钥存于主配置和该号的运行时登录文件，不带密钥导出时会省略。旧的 `providers.zhaolaoban` 在服务启动时备份主配置后迁入模型池。
 
-麻薯自己管多个 Codex 账号：加号、续期、按号额度、开会话自动挑号或手动指定。Gemini（agy）只管本机当前登录的**一个号**：续期 + 额度。Claude、OpenCode 不在范围内（「账号池」标签只显示它们的登录和额度 / 花费）。代码：`mashu/accounts.py`（纯逻辑，网络走可替换的 `HTTP`）+ `studio.py` 的「账号池」一节；网页在顶部「账号池」标签（各家账号、额度、加号 / 导入、全部体检）；命令 `mashu account …`。
+麻薯自己管多个 Codex 账号：加号、续期、按号额度、开会话自动挑号或手动指定。Gemini（agy）只管本机当前登录的**一个号**：续期 + 额度。Claude、OpenCode 不在范围内（「模型池」标签同时管理预设、角色默认以及各家的登录和额度 / 花费）。代码：`mashu/accounts.py`（纯逻辑，网络走可替换的 `HTTP`）+ `studio.py`；网页在顶部「模型池」标签；命令 `mashu preset list` / `mashu account …`。
 
 > **Gemini 为什么不做多号 / 切号**（用户 2026-11-26 定，#156 / #157）：Google 的 Antigravity 条款第 6 条把「用第三方软件、工具接入」算违约，可停用 Antigravity / Gemini CLI 账号；2026-02 起一直在封走第三方工具（OpenClaw、OpenCode、CLIProxyAPI 等）用 Antigravity 登录的号，11 月又有一波（403 `TOS_VIOLATION`，有报告整个 Google 账号被停、申诉只有一次机会），第三方整理还点名「多账号自动轮换」「把 agy -p 包在第三方 agent 里」。所以 Gemini 的加第二个号、自动挑号、全局切号入口都关了（`account_action` 直接拒绝，网页 / 命令行没有入口；`accounts.Gemini` 里的导入 RT、网页授权、写钥匙串的代码留着但调不到）。要换 Gemini 号：用户自己在终端运行 agy 登录，麻薯体检时发现钥匙串换了号就跟上（`gemini_sync_local`，旧号记录删掉）。要让第三方工具用 Gemini，走 AI Studio / Vertex 的 API key。
 
@@ -121,9 +123,9 @@ Codex 也支持兼容 OpenAI Responses 的 API 号：在账号池点「加 API �
 
 ### 加号
 
-| | 命令行 | 网页（「账号池」标签） |
+| | 命令行 | 网页（「模型池」标签） |
 | --- | --- | --- |
-| Codex | `mashu account add codex [--device]`（前台跑 `CODEX_HOME=<号目录> codex login`） | 「账号池」标签：「加号（设备码）」显示 `https://auth.openai.com/codex/device` + 一次性码（点了才生成，15 分钟有效）；「加号（本机浏览器）」在本机浏览器打开登录页。后台任务读 `codex login` 的输出，完成后自动登记 |
+| Codex | `mashu account add codex [--device]`（前台跑 `CODEX_HOME=<号目录> codex login`） | 「模型池」标签：「加号（设备码）」显示 `https://auth.openai.com/codex/device` + 一次性码（点了才生成，15 分钟有效）；「加号（本机浏览器）」在本机浏览器打开登录页。后台任务读 `codex login` 的输出，完成后自动登记 |
 | Gemini | 不能加号（#157） | 只有「登记 / 同步本机 agy 登录」 |
 | 本机 | `mashu account import-local codex|gemini` | 「登记本机登录」/「登记 / 同步本机 agy 登录」 |
 
@@ -152,7 +154,7 @@ Codex 也支持兼容 OpenAI Responses 的 API 号：在账号池点「加 API �
 
 ### 回滚
 
-- 仅停用账号池：在主文件里清空 `accounts.items` 或用 `mashu account remove` 删除号后，Codex 会话退回 `state/codex-home`（软链接 `~/.codex/auth.json` 不变），Gemini 用钥匙串里当前的登录。
+- 仅停用多账号：在主文件里清空 `accounts.items` 或用 `mashu account remove` 删除号后，Codex 会话退回 `state/codex-home`（软链接 `~/.codex/auth.json` 不变），Gemini 用钥匙串里当前的登录。
 - 整套主配置改动回滚见下节「主配置文件与导出导入」的回滚说明。
 
 ### 风险
@@ -163,13 +165,13 @@ Codex 也支持兼容 OpenAI Responses 的 API 号：在账号池点「加 API �
 
 ### 1. 主文件结构（`state/studio.json`，0600）
 
-- `settings`：全局设置（并发槽 `stages` = 每个账号同时跑的执行者上限、扫描根目录、端口、价格 `prices`、平台版本 `platform_versions` 等 `DEFAULTS` 键）。
-- `defaults`：各角色默认平台 / 模型 / 思考程度 / Code Mode（`providers`、`models`、`gemini_models`、`codex_models`、`opencode_models`、`efforts`、`code_modes`）。
-- `accounts`：账号池默认号（`defaults`）、账号清单及凭据（`items`：Gemini 的 RT/AT/过期时间，非本机 Codex 的 `auth.json` 内容；本机 Codex 号只记 `auth_ref: "local_cli"`，不复制 RT）、Gemini OAuth 客户端缓存（`gemini_clients`）。
+- `settings`：全局设置（并发槽 `stages` = 每个账号同时跑的执行者上限、备选切换阈值 `preset_fallback_pct` 默认 95、扫描根目录、端口、价格 `prices`、平台版本 `platform_versions` 等 `DEFAULTS` 键）。
+- `presets` / `role_presets`：模型池预设列表及各角色默认预设（`schema_version: 2`；首次迁移自动把旧 `defaults` 转成预设并备份到 `state/backup/model-pool-*`，旧 `defaults` 保留只读供回滚）。
+- `accounts`：模型池默认号（`defaults`）、账号清单及凭据（`items`：Gemini 的 RT/AT/过期时间，非本机 Codex 的 `auth.json` 内容；本机 Codex 号只记 `auth_ref: "local_cli"`，不复制 RT）、Gemini OAuth 客户端缓存（`gemini_clients`）。
 - `providers`：本机 CLI 引用标记与自定义 provider API key。
 - `web`：网页接口口令 `token`（原 `state/token`）。
 - **并发安全**：所有写入经过 `config_file.config_lock`（线程 `RLock` + 进程 `fcntl.flock`）和 `write_private`（同目录临时文件 `0600` + `fsync` + `os.replace`）。
-- **首次迁移**：`server.py` 启动、`mashu init`、访问账号池或 `mashu config migrate` 时自动执行（幂等）：把旧扁平 `studio.json`、`state/token`、`state/accounts/index.json`、`state/accounts/gemini/*/cred.json`、`clients.json` 合并进 `state/studio.json`，旧文件备份到 `state/backup/one-config-*` 后移除，代码不再读旧文件。
+- **首次迁移**：`server.py` 启动、`mashu init`、访问模型池或 `mashu config migrate` 时自动执行（幂等）：把旧扁平 `studio.json`、`state/token`、`state/accounts/index.json`、`state/accounts/gemini/*/cred.json`、`clients.json` 合并进 `state/studio.json`，旧文件备份到 `state/backup/one-config-*` 后移除；v1 → v2 升级自动将旧 `defaults` 迁移成 `presets` 和 `role_presets`（备份到 `state/backup/model-pool-*`）。
 
 ### 2. 哪些东西不在主文件里
 
