@@ -8,7 +8,7 @@
 
 | 功能 | 执行者 | 交付 / 状态 | 方案 |
 | --- | --- | --- | --- |
-| #18 gemini-quota 额度改读 agy /quota | 隐形人（#395 批准，进行中） | accounts.py `GeminiOps.quota`/`parse_agy_quota`；studio.py 只改 Gemini 体检循环里失败时保留旧值的处理；web 只改左下角 Gemini 项和模型池 Gemini 卡片 | `.mashu/plans/gemini-quota.md` |
+| #18 gemini-quota 额度改读 agy /quota + 左下角用量面板重做 | 隐形人（#395 批准，进行中；14:4x 追加第二部分） | accounts.py `GeminiOps.quota`/`parse_agy_quota`；studio.py 只改 Gemini 体检循环里失败时保留旧值的处理，status_data 只增用量字段；web 改左下角整个 `#sideFoot`、模型池 Gemini 卡片 | `.mashu/plans/gemini-quota.md` |
 | #17 stable-runtime 线上跑稳定快照（发布 = 重启服务） | 遇见（#390 批准，进行中） | `bin/mashu` 分流器、`bin/mashu-dev`、`start.sh` 服务路径、studio.py 路径常量 + `MASHU_CONTENT` + `cmd_release`/`runtime_info`/`cmd_restart_server`、`status_data` 只加 `runtime` 字段、server.py 重启接口、web 右上角。不碰 #16 的通信命令/hook_prompt/卡片，不碰 #15 的左栏 | `.mashu/plans/stable-runtime.md` |
 | #16 agent-cli 统一收发 + 收件箱分拣 + agent 友好输出 | 已完成（b1b5703、43ba5d1、5df08ed、0cc3e90、e164ae5），待发布 | 新增 `cmd_me/inbox/send/reply/forward/close`、`resolve_address`、`triage_reports`、`fail()`；旧通信命令改为别名；`reports` 加列；hook_prompt 摘要；web 卡片类型/过时；提示词瘦身。`peer` 只调用 #15 的函数，不改其表 | `.mashu/plans/agent-cli.md` |
 | #15 左栏状态细化 + 点对点等待 | 已完成（2e81a8b、返工 6522542），待重启服务 | 改 `seq_status`/`status_data`/`bg_tasks_of`/`cam_view_bg`/`launch_queue`（记排队原因）/`cmd_collaboration`（peer 等待）/`collaboration_context`、新表 `peer_waits`、web 左栏与对话头部 | `.mashu/plans/status-detail.md` |
