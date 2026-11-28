@@ -71,6 +71,43 @@ class DocsGovernanceTests(Base):
             self.assertIn('未覆盖', errors[0])
             self.assertEqual((target / 'SKILL.md').read_text(), 'local changes')
 
+    def test_source_stays_in_worktree_when_running_snapshot(self):
+        work = self.tmp / 'work'
+        (work / '.git').mkdir(parents=True)
+        runtime = work / 'state' / 'runtime'
+        runtime.mkdir(parents=True)
+        self.assertEqual(skill_sync.content_root(runtime, {}), work)
+        self.assertEqual(skill_sync.content_root(work, {}), work)
+        self.assertEqual(skill_sync.content_root(runtime, {'MASHU_CONTENT': str(self.tmp / 'x')}), self.tmp / 'x')
+
+    def test_submodule_copies_are_not_drift_and_not_synced(self):
+        root = (self.tmp / 'game').resolve()
+        sub = root / 'engine'
+        target = sub / '.agents' / 'skills' / skill_sync.NAME
+        target.mkdir(parents=True)
+        (sub / '.git').write_text('gitdir: ../.git/modules/engine\n')
+        (target / 'SKILL.md').write_text('pinned upstream')
+        skill_sync.lock_path(sub).write_text(json.dumps({'version': 1, 'skills': {skill_sync.NAME: {
+            'files': skill_sync.digest(target)}}}))
+        user_home = self.tmp / 'user'
+        options = (studio.HOME, user_home, [studio.HOME / 'codex-home'], [{'id': 'game', 'path': root}])
+        with patch.dict('os.environ', {'XDG_CONFIG_HOME': str(user_home / '.config')}):
+            row = next(r for r in skill_sync.inventory(*options) if r['path'] == str(target))
+            self.assertEqual(row['status'], skill_sync.SUBMODULE)
+            changes, errors = skill_sync.sync(*options, apply=True)
+        self.assertNotIn(str(target), changes)
+        self.assertFalse(errors)
+        self.assertEqual((target / 'SKILL.md').read_text(), 'pinned upstream')
+        with patch.object(studio, 'skill_inventory', return_value=[row]):
+            summary = selfiter.docs_sections(self.conn, time.time() - 60)
+        self.assertNotIn(str(target), summary)
+        tree = root / 'issues' / 'work'
+        (tree / '.agents' / 'skills' / skill_sync.NAME).mkdir(parents=True)
+        (tree / '.git').write_text('gitdir: /repo/.git/worktrees/work\n')
+        self.assertEqual(skill_sync.nested_checkout(root, tree), skill_sync.WORKTREE)
+        self.assertEqual(skill_sync.nested_checkout(root, sub / '.agents'), skill_sync.SUBMODULE)
+        self.assertIsNone(skill_sync.nested_checkout(root, root))
+
     def test_new_errors_block_without_project_script_and_baseline_is_advisory(self):
         repo = self.make_repo('docs-check')
         film, _ = studio.greenlight(self.conn, repo, 'example')

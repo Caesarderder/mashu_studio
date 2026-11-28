@@ -434,7 +434,7 @@ def claude_docs_usage(transcript, root):
 
 
 def docs_sections(conn, since):
-    drift = [row for row in studio.skill_inventory(conn) if row['status'] not in ('来源', '一致')
+    drift = [row for row in studio.skill_inventory(conn) if row['status'] not in ('来源', '一致', *studio.skills_dist.PINNED)
              or row['project'] is None and row['status'] == '一致' and not row['linked']]
     lines = ['## caesar-docs 漂移', *(f'- {row["status"] if row["status"] != "一致" else "需改为软链接"} {row["path"]}'
                                      for row in drift)]

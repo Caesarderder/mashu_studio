@@ -11,10 +11,23 @@ import tempfile
 
 NAME = 'caesar-docs'
 _CODE = Path(__file__).resolve().parents[1]
-# 线上跑 state/runtime 快照时，技能来源仍取工作区那份（和守则、文档一样即时生效；全局软链接也指向工作区）
-_ROOT = Path(os.environ.get('MASHU_CONTENT') or (
-    _CODE.parent.parent if _CODE.name == 'runtime' and _CODE.parent.name == 'state' and (_CODE.parent.parent / '.git').exists() else _CODE))
+
+
+def content_root(code, env=os.environ):
+    """线上跑 state/runtime 快照时，技能来源仍取工作区那份（和守则、文档一样即时生效；全局软链接也指向工作区）。"""
+    if env.get('MASHU_CONTENT'):
+        return Path(env['MASHU_CONTENT'])
+    code = Path(code)
+    if code.name == 'runtime' and code.parent.name == 'state' and (code.parent.parent / '.git').exists():
+        return code.parent.parent
+    return code
+
+
+_ROOT = content_root(_CODE)
 SOURCE = _ROOT / 'skills' / NAME
+SUBMODULE = '子模块（随上游）'
+WORKTREE = '工作树（随分支）'
+PINNED = (SUBMODULE, WORKTREE)
 LEGACY = {'SKILL.md': '54f6b347ddafaaf4e4b04d79e08dea7f666034c205fbc44a52cbdffab9fde17e'}
 IGNORED = {'.ruff_cache', '__pycache__', '.DS_Store'}
 PRUNE = {'.git', '.agents', '.mashu', 'state', 'node_modules', '.venv', '.build', 'Library', 'DerivedData'}
@@ -30,7 +43,22 @@ def lock_path(root):
     return root / '.agents' / 'skills-lock.json'
 
 
-def project_paths(projects):
+def nested_checkout(root, directory):
+    """directory 在 root 下的 git 子模块或工作树里（根目录的 .git 是文件）：内容跟着上游提交 / 自己的分支走，不由 sync 覆盖。
+    返回 SUBMODULE / WORKTREE / None。"""
+    while directory != root and root in directory.parents:
+        git = directory / '.git'
+        if git.is_file():
+            try:
+                pointer = git.read_text(errors='replace')
+            except OSError:
+                pointer = ''
+            return WORKTREE if '/worktrees/' in pointer else SUBMODULE
+        directory = directory.parent
+    return None
+
+
+def project_paths(projects, include_submodules=False):
     seen = set()
     for project in projects:
         root = Path(project['path']).resolve()
@@ -38,7 +66,9 @@ def project_paths(projects):
             target = directory / '.agents' / 'skills' / NAME
             if directory not in seen and (lock_path(directory).is_file() or target.exists() or target.is_symlink()):
                 seen.add(directory)
-                yield project['id'], directory, target
+                pinned = nested_checkout(root, directory)
+                if include_submodules or not pinned:
+                    yield project['id'], directory, target, pinned
 
 
 def digest(root):
@@ -180,9 +210,12 @@ def installations(home, user_home, codex_homes):
 def inventory(home, user_home, codex_homes, projects, source=SOURCE):
     wanted = digest(source)
     rows = [dict(path=str(source), project=None, version=version(source), fingerprint=fingerprint(wanted), status='来源', linked=False)]
-    targets = [(None, None, path) for path in installations(home, user_home, codex_homes)]
-    for project, root, target in [*targets, *project_paths(projects)]:
+    targets = [(None, None, path, None) for path in installations(home, user_home, codex_homes)]
+    for project, root, target, pinned in [*targets, *project_paths(projects, include_submodules=True)]:
         try:
+            if pinned:
+                rows.append({**status_row(target, wanted, source, None, project), 'status': pinned})
+                continue
             rows.append(status_row(target, wanted, source, root, project))
         except (OSError, ValueError, TypeError) as exc:
             rows.append(dict(path=str(target), project=project, version=None, fingerprint=None,
@@ -214,7 +247,7 @@ def sync_targets(home, user_home, codex_homes, projects, source, wanted, apply, 
             errors.append(f'{target}：{exc}')
     if apply:
         claude_plugin(home, source)
-    for project, root, target in project_paths(projects):
+    for project, root, target, _ in project_paths(projects):
         if project_filter and project != project_filter:
             continue
         try:
