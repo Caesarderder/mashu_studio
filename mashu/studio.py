@@ -2249,6 +2249,7 @@ def accounts_check(force=False, only=None):
                 res.append((b['id'], f'ok（本机 agy 换成了 {b.get("email")}，已跟上）'))
         except acct.AccountError as exc:
             res.append(('gemini', f'同步本机登录失败：{exc}'))
+    gm_gap = 180 if acct.agy_running() else 600     # 有 agy 会话在跑时额度变得快：3 分钟查一次（/quota 不耗 token）
     for a in p.list():
         if only and a['id'] != only:
             continue
@@ -2261,7 +2262,7 @@ def accounts_check(force=False, only=None):
         if a.get('disabled') and not force:
             continue
         if (not force and not (a.get('kind') == 'api' and a['id'] not in _API_MODELS)
-                and time.time() - (a.get('last_check') or 0) < (600 if a['platform'] == 'gemini' else 1800)):
+                and time.time() - (a.get('last_check') or 0) < (gm_gap if a['platform'] == 'gemini' else 1800)):
             continue
         try:
             if a.get('kind') == 'api':

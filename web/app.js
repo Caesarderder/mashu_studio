@@ -759,6 +759,12 @@ function renderClaudeCard(data) {
   const mini = `<span class="qf-w ${quotaRemTone(100 - worstUsed)}"><i class="qf-bar"><i style="width:${worstUsed}%"></i></i><b>${p5 != null ? `5h ${p5}%` : ''}${p5 != null && pw != null ? ' · ' : ''}${pw != null ? `周 ${pw}%` : ''}</b></span>`;
   return qfCard('claude', 'Claude', slots, age, data.at ? `更新于 ${quotaAgeLong(data.at)}` : '', body, mini, tip);
 }
+// 窗口已过重置时间：旧百分比作废，按「等会话报上来」显示
+function codexLiveWin(w) {
+  if (!w || !w.resets_at) return w;
+  const t = Number(w.resets_at) > 1e12 ? Number(w.resets_at) : Number(w.resets_at) * 1000;
+  return t < Date.now() ? null : w;
+}
 function renderCodexCard(data) {
   const sl = slotsForProv('codex');
   const cxAccts = cliAccts('codex');
@@ -772,7 +778,8 @@ function renderCodexCard(data) {
   if (data && data.installed === false) {
     return qfCard('codex', 'Codex', slots, '', '', '<div class="qf-empty">未安装</div>', '<span class="qf-empty">未安装</span>', 'Codex 未安装', '', true);
   }
-  const latestAt = accList.reduce((m, a) => Math.max(m, (a.quota && a.quota.at) || 0), (data && data.at) || 0) || null;
+  const liveAccts = accList.filter((a) => !a.disabled && (a.kind === 'api' || a.status === 'ok'));
+  const latestAt = liveAccts.reduce((m, a) => Math.max(m, (a.quota && a.quota.at) || 0), (data && data.at) || 0) || null;
   const age = quotaAgeShort(latestAt);
   if (accList.length) {
     let worstUsed = null;
@@ -781,10 +788,13 @@ function renderCodexCard(data) {
       const name = shortAcctLabel(a);
       const aRun = sl.perAcct[a.id] || 0;
       const lbl = multi ? `<span class="qf-tag" title="${esc(acctName(a))}${aRun ? `（在跑 ${aRun}/${sl.max}）` : ''}">${esc(name)}</span>` : '';
+      // 禁用 / 未登录的号不显示旧百分比（那是停用前的数，会误以为还在用）
+      if (a.disabled) return `<div class="qf-row">${lbl}<span class="qf-empty">已禁用</span></div>`;
+      if (a.kind !== 'api' && a.status && a.status !== 'ok') return `<div class="qf-row">${lbl}<span class="qf-empty">${esc(a.status_cn || a.status)}</span></div>`;
       if (a.kind === 'api' || q.billing === 'usage') {
         return `<div class="qf-row">${lbl}<span class="qf-empty">按量计费</span></div>`;
       }
-      const f5 = q.five_hour, fw = q.seven_day;
+      const f5 = codexLiveWin(q.five_hour), fw = codexLiveWin(q.seven_day);
       const has = (f5 && f5.used_percentage != null) || (fw && fw.used_percentage != null);
       if (!has) return `<div class="qf-row">${lbl}<span class="qf-empty">等会话报上来</span></div>`;
       const u = Math.max(f5?.used_percentage ?? 0, fw?.used_percentage ?? 0);
@@ -792,10 +802,11 @@ function renderCodexCard(data) {
       return `<div class="qf-row">${lbl}${qfBarUsed('5h', f5, acctName(a))}${qfBarUsed('周', fw, acctName(a))}${qfNearestResetHtml(f5 && f5.resets_at, fw && fw.resets_at)}</div>`;
     });
     const tip = `${acctTip({ account: data && data.account, accounts: accList })}${latestAt ? `\n更新于 ${quotaAgeLong(latestAt)}` : ''}\n点击查看全部账号详情`;
+    const none = !liveAccts.length;
     const mini = worstUsed != null
       ? `<span class="qf-w ${quotaRemTone(100 - worstUsed)}"><i class="qf-bar"><i style="width:${Math.round(worstUsed)}%"></i></i><b>最高 ${Math.round(worstUsed)}%</b></span>`
-      : '<span class="qf-empty">等会话报上来</span>';
-    return qfCard('codex', 'Codex', slots, age, latestAt ? `更新于 ${quotaAgeLong(latestAt)}` : '', rows.join(''), mini, tip, badge);
+      : `<span class="qf-empty">${none ? '没有可用的号' : '等会话报上来'}</span>`;
+    return qfCard('codex', 'Codex', slots, none ? '' : age, latestAt ? `更新于 ${quotaAgeLong(latestAt)}` : '', rows.join(''), mini, tip, badge, none);
   }
   const f5 = data && data.five_hour, fw = data && data.seven_day;
   const has = (f5 && f5.used_percentage != null) || (fw && fw.used_percentage != null);
