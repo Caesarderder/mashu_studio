@@ -467,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/api/restart-server':   # 发布快照并重启服务：要跑 check.sh，不占全局锁
             try:
                 data = self.body() or {}
-                if not data.get('dry_run') and not data.get('rollback'):     # 网页按钮：后台发布、立刻返回（#143）
+                if data.get('background') and not data.get('dry_run') and not data.get('rollback'):   # 网页按钮：后台发布、立刻返回（#143）；不带 background 仍同步返回
                     return self.send_json(start_release_job(data))
                 # 都走 studio.release_runtime（release_logged 失败时记事件；auto：网页按钮用，落后已提交代码就发布并重启，不落后只重启）
                 release = studio.restart_auto if data.get('auto') else studio.release_logged

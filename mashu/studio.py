@@ -9570,11 +9570,14 @@ def release_failures(out):
             continue
         name, where = m.group(2), m.group(3)
         tid = where if where.endswith('.' + name) else f'{where}.{name}'
-        first = ''
+        first, body = '', False          # 跳过测试的说明行，从 ---- 分隔线后的 Traceback 之后取首个异常行
         for x in lines[i + 1:]:
             if x.startswith('=' * 20) or UNITTEST_FAIL_RE.match(x):
                 break
-            if x and not x.startswith((' ', '-', 'Traceback')):
+            if x.startswith('-' * 20):
+                body = True
+                continue
+            if body and x and not x.startswith((' ', 'Traceback')):
                 first = x.strip()
                 break
         items.append(f'{tid}：{first[:200]}' if first else tid)

@@ -3758,7 +3758,7 @@ async function restartServer(opts = {}) {
     res = await fetch('/api/restart-server', {
       method: 'POST',
       headers: { 'X-Mashu-Token': TOKEN, 'Content-Type': 'application/json' },
-      body: JSON.stringify(opts || {}),
+      body: JSON.stringify({ ...(opts || {}), background: true }),
     });
     data = await res.json().catch(() => ({}));
   } catch (e) {
