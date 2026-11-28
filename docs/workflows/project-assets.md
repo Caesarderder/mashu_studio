@@ -48,6 +48,14 @@ related:
 - 改麻薯通用模板、麻薯记忆、麻薯知识地图：`mashu report` 交给主脑。
 - 执行者不改工作流和模板，有建议 `mashu tell` 给子脑。
 
+## 进不进 git（用户 2026-11-28 #450 定）
+
+- 工程的项目资料 `.mashu/` 和知识地图 `docs/` 默认进各自工程的 git，跟代码一起提交。
+- 排除流水、历史和临时件，在工程 `.gitignore` 写：`/.mashu/board.jsonl`、`/.mashu/history/`、`/.mashu/handoff*.md`、`/.mashu/drafts/tmp/`。
+- 例外：cysj 工作区的 `.mashu/` 不进 git，保持现状。
+- 公开仓库推送前先确认没有密钥、令牌、带凭证 URL、个人信息；推送照常要用户点头。
+- 执行者收尾时把本功能在 `.mashu/features/<功能>/` 下产生的文件（截图、报告）一起提交。
+
 ## 新工程登记（主脑）
 
 1. 建工作区目录、克隆仓库；工作区本身也要记事时 `git init`，用 `.gitignore` 排除各工程仓库。
