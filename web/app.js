@@ -180,7 +180,7 @@ function mdTable(lines) {
 function md(text) {
   const parts = String(text ?? '').split(/```[\w-]*\n?/);
   return parts.map((p, i) => {
-    if (i % 2) return `<pre><code>${esc(p.replace(/\n$/, ''))}</code></pre>`;
+    if (i % 2) return `<div class="code-wrap"><button class="code-copy" data-copycode title="复制代码">${icon('copy', 12)}复制</button><pre><code>${esc(p.replace(/\n$/, ''))}</code></pre></div>`;
     // 表格：表头行 + 分隔行 + 若干数据行，其余照常
     const lines = p.split('\n');
     const out = [];
@@ -3845,6 +3845,8 @@ document.addEventListener('click', (ev) => {
   if (ev.target.closest('[data-palette]')) return openPalette();
   const cp = ev.target.closest('[data-copy]');
   if (cp) navigator.clipboard?.writeText(cp.dataset.copy).then(() => toast('已复制'), () => {});
+  const cc = ev.target.closest('[data-copycode]');
+  if (cc) { const code = cc.parentElement.querySelector('pre code'); if (code) navigator.clipboard?.writeText(code.textContent).then(() => toast('已复制'), () => {}); return; }
   const cm = ev.target.closest('[data-copymsg]');
   if (cm) { const m = messages.find((x) => x.id === Number(cm.dataset.copymsg)); if (m) navigator.clipboard?.writeText(m.text).then(() => toast('已复制'), () => {}); }
   if (ev.target.closest('[data-interrupt]')) return interruptNow();
