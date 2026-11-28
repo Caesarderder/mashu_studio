@@ -4036,6 +4036,16 @@ def resolve_address(conn, cam, raw_addr):
     fail('not_found', f'找不到发送对象「{addr}」', fix='mashu me 查看可用对象地址', exit_code=EXIT_NOT_FOUND)
 
 
+TELL_TODO_RE = re.compile(r'请(你|用户)?(打开|登录|截|充值|付款|发我|提供|扫码|授权)|麻烦(你|用户)|截一张|发我|'
+                          r'需要(你|用户)(去|来|帮|提供|登录|截图|充值|付款)')
+
+
+def tell_todo(text):
+    """通报里写了要对方去做的事（截图、登录、充值…）：通报会被一键关掉，这类事要发成 ask 待办卡（自迭代 #136）。"""
+    m = TELL_TODO_RE.search(text or '')
+    return m.group(0) if m else ''
+
+
 def send_message(conn, cam, to, text, msg_type=None, options=None, recommend=None, why=None, summary=None,
                  gate=None, confirm_stage=None, impact=None, reversible=None, human=False, urgent=False,
                  ref=None, re_id=None, supersedes=None, dedupe_key=None, legacy_kind=None):
@@ -4099,6 +4109,11 @@ def send_message(conn, cam, to, text, msg_type=None, options=None, recommend=Non
         kind = 'report'
     else:
         kind = 'tell'
+    hit = tell_todo(text) if kind == 'tell' else ''
+    if hit:
+        fail('tell_has_todo', f'通报里有要对方去做的事（「{hit}」）：通报会被直接关掉，没人跟进',
+             fix=f'mashu send {to} "…" --type ask --human --options "已做好|做不了" --recommend A；只是告知就把这句改成陈述再发',
+             exit_code=EXIT_RULE)
     if re_id is not None:
         re_id = int(str(re_id).lstrip('#'))
         report(conn, re_id)
@@ -4805,6 +4820,28 @@ def run_check(f, key, stage_no, repos=None, baselines=None):
                 path=str(p.relative_to(seq_dir(f, key))), code=code)
 
 
+SHORTFALL_RE = re.compile(r'未达标|没达标|没到目标|超目标|超出目标|略超|未验证|没验证|没有验证')
+
+
+def shortfall_block(conn, f, key, c, data):
+    """功能最后一个阶段完成时：本会话写的交接里出现「未达标 / 超目标 / 未验证」，且没批过「部分完成」，就不让收工（自迭代 #125）。"""
+    if not seq_done(data) or not wrote_handoff(c):
+        return ''
+    try:
+        text = handoff_path(conn, c).read_text()
+    except OSError:
+        return ''
+    hits = sorted(set(SHORTFALL_RE.findall(text)))
+    if not hits:
+        return ''
+    ok = conn.execute('SELECT 1 FROM reports WHERE film_id=? AND seq_key=? AND status!="open" AND answer LIKE "%部分完成%" '
+                      'AND created_at>=? LIMIT 1', (f['id'], key, (data or {}).get('created_ts') or 0)).fetchone()
+    if ok:
+        return ''
+    return (f'交接里写了「{"、".join(hits)}」：有指标没达标或没验证。先 `mashu send up "…" --type ask --options "接受部分完成|补做到达标" '
+            '--recommend …` 请子脑定；批了「部分完成」再 finish。已经补到达标、核实过，就把交接里的这些说法改掉再 finish。')
+
+
 def finish_checks(conn, c):
     """执行者结束本阶段前的确定性检查。返回 (能否交接, 说明)。"""
     f = film(conn, c['film_id'])
@@ -4816,6 +4853,9 @@ def finish_checks(conn, c):
         return True, '本阶段未标记完成：按交接处理，不做完成检查'
     notes, warns = [], []
     strict = cfg('strict_checks')
+    short = shortfall_block(conn, f, key, c, data)
+    if short:
+        return False, short
     tag = feature_tag(f, key)
     repos = docs.feature_repos(f['path'], set_dir(f, key), tag)
     handoff_docs = (data.get('handoff') or {}).get('docs') or ''
@@ -8364,6 +8404,8 @@ def edit_guard(conn, c, f, fp):
     owner = path_owner(conn, f, rel, key)
     if owner:
         board_post(f, '写入提醒', f'#{seq_num(key)} 正在编辑 {rel}，与 #{seq_num(owner)} 的范围重叠。请按法典分区编辑。')
+    if '.local' in Path(rel).parts:      # 被 git 忽略的本机产物（评测输出等）不算改动范围（自迭代 #131）
+        return None
     if not any(claim_match(rel, x) for x in claims_of(f, key)):
         data = seq_state(f, key)
         if data is not None:
