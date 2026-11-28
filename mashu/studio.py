@@ -9557,6 +9557,55 @@ def _assert_runtime_compatible(repo, target_sha):
              fix='发布 HEAD 或 #17 stable-runtime（59d21ba）之后的提交', exit_code=EXIT_RULE)
 
 
+UNITTEST_FAIL_RE = re.compile(r'^(FAIL|ERROR): (\S+) \((.+?)\)\s*$')
+
+
+def release_failures(out):
+    """从检查输出里挑失败项：unittest 的「测试 id：首行断言」，没有就取带 ERROR 的行（#146）。"""
+    lines = (out or '').splitlines()
+    items = []
+    for i, ln in enumerate(lines):
+        m = UNITTEST_FAIL_RE.match(ln)
+        if not m:
+            continue
+        name, where = m.group(2), m.group(3)
+        tid = where if where.endswith('.' + name) else f'{where}.{name}'
+        first = ''
+        for x in lines[i + 1:]:
+            if x.startswith('=' * 20) or UNITTEST_FAIL_RE.match(x):
+                break
+            if x and not x.startswith((' ', '-', 'Traceback')):
+                first = x.strip()
+                break
+        items.append(f'{tid}：{first[:200]}' if first else tid)
+    if not items:
+        items = [x.strip()[:200] for x in lines if 'ERROR' in x][:5]
+    return items
+
+
+def save_release_log(sha, out):
+    """完整检查输出落盘 state/release-logs/<sha>.log，返回路径（写不了返回空串）。"""
+    try:
+        d = HOME / 'release-logs'
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f'{sha}.log'
+        p.write_text(out or '')
+        return str(p)
+    except OSError:
+        return ''
+
+
+def release_fail_detail(sha, out, head):
+    """发布检查失败的说明：先失败项，再完整日志路径，再输出末尾约 40 行；提示词原文之类的长段落不放开头。"""
+    fails = release_failures(out)
+    log = save_release_log(sha, out)
+    tail = '\n'.join((out or '').splitlines()[-40:])
+    text = f'{head}\n失败项：' + ('；'.join(fails) if fails else '（没认出失败项，见日志）')
+    if log:
+        text += f'\n完整输出：{log}'
+    return text + ('\n\n' + tail if tail else ''), fails, log, tail
+
+
 def _run_release_check(repo, target_sha):
     import tempfile
     tmp_root = Path(tempfile.mkdtemp(prefix='mashu-release-check-')).resolve()
@@ -9579,16 +9628,18 @@ def _run_release_check(repo, target_sha):
             proc = subprocess.run(['bash', str(check_sh)], cwd=str(wt), env=env,
                                   capture_output=True, text=True, timeout=timeout_s)
         except subprocess.TimeoutExpired as exc:
-            out = ((exc.stdout or '') + '\n' + (exc.stderr or '')).strip()[-2000:]
-            fail('check_failed', f'发布前检查超时（{target_sha[:7]}，超过 {timeout_s}s）',
-                 fix='修复耗时或卡住的检查项并提交后再试', exit_code=EXIT_RULE,
-                 data={'sha': target_sha, 'check_output': out, 'returncode': -1})
+            out = '\n'.join(x if isinstance(x, str) else (x or b'').decode('utf-8', 'replace')
+                            for x in (exc.stdout, exc.stderr)).strip()
+            msg, fails, log, tail = release_fail_detail(target_sha, out, f'发布前检查超时（{target_sha[:7]}，超过 {timeout_s}s）')
+            fail('check_failed', msg, fix='修复耗时或卡住的检查项并提交后再试', exit_code=EXIT_RULE,
+                 data={'sha': target_sha, 'check_output': tail, 'failures': fails, 'log_path': log, 'returncode': -1})
         combined = '\n'.join(x for x in (proc.stdout.strip(), proc.stderr.strip()) if x).strip()
         if proc.returncode != 0:
-            summary = combined[-2000:] if combined else f'退出码 {proc.returncode}'
-            fail('check_failed', f'发布前检查未通过（{target_sha[:7]}）：\n{summary}',
-                 fix='修复失败项并提交后再运行 mashu release', exit_code=EXIT_RULE,
-                 data={'sha': target_sha, 'check_output': summary, 'returncode': proc.returncode})
+            msg, fails, log, tail = release_fail_detail(target_sha, combined or f'退出码 {proc.returncode}',
+                                                        f'发布前检查未通过（{target_sha[:7]}）')
+            fail('check_failed', msg, fix='修复失败项并提交后再运行 mashu release', exit_code=EXIT_RULE,
+                 data={'sha': target_sha, 'check_output': tail, 'failures': fails, 'log_path': log,
+                       'returncode': proc.returncode})
         return dict(checked=True, skipped=False, output=combined[-2000:])
     finally:
         _git_output(repo, 'worktree', 'remove', '--force', str(wt))
@@ -9696,15 +9747,62 @@ def release_runtime(conn, *, sha=None, rollback=False, same=False, dry_run=False
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
-def release_logged(conn, **kw):
-    """release_runtime 的包装：发布失败（检查没过、快照切换失败等）记一条 release-fail 事件，自迭代据此做事故小复盘。"""
+def release_requester(conn, sha):
+    """最近一次把这个提交交给主脑请求发布的子脑汇报（正文或摘要里写了 sha 前 7 位）。"""
+    short = (sha or '')[:7]
+    if len(short) < 7:
+        return None
+    return one(conn, 'SELECT * FROM reports WHERE source_role="producer" AND film_id IS NOT NULL AND created_at>=? '
+                     'AND (text LIKE ? OR summary LIKE ?) ORDER BY id DESC LIMIT 1',
+               time.time() - 7 * 86400, f'%{short}%', f'%{short}%')
+
+
+def notify_release(conn, sha, ok, line):
+    """发布成功 / 失败后告诉请求发布的子脑，并在那张汇报卡末尾加一行结果（#145 #148）。出错不影响发布本身。"""
     try:
-        return release_runtime(conn, **kw)
+        r = release_requester(conn, sha)
+        if not r:
+            return None
+        stamp = datetime.datetime.now().strftime('%m-%d %H:%M')
+        conn.execute('UPDATE reports SET text=COALESCE(text, "") || ? WHERE id=?',
+                     (f'\n\n[{stamp} 发布结果] {line}', r['id']))
+        conn.commit()
+        text = f'[发布结果 #{r["id"]}] {line}'
+        if active_producer(conn, r['film_id']):
+            post(conn, 'system', r['film_id'], 'notice', text, target=f'producer:{r["film_id"]}', report_id=r['id'])
+        else:       # 子脑不在线：只进项目频道，不为一条通知拉起会话
+            notice(conn, r['film_id'], text)
+        return r['id']
+    except Exception as exc:
+        log_event(conn, 'error', level='warn', where='notify_release', err=f'{type(exc).__name__}: {exc}'[:300])
+        return None
+
+
+def release_logged(conn, **kw):
+    """release_runtime 的包装：发布失败（检查没过、快照切换失败等）记一条 release-fail 事件，自迭代据此做事故小复盘；
+    发布（非演练）成功或失败后通知请求发布该提交的子脑。"""
+    try:
+        res = release_runtime(conn, **kw)
     except MashuError as exc:
         if exc.code != 'usage_error' and not kw.get('dry_run'):
+            data = exc.data or {}
             log_event(conn, 'release-fail', level='warn', code=exc.code, err=str(exc.message)[:500], actor=kw.get('actor'),
-                      sha=kw.get('sha'), rollback=bool(kw.get('rollback')) or None)
+                      sha=data.get('sha') or kw.get('sha'), rollback=bool(kw.get('rollback')) or None,
+                      failures=data.get('failures') or None, log=data.get('log_path') or None)
+            target = data.get('sha') or ''
+            if not target and not kw.get('rollback') and is_git(CONTENT):
+                rc, out, _ = _git_output(CONTENT, 'rev-parse', '--verify', f'{(kw.get("sha") or "HEAD").strip()}^{{commit}}')
+                target = out if rc == 0 else ''
+            if target:
+                fails = data.get('failures') or []
+                why = ('失败项：' + '；'.join(fails)) if fails else str(exc.message).splitlines()[0][:200]
+                log = f'（完整输出 {data["log_path"]}）' if data.get('log_path') else ''
+                online = (runtime_info().get('sha') or '')[:7] or '未知'
+                notify_release(conn, target, False, f'发布 {target[:7]} 失败：{why}{log}；线上仍是 {online}。')
         raise
+    if not res.get('dry_run') and res.get('mode') == 'release':
+        notify_release(conn, res.get('sha'), True, f'{(res.get("sha") or "")[:7]} 已发布上线（线上 sha {res.get("sha")}）。')
+    return res
 
 
 def restart_auto(conn, **kw):
@@ -9716,11 +9814,11 @@ def restart_auto(conn, **kw):
     return dict(res, ahead_before=ahead)
 
 
-def _require_release_actor(conn):
+def _require_release_actor(conn, dry_run=False):
     c = caller(conn)
-    if c and c['role'] != 'assistant':
-        fail('permission_denied', '只有主脑和用户能发布或重启服务；子脑和执行者请让用户点网页右上角「重启服务」',
-             fix='在回复里提醒用户点网页右上角「重启服务」按钮', exit_code=EXIT_RULE)
+    if c and c['role'] != 'assistant' and not dry_run:      # 演练（--dry-run）谁都能跑：只检查、不切换不重启
+        fail('permission_denied', '只有主脑和用户能发布或重启服务；子脑和执行者提交后请主脑发布，自己可以先跑 --dry-run 演练',
+             fix='mashu-dev release --dry-run 通过后 mashu send boss "请发布 <sha>"', exit_code=EXIT_RULE)
     return c, ('assistant' if c else 'executive')
 
 
@@ -9749,7 +9847,7 @@ def _release_summary(res):
 def cmd_release(args):
     """发布已提交版本到 state/runtime/ 快照并重启服务（支持 --sha / --rollback / --same / --dry-run / --no-restart）。"""
     conn = db()
-    _, actor = _require_release_actor(conn)
+    _, actor = _require_release_actor(conn, dry_run=bool(getattr(args, 'dry_run', False)))
     res = release_logged(
         conn,
         sha=getattr(args, 'sha', None),
@@ -9766,7 +9864,7 @@ def cmd_release(args):
 def cmd_restart_server(args):
     """主脑（或终端里的用户）发布并重启网页服务与调度器，和网页「重启服务」按钮同一做法；--same 只重启不换版本。"""
     conn = db()
-    _, actor = _require_release_actor(conn)
+    _, actor = _require_release_actor(conn, dry_run=bool(getattr(args, 'dry_run', False)))
     same = bool(getattr(args, 'same', False))
     dry_run = bool(getattr(args, 'dry_run', False))
     sha = getattr(args, 'sha', None)

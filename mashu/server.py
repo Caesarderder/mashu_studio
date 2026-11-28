@@ -36,6 +36,67 @@ def code_stale():
 def restart_later():
     """网页上的「重启服务」按钮：先回应页面，1 秒后在独立进程组里跑 start.sh restart（会关掉本进程所在的 office 窗口再重开）。"""
     studio.schedule_server_restart()
+RELEASE_JOB = {}          # 网页「重启服务」的后台发布（#143）：running / sha / mode / started / ok / result / error
+RELEASE_LOCK = threading.Lock()
+
+
+def release_job_view():
+    with RELEASE_LOCK:
+        j = dict(RELEASE_JOB)
+    if j.get('started'):
+        j['elapsed'] = int(time.time() - j['started'])
+    return j
+
+
+def start_release_job(data):
+    """在后台线程里跑发布（约 2 分钟），接口立刻返回。已有发布在跑就回 busy；线上已是 HEAD 且服务不旧就回 noop。"""
+    same = bool(data.get('same'))
+    auto = bool(data.get('auto'))
+    rt = studio.runtime_info()
+    online = rt.get('sha') or ''
+    with RELEASE_LOCK:
+        if RELEASE_JOB.get('running'):
+            short = (RELEASE_JOB.get('sha') or '')[:7]
+            return {'ok': True, 'busy': True, **RELEASE_JOB,
+                    'message': f'正在发布 {short}，约 2 分钟' if RELEASE_JOB.get('mode') == 'release' else '正在重启服务'}
+        mode = 'same' if same or (auto and int(rt.get('ahead') or 0) <= 0) else 'release'
+        if mode == 'same' and auto and not same and not code_stale():
+            return {'ok': True, 'noop': True, 'sha': online,
+                    'message': f'没有新提交：线上已是 {online[:7]}，不用重启'}
+        target = ''
+        if mode == 'release':
+            rc, out, _ = studio._git_output(studio.CONTENT, 'rev-parse', '--verify',
+                                            f'{(data.get("sha") or "HEAD").strip()}^{{commit}}')
+            target = out if rc == 0 else ''
+            if target and target == online and not data.get('sha'):
+                return {'ok': True, 'noop': True, 'sha': online,
+                        'message': f'没有新提交：线上已是 {online[:7]}，不用重启'}
+        RELEASE_JOB.clear()
+        RELEASE_JOB.update(running=True, mode=mode, sha=target or online, started=time.time())
+
+    def run():
+        try:
+            kw = dict(actor='executive', reason=(data.get('reason') or '').strip() or '网页按钮重启服务',
+                      restart_fn=restart_later)
+            if mode == 'same':
+                res = studio.release_logged(studio.db(), same=True, **kw)
+            else:
+                res = studio.release_logged(studio.db(), sha=(data.get('sha') or '').strip() or None, **kw)
+            done = dict(ok=True, result=res)
+        except studio.MashuError as exc:
+            done = dict(ok=False, error={'code': exc.code, 'error': exc.message, 'fix': exc.fix, **(exc.data or {})})
+        except Exception as exc:
+            traceback.print_exc()
+            studio.log_event(studio.db(), 'error', level='error', where='release job',
+                             err=f'{type(exc).__name__}: {exc}', tb=traceback.format_exc()[-1500:])
+            done = dict(ok=False, error={'code': 'error', 'error': f'{type(exc).__name__}: {exc}'})
+        with RELEASE_LOCK:
+            RELEASE_JOB.update(running=False, finished=time.time(), **done)
+    threading.Thread(target=run, name='release-job', daemon=True).start()
+    return {'ok': True, 'started': True, 'mode': mode, 'sha': target or online,
+            'message': f'开始发布 {target[:7]}：先跑检查，约 2 分钟' if mode == 'release' else '正在重启服务'}
+
+
 DASH_CACHE = {}           # 项目 id → (时间, 工作流面板数据)
 MSG_COLS = 'id, ts, sender, camera_id, camera_name, channel, film_id, seq_key, target, kind, text, report_id'
 
@@ -180,6 +241,8 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/api/events':
             return self.events()
         conn = studio.db()
+        if url.path == '/api/release-status':     # 网页「重启服务」后台发布的进度（#143）
+            return self.send_json(release_job_view())
         if url.path == '/api/state':
             with self.lock:
                 d = studio.status_data(conn)
@@ -189,6 +252,7 @@ class Handler(BaseHTTPRequestHandler):
                 r['superseded_by'] = studio.report_superseded_by(conn, r)
                 r['stale_reason'] = studio.evaluate_stale(conn, r)
             d['server'] = dict(started=STARTED, stale=code_stale())
+            d['release_job'] = release_job_view()
             add_behaviors(d, conn)
             return self.send_json(d)
         if url.path == '/api/messages':
@@ -403,6 +467,8 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/api/restart-server':   # 发布快照并重启服务：要跑 check.sh，不占全局锁
             try:
                 data = self.body() or {}
+                if not data.get('dry_run') and not data.get('rollback'):     # 网页按钮：后台发布、立刻返回（#143）
+                    return self.send_json(start_release_job(data))
                 # 都走 studio.release_runtime（release_logged 失败时记事件；auto：网页按钮用，落后已提交代码就发布并重启，不落后只重启）
                 release = studio.restart_auto if data.get('auto') else studio.release_logged
                 res = release(
@@ -416,6 +482,8 @@ class Handler(BaseHTTPRequestHandler):
                     restart_fn=restart_later,
                 )
                 return self.send_json({'ok': True, **res})
+            except (BrokenPipeError, ConnectionResetError):     # 页面等不及先断开了：发布照常，不再回写
+                return None
             except studio.MashuError as exc:
                 payload = {'ok': False, 'code': exc.code, 'error': exc.message, 'fix': exc.fix}
                 if exc.data:

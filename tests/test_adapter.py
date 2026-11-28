@@ -96,7 +96,8 @@ class AdapterBase(Base):
         super().setUp()
         fake = self.tmp / 'fake-claude'          # 假 claude 额外记下适配器给的环境变量
         lines = FAKE_CLAUDE.splitlines(keepends=True)
-        fake.write_text(''.join(lines[:3]) + ENV_LINE + ''.join(lines[3:]))
+        # ENV 行写在 ARG 循环之后：launched() 等到 ENV 出现时启动参数已全部写完（原先写在前面，偶发读到一半的日志）
+        fake.write_text(''.join(lines[:5]) + ENV_LINE + ''.join(lines[5:]))
         self.saved_threaded = studio.ADAPTER_THREADED
         studio.ADAPTER_THREADED = False
         self.addCleanup(setattr, studio, 'ADAPTER_THREADED', self.saved_threaded)

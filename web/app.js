@@ -1151,13 +1151,16 @@ function renderSide() {
     ? `线上版本：${rt.sha}${rt.released_at ? `\n发布时间：${rt.released_at}` : ''}${rt.released_by ? `\n发布人：${rt.released_by}` : ''}${ahead > 0 ? `\n工作区已领先 ${ahead} 个提交` : ''}${dirty ? '\n工作区有未提交改动（不影响线上快照）' : ''}`
     : '';
   // 快照落后已提交代码：按钮就是「发布并重启」（先跑检查，不过不切换）；不落后只重启（服务端按 auto 再判一次）
-  const btnText = restartBusy ? (ahead > 0 ? '检查发布中…' : '重启中…') : (ahead > 0 ? `发布并重启（落后 ${ahead} 个提交）` : (stale ? '有更新，重启生效' : '重启服务'));
+  const job = state.release_job || {};
+  if (job.running && !restartBusy) { restartBusy = true; watchRelease(); }       // 别的标签页 / 主脑发起的发布也置灰
+  const jobText = job.running ? (job.mode === 'release' ? `发布中 ${String(job.sha || '').slice(0, 7)} · ${releaseElapsed(job)}（约 2 分钟）` : '重启中…') : '';
+  const btnText = restartBusy ? (jobText || (ahead > 0 ? '检查发布中…' : '重启中…')) : (ahead > 0 ? `发布并重启（落后 ${ahead} 个提交）` : (stale ? '有更新，重启生效' : '重启服务'));
   const btnTitle = restartBusy
     ? (ahead > 0 ? '正在对工作区 HEAD 运行检查并切换稳定快照…' : '正在重启网页服务与调度器…')
     : (ahead > 0
       ? `线上快照落后工作区 ${ahead} 个已提交的改动：点击先运行检查，通过后发布新快照并重启服务；检查不过不切换（各会话不受影响；未提交的改动不会发布）`
       : `线上已是最新提交，点击只重启网页服务与调度器，不换版本（各会话不受影响）${stale ? '；服务进程比快照旧，重启后生效' : ''}`);
-  const trKey = `${tmuxCmd}|${shortSha}|${ahead}|${dirty}|${stale}|${restartBusy}`;
+  const trKey = `${tmuxCmd}|${shortSha}|${ahead}|${dirty}|${stale}|${restartBusy}|${btnText}`;
   if (tr._cmd !== trKey) {
     tr._cmd = trKey;
     tr.innerHTML = `${verText ? `<span class="runtime-ver${ahead > 0 ? ' ahead' : ''}" title="${esc(verTitle)}">${esc(verText)}</span>` : ''}
@@ -3696,6 +3699,8 @@ function showReleaseFailure(data, fallbackMsg) {
   toast(`重启发布失败：${msg.split('\n')[0]}`);
   openModal(`<h2>发布 / 重启失败</h2>
     <p style="margin:6px 0 0;color:var(--text-2)">${esc(msg.split('\n')[0])}</p>
+    ${(data && data.failures && data.failures.length) ? `<p style="margin:6px 0 0">失败项：${esc(data.failures.join('；'))}</p>` : ''}
+    ${(data && data.log_path) ? `<p class="hint" style="margin-top:4px">完整输出：${esc(data.log_path)}</p>` : ''}
     ${detail ? `<pre class="release-err">${esc(detail)}</pre>` : (msg.includes('\n') ? `<pre class="release-err">${esc(msg)}</pre>` : '')}
     ${fix ? `<p class="hint" style="margin-top:8px">建议：${esc(fix)}</p>` : ''}
     <div class="api-actions" style="margin-top:12px">
@@ -3706,12 +3711,48 @@ function showReleaseFailure(data, fallbackMsg) {
   const sb = $('#restartSameBtn');
   if (sb) sb.onclick = () => { closeModal(); restartServer({ same: true }); };
 }
+function releaseElapsed(job) {
+  const sec = Math.max(0, Math.round(((job && job.elapsed) || 0) + (Date.now() - ((job && job._at) || Date.now())) / 1000));
+  return sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`;
+}
+function waitServerBack() {      // 发布 / 重启后等新服务起来再刷新
+  const t0 = Date.now();
+  const poll = async () => {
+    try { if (Date.now() - t0 > 2500 && (await fetch('/', { cache: 'no-store' })).ok) return location.reload(); } catch (e) {}
+    if (Date.now() - t0 < 60000) setTimeout(poll, 1000);
+    else { restartBusy = false; renderSide(); toast('重启超时，请手动刷新页面'); }
+  };
+  setTimeout(poll, 1500);
+}
+let releaseWatching = false;
+function watchRelease() {        // 轮询后台发布进度：成功等服务重启后刷新，失败弹出失败项
+  if (releaseWatching) return;
+  releaseWatching = true;
+  const tick = async () => {
+    let job;
+    try {
+      const r = await fetch('/api/release-status', { headers: { 'X-Mashu-Token': TOKEN }, cache: 'no-store' });
+      job = await r.json();
+    } catch (e) { releaseWatching = false; return waitServerBack(); }      // 服务正在重启
+    job._at = Date.now();
+    state.release_job = job;
+    if (job.running) { renderSide(); return setTimeout(tick, 2000); }
+    releaseWatching = false;
+    if (job.ok === false) {
+      restartBusy = false; state.release_job = {}; renderSide();
+      return showReleaseFailure(job.error || {}, '发布失败');
+    }
+    const res = job.result || {};
+    const shortSha = res.sha ? String(res.sha).slice(0, 7) : '';
+    toast(res.mode === 'same' ? '正在重启网页服务，几秒后自动刷新…' : `检查通过${shortSha ? `（${shortSha}）` : ''}，已发布，正在重启网页服务…`);
+    waitServerBack();
+  };
+  setTimeout(tick, 1500);
+}
 async function restartServer(opts = {}) {
-  if (restartBusy) return;
+  if (restartBusy) return toast('正在发布或重启，请稍等');
   restartBusy = true;
   renderSide();
-  const willRelease = !opts.same && (!opts.auto || Number(state.runtime?.ahead || 0) > 0);
-  if (willRelease) toast('正在检查并准备发布新快照…');
   let res, data = {};
   try {
     res = await fetch('/api/restart-server', {
@@ -3730,15 +3771,11 @@ async function restartServer(opts = {}) {
     renderSide();
     return showReleaseFailure(data, res.statusText);
   }
-  const shortSha = data.sha ? String(data.sha).slice(0, 7) : '';
-  toast(data.mode === 'same' ? '正在重启网页服务，几秒后自动刷新…' : `检查通过${shortSha ? `（${shortSha}）` : ''}，已发布，正在重启网页服务…`);
-  const t0 = Date.now();
-  const poll = async () => {      // 等新服务起来再刷新
-    try { if (Date.now() - t0 > 2500 && (await fetch('/', { cache: 'no-store' })).ok) return location.reload(); } catch (e) {}
-    if (Date.now() - t0 < 60000) setTimeout(poll, 1000);
-    else { restartBusy = false; renderSide(); toast('重启超时，请手动刷新页面'); }
-  };
-  setTimeout(poll, 1500);
+  if (data.noop) { restartBusy = false; renderSide(); return toast(data.message || '没有新提交，不用重启'); }
+  if (data.message) toast(data.message);
+  state.release_job = { running: true, mode: data.mode, sha: data.sha, elapsed: data.elapsed || 0, _at: Date.now() };
+  renderSide();
+  watchRelease();
 }
 function togglePanel(force) {
   const off = force ?? !document.body.classList.contains('panel-off');
