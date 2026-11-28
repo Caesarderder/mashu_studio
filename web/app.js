@@ -1145,21 +1145,19 @@ function renderSide() {
   const shortSha = rt && rt.sha ? String(rt.sha).slice(0, 7) : '';
   const ahead = Number((rt && rt.ahead) || 0);
   const dirty = !!(rt && rt.dirty);
-  const stale = ahead > 0 || !!state.server?.stale;
-  const verText = shortSha ? (ahead > 0 ? `${shortSha} · +${ahead}` : `线上 ${shortSha}`) : '';
+  const stale = !!state.server?.stale;       // 只看服务进程比快照旧；有新提交不算（重启不换版本，#402）
+  const verText = shortSha ? (ahead > 0 ? `线上 ${shortSha} · 待发布 ${ahead}` : `线上 ${shortSha}`) : '';
   const verTitle = shortSha
-    ? `线上版本：${rt.sha}${rt.released_at ? `\n发布时间：${rt.released_at}` : ''}${rt.released_by ? `\n发布人：${rt.released_by}` : ''}${ahead > 0 ? `\n工作区已领先 ${ahead} 个提交` : ''}${dirty ? '\n工作区有未提交改动（不影响线上快照）' : ''}`
+    ? `线上版本：${rt.sha}${rt.released_at ? `\n发布时间：${rt.released_at}` : ''}${rt.released_by ? `\n发布人：${rt.released_by}` : ''}${ahead > 0 ? `\n工作区已领先 ${ahead} 个提交：由主脑跑检查后发布，「重启服务」不换版本` : ''}${dirty ? '\n工作区有未提交改动（不影响线上快照）' : ''}`
     : '';
-  // 快照落后已提交代码：按钮就是「发布并重启」（先跑检查，不过不切换）；不落后只重启（服务端按 auto 再判一次）
+  // 按钮只重启、不换版本（用户 #402）：发布新版本由主脑 mashu-dev release 做；网页发起的发布进行中时按钮置灰显示进度
   const job = state.release_job || {};
-  if (job.running && !restartBusy) { restartBusy = true; watchRelease(); }       // 别的标签页 / 主脑发起的发布也置灰
+  if (job.running && !restartBusy) { restartBusy = true; watchRelease(); }       // 别的标签页发起的发布 / 重启也置灰
   const jobText = job.running ? (job.mode === 'release' ? `发布中 ${String(job.sha || '').slice(0, 7)} · ${releaseElapsed(job)}（约 2 分钟）` : '重启中…') : '';
-  const btnText = restartBusy ? (jobText || (ahead > 0 ? '检查发布中…' : '重启中…')) : (ahead > 0 ? `发布并重启（落后 ${ahead} 个提交）` : (stale ? '有更新，重启生效' : '重启服务'));
+  const btnText = restartBusy ? (jobText || '重启中…') : (stale ? '有更新，重启生效' : '重启服务');
   const btnTitle = restartBusy
-    ? (ahead > 0 ? '正在对工作区 HEAD 运行检查并切换稳定快照…' : '正在重启网页服务与调度器…')
-    : (ahead > 0
-      ? `线上快照落后工作区 ${ahead} 个已提交的改动：点击先运行检查，通过后发布新快照并重启服务；检查不过不切换（各会话不受影响；未提交的改动不会发布）`
-      : `线上已是最新提交，点击只重启网页服务与调度器，不换版本（各会话不受影响）${stale ? '；服务进程比快照旧，重启后生效' : ''}`);
+    ? (jobText ? '正在发布新版本（跑检查后切换），完成后自动重启' : '正在重启网页服务与调度器…')
+    : `只重启网页服务与调度器，几秒钟，不换版本（各会话不受影响）${stale ? '；服务进程比快照旧，重启后生效' : ''}${ahead > 0 ? `；还有 ${ahead} 个新提交等主脑发布` : ''}`;
   const trKey = `${tmuxCmd}|${shortSha}|${ahead}|${dirty}|${stale}|${restartBusy}|${btnText}`;
   if (tr._cmd !== trKey) {
     tr._cmd = trKey;
@@ -3891,7 +3889,7 @@ document.addEventListener('keydown', (ev) => {
 });
 document.addEventListener('click', (ev) => {
   if (ev.target.closest('[data-theme-toggle]')) return cycleTheme();
-  if (ev.target.closest('[data-restart]')) return restartServer({ auto: true });
+  if (ev.target.closest('[data-restart]')) return restartServer({ same: true });     // 只重启（#402）
   if (ev.target.closest('[data-panel-toggle]')) return togglePanel();
   if (ev.target.closest('[data-palette]')) return openPalette();
   const cp = ev.target.closest('[data-copy]');
