@@ -10,7 +10,11 @@ import tempfile
 
 
 NAME = 'caesar-docs'
-SOURCE = Path(__file__).resolve().parents[1] / 'skills' / NAME
+_CODE = Path(__file__).resolve().parents[1]
+# 线上跑 state/runtime 快照时，技能来源仍取工作区那份（和守则、文档一样即时生效；全局软链接也指向工作区）
+_ROOT = Path(os.environ.get('MASHU_CONTENT') or (
+    _CODE.parent.parent if _CODE.name == 'runtime' and _CODE.parent.name == 'state' and (_CODE.parent.parent / '.git').exists() else _CODE))
+SOURCE = _ROOT / 'skills' / NAME
 LEGACY = {'SKILL.md': '54f6b347ddafaaf4e4b04d79e08dea7f666034c205fbc44a52cbdffab9fde17e'}
 IGNORED = {'.ruff_cache', '__pycache__', '.DS_Store'}
 PRUNE = {'.git', '.agents', '.mashu', 'state', 'node_modules', '.venv', '.build', 'Library', 'DerivedData'}
