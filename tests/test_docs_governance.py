@@ -189,4 +189,4 @@ class DocsGovernanceTests(Base):
         self.assertIn('## caesar-docs 漂移\n- 落后 /fake', summary)
         self.assertIn('## docs 使用统计', summary)
         self.assertIn('首读入口 1 · 阅读合计 2 篇 · validate 1 · docs 写入 1', summary)
-        self.assertIn('首读入口 是 · 2 篇', summary)
+        self.assertNotIn('首读入口 是 · 2 篇', summary)    # #19 起不再逐会话列，只留汇总和「改了代码却缺入口 / 回写 / validate」的异常会话

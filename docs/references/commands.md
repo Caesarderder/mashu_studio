@@ -77,7 +77,7 @@ related:
 | `mashu preset list [--json]` | 只读列出模型池预设（id、名字、CLI、模型、思考、账号、备选、哪些角色默认在用）；增删改在网页「模型池」页做 |
 | `mashu config export --out <文件> [--with-secrets]` / `import <文件> [--dry-run] [--yes]` / `migrate` | 主配置文件（`state/studio.json`）导出、差异预览导入与迁移；`--with-secrets` 交互输口令加密，默认省略密钥。详见 [平台说明](platforms.md) |
 | `mashu playbook list / show / check / commit / apply / restore` | 工作流管理；目标写 `film:<项目>`（项目默认工作流）、`template:<项目>/<id>`（项目专用模板，在 `<工程>/.mashu/playbooks/`）或 `template:<id>`（麻薯通用模板）。见 [项目资料制作规范](../workflows/project-assets.md) |
-| `mashu retro [项目]` / `mashu digest` / `mashu self-iterate …` | 复盘数据 / 简报数据 / 每日自迭代 |
+| `mashu retro [项目]` / `mashu digest` / `mashu self-iterate …` | 复盘数据 / 简报数据 / 每日自迭代（`effects` 看采纳后的效果，`adopt/cover --signal` 写生效信号） |
 
 ## 子脑
 

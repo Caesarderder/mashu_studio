@@ -41,7 +41,8 @@ REPORT = dict(
     sessions=[dict(session='#1 遇见', role='执行者', project='Builda #1', purpose='写方案', chain='子脑派 → 写文档 → 交接',
                    effect='好', comment='按时完成')],
     suggestions=[dict(area='prompt', target='mashu/prompts/crew.md「需要人的时候」', title='请示前先查项目说明',
-                      evidence='上报 #1', change='加一句：请示前先读 .mashu/README.md', priority='高'),
+                      evidence='上报 #1', change='加一句：请示前先读 .mashu/README.md', priority='高',
+                      signal=dict(kind='audit', query='sign@executive', expect='下降')),   # #19 起采纳要有生效信号
                  dict(area='weird', target='x', title='未知类别归 other', evidence='e', change='c', priority='低'),
                  dict(area='rules', title='  ')],
     memory_candidates=[dict(target='memory/方针.md', title='重启服务由用户安排', evidence='#1', change='原文')],

@@ -1150,12 +1150,13 @@ function renderSide() {
   const verTitle = shortSha
     ? `线上版本：${rt.sha}${rt.released_at ? `\n发布时间：${rt.released_at}` : ''}${rt.released_by ? `\n发布人：${rt.released_by}` : ''}${ahead > 0 ? `\n工作区已领先 ${ahead} 个提交` : ''}${dirty ? '\n工作区有未提交改动（不影响线上快照）' : ''}`
     : '';
-  const btnText = restartBusy ? '检查发布中…' : (ahead > 0 ? `有 ${ahead} 个提交待发布` : (stale ? '有更新，重启生效' : '重启服务'));
+  // 快照落后已提交代码：按钮就是「发布并重启」（先跑检查，不过不切换）；不落后只重启（服务端按 auto 再判一次）
+  const btnText = restartBusy ? (ahead > 0 ? '检查发布中…' : '重启中…') : (ahead > 0 ? `发布并重启（落后 ${ahead} 个提交）` : (stale ? '有更新，重启生效' : '重启服务'));
   const btnTitle = restartBusy
-    ? '正在对工作区 HEAD 运行检查并切换稳定快照…'
+    ? (ahead > 0 ? '正在对工作区 HEAD 运行检查并切换稳定快照…' : '正在重启网页服务与调度器…')
     : (ahead > 0
-      ? `工作区已领先 ${ahead} 个提交，点击运行检查、发布新快照并重启服务（各会话不受影响）`
-      : '检查 HEAD、发布稳定快照并重启网页服务与调度器（各会话不受影响）');
+      ? `线上快照落后工作区 ${ahead} 个已提交的改动：点击先运行检查，通过后发布新快照并重启服务；检查不过不切换（各会话不受影响；未提交的改动不会发布）`
+      : `线上已是最新提交，点击只重启网页服务与调度器，不换版本（各会话不受影响）${stale ? '；服务进程比快照旧，重启后生效' : ''}`);
   const trKey = `${tmuxCmd}|${shortSha}|${ahead}|${dirty}|${stale}|${restartBusy}`;
   if (tr._cmd !== trKey) {
     tr._cmd = trKey;
@@ -3074,29 +3075,41 @@ async function renderSelfIter() {
   const ST_CLS = { 待定: 'gold', 采纳: 'si-ok', 不采纳: '', 已覆盖: 'si-ok', 过时: '' };
   const RUN = { ok: '完成', failed: '失败', skipped: '没活动，跳过', running: '进行中' };
   const item = (x) => `<div class="dec"><div class="dh"><span class="tag ${ST_CLS[x.status] || ''}">${esc(x.status)}</span>
-      <b>#${x.id}</b>${x.section === 'suggestion' ? `<span class="tag">${esc(x.area)}</span>` : ''}${x.priority ? `<span class="tag">优先级 ${esc(x.priority)}</span>` : ''}
+      <b>#${x.id}</b>${x.section === 'suggestion' ? `<span class="tag">${esc(x.area)}</span>` : ''}${x.priority ? `<span class="tag">优先级 ${esc(x.priority)}</span>` : ''}${x.source && x.source !== '日报' ? `<span class="tag gold">${esc(x.source)}</span>` : ''}
       <span class="si-target">${esc(x.target || '')}</span></div>
       <div class="dt"><b>${esc(x.title)}</b></div>
       ${x.evidence ? `<div class="si-row"><span>依据</span><div>${md(x.evidence)}</div></div>` : ''}
       ${x.change ? `<div class="si-row"><span>改法</span><div>${md(x.change)}</div></div>` : ''}
+      ${x.signal_text ? `<div class="si-row"><span>生效信号</span><div><code>${esc(x.signal_text)}</code></div></div>` : ''}
       ${x.note || x.decided_by ? `<div class="hint" style="margin:4px 0 0">${esc(x.decided_by || '')}${x.note ? `：${esc(x.note)}` : ''}</div>` : ''}</div>`;
   const items = d.items || [];
   const sugg = items.filter((x) => x.section === 'suggestion');
   const keep = items.filter((x) => x.section !== 'suggestion');
   const rep = d.report || {};
+  const EFF_CLS = { 生效: 'si-ok', 复发: 'gold', 未见效: 'gold', 查询出错: 'gold' };
+  const effs = rep.effects || [];
+  const effHtml = effs.length ? `<h3>自动验效（${effs.length}）</h3>${effs.map((e) => `<div class="dec"><div class="dh"><span class="tag ${EFF_CLS[e.verdict] || ''}">${esc(e.verdict)}</span>
+      <b>#${e.id}</b><span class="tag">${esc(e.status)}</span><span class="si-target">${esc(e.signal || '')}</span></div><div class="dt">${esc(e.title)}</div>
+      ${e.daily_text ? `<div class="hint" style="margin:4px 0 0">采纳前 ${e.before_days} 天 ${e.before} 次（${e.rate_before}/天）→ 之后 ${e.after_days} 天 ${e.after} 次（${e.rate_after}/天）；每日 ${esc(e.daily_text)}</div>` : ''}
+      ${e.error ? `<div class="hint" style="margin:4px 0 0">${esc(e.error)}</div>` : ''}</div>`).join('')}` : '';
+  const incHtml = (d.incidents || []).map((i) => `<h3>事故小复盘 #${i.run_id}：${esc((i.incident || {}).title || '')}</h3>
+      <div class="dec"><div class="dt">${md(i.summary || '（无总结）')}</div>${(i.incident || {}).detail ? `<div class="hint" style="margin:4px 0 0">${esc(i.incident.detail)}</div>` : ''}</div>
+      ${i.items.map(item).join('') || '<div class="hint">没有建议</div>'}`).join('');
   el.innerHTML = `<h2>自迭代</h2>
-    <p class="hint">每天凌晨麻薯用便宜模型复盘最近 24 小时：会话 review、改进建议、可沉淀的记忆和工作流。主脑用 <code>mashu self-iterate adopt / reject / cover / outdated &lt;编号&gt;</code> 标记（采纳 / 不采纳 / 已被别的改动覆盖 / 过时），网页只读。</p>
+    <p class="hint">每天凌晨麻薯用便宜模型复盘最近 24 小时：会话 review、改进建议、可沉淀的记忆和工作流。主脑用 <code>mashu self-iterate adopt / reject / cover / outdated &lt;编号&gt;</code> 标记（采纳 / 不采纳 / 已被别的改动覆盖 / 过时），采纳和判已覆盖要带 <code>--signal</code>，之后的报告按它自动验效；出事故时当场做一次小复盘。网页只读。</p>
     ${d.days.length ? `<div class="seg">${d.days.map((x) => `<button class="${x.day === d.day ? 'active' : ''}" data-siday="${esc(x.day)}">${esc(x.day.slice(5))}</button>`).join('')}</div>` : ''}
-    ${(d.runs || []).map((r) => `<div class="hint si-run">运行 #${r.id} · ${r.trigger === 'tick' ? '定时' : '手动'} · ${esc(r.model || '')} · <b>${esc(RUN[r.status] || r.status)}</b>
+    ${(d.runs || []).map((r) => `<div class="hint si-run">运行 #${r.id} · ${({ tick: '定时', incident: '事故复盘' })[r.trigger] || '手动'} · ${esc(r.model || '')} · <b>${esc(RUN[r.status] || r.status)}</b>
       ${r.tokens_in != null ? ` · 输入 ${num(r.tokens_in)} / 输出 ${num(r.tokens_out)}` : ''}${r.cost != null ? ` · $${Number(r.cost).toFixed(4)}` : ''}
       ${r.error ? ` · ${esc(r.error)}` : ''}</div>`).join('') || '<div class="empty">还没有自迭代报告</div>'}
     ${d.run_id ? `<h3>总结</h3><div class="dec"><div class="dt">${md(rep.summary || '（无）')}</div></div>
       <h3>改进建议（${sugg.length}）</h3>${sugg.map(item).join('') || '<div class="hint">没有建议</div>'}
       <h3>可沉淀项（${keep.length}）</h3>${keep.map((x) => item({ ...x, area: '' })).join('') || '<div class="hint">没有</div>'}
+      ${effHtml}
       ${(rep.followups || []).length ? `<h3>已采纳改动的效果（${rep.followups.length}）</h3>${rep.followups.map((x) => `<div class="dec"><div class="dh"><span class="tag ${x.status === '生效' ? 'si-ok' : 'gold'}">${esc(x.status)}</span><b>${esc(x.item)}</b></div>${x.evidence ? `<div class="dt">${md(x.evidence)}</div>` : ''}</div>`).join('')}` : ''}
       <h3>会话 review（${(rep.sessions || []).length}）</h3>
       <table><tr><th>会话</th><th>角色</th><th>项目</th><th>目的</th><th>链路</th><th>效果</th><th>说明</th></tr>
-      ${(rep.sessions || []).map((s) => `<tr><td>${esc(s.session)}</td><td>${esc(s.role)}</td><td>${esc(s.project)}</td><td>${esc(s.purpose)}</td><td>${esc(s.chain)}</td><td>${esc(s.effect)}</td><td>${esc(s.comment)}</td></tr>`).join('')}</table>` : ''}`;
+      ${(rep.sessions || []).map((s) => `<tr><td>${esc(s.session)}</td><td>${esc(s.role)}</td><td>${esc(s.project)}</td><td>${esc(s.purpose)}</td><td>${esc(s.chain)}</td><td>${esc(s.effect)}</td><td>${esc(s.comment)}</td></tr>`).join('')}</table>` : ''}
+    ${incHtml}`;
   el.querySelectorAll('[data-siday]').forEach((b) => { b.onclick = () => { siDay = b.dataset.siday; renderSelfIter(); }; });
 }
 
@@ -3697,7 +3710,8 @@ async function restartServer(opts = {}) {
   if (restartBusy) return;
   restartBusy = true;
   renderSide();
-  if (!opts.same) toast('正在检查并准备发布新快照…');
+  const willRelease = !opts.same && (!opts.auto || Number(state.runtime?.ahead || 0) > 0);
+  if (willRelease) toast('正在检查并准备发布新快照…');
   let res, data = {};
   try {
     res = await fetch('/api/restart-server', {
@@ -3717,7 +3731,7 @@ async function restartServer(opts = {}) {
     return showReleaseFailure(data, res.statusText);
   }
   const shortSha = data.sha ? String(data.sha).slice(0, 7) : '';
-  toast(opts.same ? '正在重启网页服务，几秒后自动刷新…' : `检查通过${shortSha ? `（${shortSha}）` : ''}，正在重启网页服务…`);
+  toast(data.mode === 'same' ? '正在重启网页服务，几秒后自动刷新…' : `检查通过${shortSha ? `（${shortSha}）` : ''}，已发布，正在重启网页服务…`);
   const t0 = Date.now();
   const poll = async () => {      // 等新服务起来再刷新
     try { if (Date.now() - t0 > 2500 && (await fetch('/', { cache: 'no-store' })).ok) return location.reload(); } catch (e) {}
@@ -3840,7 +3854,7 @@ document.addEventListener('keydown', (ev) => {
 });
 document.addEventListener('click', (ev) => {
   if (ev.target.closest('[data-theme-toggle]')) return cycleTheme();
-  if (ev.target.closest('[data-restart]')) return restartServer();
+  if (ev.target.closest('[data-restart]')) return restartServer({ auto: true });
   if (ev.target.closest('[data-panel-toggle]')) return togglePanel();
   if (ev.target.closest('[data-palette]')) return openPalette();
   const cp = ev.target.closest('[data-copy]');

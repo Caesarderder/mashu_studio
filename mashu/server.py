@@ -403,7 +403,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/api/restart-server':   # 发布快照并重启服务：要跑 check.sh，不占全局锁
             try:
                 data = self.body() or {}
-                res = studio.release_runtime(
+                # 都走 studio.release_runtime（release_logged 失败时记事件；auto：网页按钮用，落后已提交代码就发布并重启，不落后只重启）
+                release = studio.restart_auto if data.get('auto') else studio.release_logged
+                res = release(
                     studio.db(),
                     sha=(data.get('sha') or '').strip() or None,
                     rollback=bool(data.get('rollback')),

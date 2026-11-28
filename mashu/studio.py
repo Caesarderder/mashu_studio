@@ -9654,6 +9654,26 @@ def release_runtime(conn, *, sha=None, rollback=False, same=False, dry_run=False
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
+def release_logged(conn, **kw):
+    """release_runtime 的包装：发布失败（检查没过、快照切换失败等）记一条 release-fail 事件，自迭代据此做事故小复盘。"""
+    try:
+        return release_runtime(conn, **kw)
+    except MashuError as exc:
+        if exc.code != 'usage_error' and not kw.get('dry_run'):
+            log_event(conn, 'release-fail', level='warn', code=exc.code, err=str(exc.message)[:500], actor=kw.get('actor'),
+                      sha=kw.get('sha'), rollback=bool(kw.get('rollback')) or None)
+        raise
+
+
+def restart_auto(conn, **kw):
+    """网页「重启服务」按钮：线上快照落后已提交代码（ahead>0）时发布 HEAD 并重启（检查不过不切换）；不落后时只重启。"""
+    ahead = int(runtime_info().get('ahead') or 0)
+    for k in ('same', 'sha', 'rollback'):
+        kw.pop(k, None)
+    res = release_logged(conn, **kw) if ahead > 0 else release_logged(conn, same=True, **kw)
+    return dict(res, ahead_before=ahead)
+
+
 def _require_release_actor(conn):
     c = caller(conn)
     if c and c['role'] != 'assistant':
@@ -9688,7 +9708,7 @@ def cmd_release(args):
     """发布已提交版本到 state/runtime/ 快照并重启服务（支持 --sha / --rollback / --same / --dry-run / --no-restart）。"""
     conn = db()
     _, actor = _require_release_actor(conn)
-    res = release_runtime(
+    res = release_logged(
         conn,
         sha=getattr(args, 'sha', None),
         rollback=bool(getattr(args, 'rollback', False)),
@@ -9719,7 +9739,7 @@ def cmd_restart_server(args):
         changes = ['保持当前版本重启网页服务与调度器进程'] if same else ['对目标提交运行检查、更新 state/runtime/ 快照并重启网页服务与调度器']
         confirm_or_fail(args, 'confirm_required', '重启网页服务与调度器会断开网页连接数秒（各受管会话不受影响），请确认',
                         cfm_cmd, changes=changes)
-    res = release_runtime(
+    res = release_logged(
         conn,
         sha=sha,
         same=same,
@@ -10120,6 +10140,8 @@ def cmd_decide(args):
     c = my_camera(conn, ['producer', 'assistant'])
     text = read_text_arg(args.text, label='决策内容')
     record_decision(conn, c, args.film or c['film_id'], args.seq, text, args.why or '', ratify=args.ratify)
+    if c['role'] == 'assistant' and '事故' in text:      # 主脑记事故 → 自迭代当场做一次小复盘
+        log_event(conn, 'incident-declared', c, level='warn', text=text[:500])
     out_ok(dict(film=args.film or c['film_id'], seq=args.seq, text=text, why=args.why or '', ratify=bool(args.ratify)),
            '已记入决策记录，' + ('等用户追认或推翻' if args.ratify else '记为已执行，简报里会列出，用户可随时推翻'),
            as_json=getattr(args, 'json', False))
