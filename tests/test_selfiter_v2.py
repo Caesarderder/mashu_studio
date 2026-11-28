@@ -357,7 +357,8 @@ class TestRestartAuto(unittest.TestCase):
                 res = studio.restart_auto(inner.conn, actor='executive', restart_fn=lambda: restarts.append(3))
                 inner.assertEqual((res['mode'], res['sha'], res['ahead_before']), ('release', good, 2))
                 inner.assertEqual(restarts, [1, 3])
-                inner.assertIn('restartServer({ auto: true })', (Path(studio.__file__).parent.parent / 'web' / 'app.js').read_text())
+                # 网页按钮只重启不换版本（用户 #402）；restart_auto 留给接口调用
+                inner.assertIn('restartServer({ same: true })', (Path(studio.__file__).parent.parent / 'web' / 'app.js').read_text())
 
         r = unittest.TestResult()
         T().run(r)
